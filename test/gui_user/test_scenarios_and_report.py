@@ -58,6 +58,7 @@ SHIPPED_SMOKE = {
 }
 SHIPPED = SHIPPED_SMOKE | {
     "crewmate-panel-tabs",
+    "crewmate-perpetual-off",
     "knowledge-add-folder-source-and-scan",
     "meet-crewmates-flow",
     "members-dm-hello",
@@ -187,6 +188,7 @@ class TestShippedScenarios:
             "members": [
                 "crewmate-panel-tabs",
                 "meet-crewmates-flow",
+                "crewmate-perpetual-off",
                 "members-dm-hello",
                 "members-private-memory-keeps-thread",
             ],
