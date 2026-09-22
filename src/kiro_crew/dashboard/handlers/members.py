@@ -191,6 +191,55 @@ def normalize_member_source(raw: object) -> str:
     return _SOURCE_PACKAGE
 
 
+def _slot_flush_generation(slot: object) -> tuple[int, int, int] | None:
+    """The three counters a live slot's persistence state is made of.
+
+    ``(len(messages), _disk_window_len, _dirty_gen)``: a row appended, a flush
+    that persisted rows, or an in-place edit each moves one of them. Sampled
+    BEFORE the roster observation and compared AFTER the transcript read, so a
+    slot whose state moved anywhere inside that window -- a reply that landed
+    after the pre-await sample but before the disk read -- is refused the
+    preview correction, the same observe/revalidate pair the roster fields
+    already get. ``None`` when there is no live slot (dormant threads carry no
+    in-memory rows, so their disk read is the only copy).
+    """
+    if slot is None:
+        return None
+    messages = getattr(slot, "messages", None)
+    count = len(messages) if isinstance(messages, (list, tuple)) else 0
+    return (
+        count,
+        int(getattr(slot, "_disk_window_len", 0) or 0),
+        int(getattr(slot, "_dirty_gen", 0) or 0),
+    )
+
+
+def _slot_has_unflushed_rows(slot: object) -> bool:
+    """Does this live slot hold rows the transcript on disk does not yet?
+
+    The same three gates ``chat_handlers._reconcile_slot_window`` checks before
+    trusting a disk read against a live window: in-memory rows past the last
+    flush (``len(messages) > _disk_window_len``), a rewind in flight, or unsaved
+    in-place edits. Module level so the roster read and its test share ONE
+    definition. Used by ``api_members`` to refuse the preview correction for a
+    member whose latest speech has reached the member log (the live emit fires at
+    in-memory append time) but not yet the transcript file the speech-only read
+    walks -- the disk read would return the PREVIOUS speech, the roster observed
+    before it already holds the new one, and the correction would durably
+    append the older quote on top. A later read, after the flush, still sees
+    the roster and the transcript agree, so skipping here loses nothing.
+    """
+    if slot is None:
+        return False
+    messages = getattr(slot, "messages", None)
+    pending = False
+    if isinstance(messages, (list, tuple)):
+        pending = len(messages) > int(getattr(slot, "_disk_window_len", 0) or 0)
+    return bool(
+        pending or getattr(slot, "_pending_rewrite", False) or getattr(slot, "_dirty_flag", False)
+    )
+
+
 async def api_members(request: web.Request) -> web.Response:
     """GET /api/members — crew roster with DM binding and cheap live status.
 
@@ -282,6 +331,8 @@ async def api_members(request: web.Request) -> web.Response:
 
     bindings = await asyncio.to_thread(_read_bindings)
 
+    unflushed_slot_keys: set[str] = set()
+    flush_generation_before: dict[str, tuple[int, int, int] | None] = {}
     for row in rows:
         binding = bindings.get(row["slug"])
         # The binding's own `member` field is authoritative: a colliding slug's
@@ -293,12 +344,19 @@ async def api_members(request: web.Request) -> web.Response:
         row["slot_key"] = slot_key
         slot = state._slots.get(slot_key) if (state and slot_key) else None
         row["running"] = bool(slot.running) if slot is not None else False
+        # Read BEFORE the roster observation and the transcript read below: a
+        # slot with unflushed rows has speech on the member log the disk does
+        # not hold yet, so its speech-only read must not become a correction.
+        if slot is not None and _slot_has_unflushed_rows(slot):
+            unflushed_slot_keys.add(slot_key)
+        if slot_key:
+            flush_generation_before[slot_key] = _slot_flush_generation(slot)
 
     # Last activity, for the roster's most-recent-first ordering. The DM
     # transcript's mtime is the one durable signal that survives restarts and
     # covers live and dormant threads alike. File stats are IO — one thread
     # hop for the whole roster, mirroring the binding reads above.
-    def _read_transcript_tails() -> dict[str, tuple[float, str, bool]]:
+    def _read_transcript_tails() -> dict[str, tuple[float, str, bool, bool]]:
         if state is None or state.conversation_log is None:
             return {}
 
@@ -310,7 +368,7 @@ async def api_members(request: web.Request) -> web.Response:
             text, _ = _h.redact_credentials(text)
             return text
 
-        out: dict[str, tuple[float, str, bool]] = {}
+        out: dict[str, tuple[float, str, bool, bool]] = {}
         for row in rows:
             if not row["slot_key"]:
                 continue
@@ -324,21 +382,76 @@ async def api_members(request: web.Request) -> web.Response:
             mt = state.conversation_log.session_mtime(log_key)
             if not mt:
                 continue
-            preview, msg_ts, stopped = state.conversation_log.last_message_info(
+            # Speech only: the row's preview quotes what the member's chat
+            # draws (its speech), never a tool call or a patrol turn.
+            # `last_speech_info`, not `last_message_info`: the fourth value says
+            # whether the tail walk reached the start of the log. An EMPTY
+            # answer from a walk that did not is "spoke further back than the
+            # windows reach", not "never spoke", and must never be written
+            # into the member log as the authority (the reconcile below).
+            preview, msg_ts, stopped, exhaustive = state.conversation_log.last_speech_info(
                 log_key, sanitize=_sanitize
             )
             # Order by the newest MESSAGE, not the file: metadata writes and
             # rehydration bump the mtime without any new message, which made
             # rows reorder with no visible cause. mtime remains only as the
             # fallback for pre-timestamp transcript rows.
-            out[row["slot_key"]] = (msg_ts or mt, preview, stopped)
+            out[row["slot_key"]] = (msg_ts or mt, preview, stopped, exhaustive)
         return out
 
+    def _observe_rosters() -> dict[str, dict]:
+        # The roster projection as it stood BEFORE the transcript read below.
+        # `reconcile_member_preview` corrects the folded preview to what the
+        # transcript says, and refuses when the roster has moved since THIS
+        # observation: a live `member/message` that lands after it is either
+        # already in the transcript the read sees (so the read agrees with
+        # it) or newer than the read (so the correction is stale and refused).
+        # Observing AFTER the read would let a message in between be read as
+        # unchanged and then overwritten by the older transcript answer.
+        from kiro_crew.eventlog.service import get_service
+
+        svc = get_service()
+        seen: dict[str, dict] = {}
+        for row in rows:
+            slug = row["slug"]
+            if slug in seen:
+                continue
+            try:
+                snap = svc.snapshot(slug)
+                values = snap.get("values", {}) if isinstance(snap, dict) else {}
+                seen[slug] = dict(values.get("roster") or {})
+            except Exception:
+                seen[slug] = {}
+        return seen
+
+    observed_rosters = await asyncio.to_thread(_observe_rosters)
     tails = await asyncio.to_thread(_read_transcript_tails)
+    # Slot keys whose speech-only read is trustworthy enough to correct the
+    # member log with: a non-empty quote, or an empty one from a walk that
+    # reached the start of the log -- and, either way, only for a slot whose
+    # in-memory rows had all been flushed when this read started
+    # (`_slot_has_unflushed_rows`). An empty read that ran out of window, or a
+    # read racing a flush, is left alone -- the row still carries the read here
+    # (the client falls back to the folded quote), but nothing is written.
+    preview_authoritative: set[str] = set()
     for row in rows:
-        mt, preview, stopped = tails.get(row["slot_key"], (0.0, "", False))
+        mt, preview, stopped, exhaustive = tails.get(row["slot_key"], (0.0, "", False, False))
         row["last_active_ts"] = mt
         row["last_message"] = preview
+        if not (preview or exhaustive) or row["slot_key"] in unflushed_slot_keys:
+            continue
+        # Re-ask AFTER the awaits: a slot that was clean at the pre-await sample
+        # can have appended a reply during the roster observation or the disk
+        # read (its member/message emit fires at in-memory append time, the
+        # transcript copy lands at flush), and the disk read would then hold
+        # the PREVIOUS speech. Both the state now and the generation since the
+        # sample must agree, or the correction is refused for this read.
+        slot_now = state._slots.get(row["slot_key"]) if state else None
+        if slot_now is not None and _slot_has_unflushed_rows(slot_now):
+            continue
+        if _slot_flush_generation(slot_now) != flush_generation_before.get(row["slot_key"]):
+            continue
+        preview_authoritative.add(row["slot_key"])
         # A locale-independent boolean, NEVER the word "Stopped": the preview
         # is computed here where the client's locale is unknown, which is why
         # the trailing stop is SKIPPED from `last_message` rather than rendered
@@ -420,12 +533,35 @@ async def api_members(request: web.Request) -> web.Response:
                 snap = svc.snapshot(slug)
                 values = snap.get("values", {}) if isinstance(snap, dict) else {}
                 agent_cfg = agent_cfgs.get(row["name"])
+                appended = False
                 if agent_cfg is not None:
-                    eventlog_hooks.reconcile_member_config(
-                        slug, row["name"], agent_cfg, values.get("roster", {})
+                    appended = (
+                        eventlog_hooks.reconcile_member_config(
+                            slug, row["name"], agent_cfg, values.get("roster", {})
+                        )
+                        is not None
                     )
-                    # Re-snapshot only when the reconcile appended (the roster
-                    # config fields would otherwise be stale for this response).
+                # The transcript's speech-only preview (read above) is the
+                # authority for the roster's `last_message`; a fold that still
+                # quotes a pre-speech-only machinery preview is corrected here,
+                # to blank when the member has never spoken. Compared against
+                # the roster observed BEFORE the transcript read (not this
+                # later snapshot), so a message that spoke in between refuses
+                # the correction instead of being overwritten by it.
+                if row["slot_key"] in preview_authoritative:
+                    appended = (
+                        eventlog_hooks.reconcile_member_preview(
+                            slug,
+                            row["name"],
+                            row.get("last_message", ""),
+                            row.get("last_active_ts"),
+                            observed_rosters.get(slug, {}),
+                        )
+                        or appended
+                    )
+                if appended:
+                    # Re-snapshot only when a reconcile appended (the roster
+                    # fields would otherwise be stale for this response).
                     snap = svc.snapshot(slug)
                 out[slug] = snap if isinstance(snap, dict) else {"asOfSeq": -1, "values": {}}
             except Exception:

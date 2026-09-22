@@ -30,6 +30,7 @@ from kiro_crew.chat_attachments import (
 )
 from kiro_crew.history_cache import _FileChangeCacheEntry
 from kiro_crew.jsonl_util import bounded_raw_records
+from kiro_crew.preview_text import speech_preview
 
 if TYPE_CHECKING:
     from kiro_crew.history import ConversationLog
@@ -56,11 +57,6 @@ def _history_facade() -> Any:
 def _facade_flock_acquire_timeout() -> float:
     """Read the one timeout with an established facade rebind seam."""
     return float(_history_facade()._FLOCK_ACQUIRE_TIMEOUT_S)
-
-
-def _facade_strip_markdown_preview(text: str) -> str:
-    """Honor post-construction patches of the facade preview helper."""
-    return _history_facade().strip_markdown_preview(text)
 
 
 def drop_persisted_tail_prefix(
@@ -947,8 +943,42 @@ class TranscriptReadProjection:
     ) -> tuple[str, float, bool]:
         """Return the newest preview, the recency epoch, and a stop flag.
 
-        Three values from the tail walk, because the preview text and the two
-        facts about it can come from different rows:
+        Every previewable row counts (the sessions sidebar's read). Three of the
+        four values the tail walk yields; :meth:`last_speech_info` documents it.
+        """
+        preview, epoch, stopped, _exhaustive = self._tail_walk(key, sanitize, speech_only=False)
+        return preview, epoch, stopped
+
+    def last_speech_info(
+        self,
+        key: str,
+        sanitize: Callable[[str], str] | None = None,
+    ) -> tuple[str, float, bool, bool]:
+        """Return the newest SPEECH preview, the recency epoch, a stop flag, and
+        whether the read was EXHAUSTIVE.
+
+        Speech only: rows ``is_speech_row`` accepts (user / assistant, minus
+        system notices and the workflow / sub-agent envelopes). The Crew
+        Members roster is the reader: a member's chat draws only what the
+        member says (``crew-mode.md``, "A crewmate's chat"), so its row's
+        one-line preview must quote the same thing, or a patroller whose chat
+        is empty sits beside a row quoting a shell command. The recency epoch
+        is unchanged by it -- it still reads the newest row, because a patrol
+        IS activity and the roster orders by it.
+        """
+        return self._tail_walk(key, sanitize, speech_only=True)
+
+    def _tail_walk(
+        self,
+        key: str,
+        sanitize: Callable[[str], str] | None,
+        *,
+        speech_only: bool,
+    ) -> tuple[str, float, bool, bool]:
+        """The one tail walk behind both reads above.
+
+        Four values, because the preview text and the facts about it can come
+        from different rows:
 
         - ``preview`` — the newest CONVERSATIONAL row's text, with the trailing
           stop card (and other non-previewable rows) skipped.
@@ -967,17 +997,28 @@ class TranscriptReadProjection:
           event is a stop": a bare resume that only re-arms the same stop card
           leaves the stop newest, so the flag holds until the member says
           something again.
+        - ``exhaustive`` — True when the walk reached the START of the log, so
+          an empty ``preview`` means the member has never said anything (or
+          nothing previewable). False when both tail windows were spent
+          without finding a previewable row while older rows remain unread: a
+          patroller that has written more than the widest window of machinery
+          since it last spoke reads as "" here although its speech exists
+          further back. The Crew Members roster reconcile writes an empty
+          speech-only answer into the append-only member log as the
+          authority, so it MUST NOT do so on a non-exhaustive read -- that
+          would durably erase a quote the transcript still holds.
         """
         # Function-local: dashboard.state imports kiro_crew.history at module
         # scope, which lands back here, so a top-level import would be a
         # cycle. By preview time the dashboard module is long since loaded.
         from kiro_crew.dashboard.state import is_stop_event_row
+        from kiro_crew.dashboard.system_notices import is_speech_row
 
         path = self._log._path(key)
         try:
             size = path.stat().st_size
         except OSError:
-            return "", 0.0, False
+            return "", 0.0, False, False
         windows = (
             self._log._PREVIEW_TAIL_BYTES,
             self._log._PREVIEW_TAIL_BYTES * 16,
@@ -1018,7 +1059,7 @@ class TranscriptReadProjection:
                         handle.readline()
                     tail = handle.read().decode("utf-8", errors="replace")
             except OSError:
-                return "", 0.0, False
+                return "", 0.0, False, False
             for line in reversed(tail.splitlines()):
                 line = line.strip()
                 if not line:
@@ -1047,22 +1088,30 @@ class TranscriptReadProjection:
                     if not newest_epoch:
                         newest_epoch = _row_epoch(data)
                     continue
+                # Normalised FIRST: a structured (list) content row is speech if
+                # its text blocks say something, exactly as the slot detail
+                # renders it; handing the raw list to the predicate would read
+                # legacy structured speech as machinery and blank the roster.
                 text = self._log._content_text(data.get("content"))
+                if speech_only and not is_speech_row(data.get("role"), text, data.get("meta")):
+                    # Machinery: skipped for the TEXT, kept for the recency.
+                    if not newest_epoch:
+                        newest_epoch = _row_epoch(data)
+                    continue
                 if not text:
                     continue
-                preview = _facade_strip_markdown_preview(text)
+                # The ONE spelling of a roster preview (strip -> sanitize -> cap),
+                # shared with the live `member/message` writer in state.py so the
+                # roster read never disagrees with what the live path folded.
+                preview = speech_preview(text, sanitize, self._log._PREVIEW_MAX_CHARS)
                 if not preview:
                     continue
-                # Sanitization precedes truncation so a boundary cannot hide a
-                # credential fragment from a caller's pattern-based redactor.
-                if sanitize is not None:
-                    preview = sanitize(preview)
-                if len(preview) > self._log._PREVIEW_MAX_CHARS:
-                    preview = preview[: self._log._PREVIEW_MAX_CHARS].rstrip() + "…"
-                return preview, newest_epoch or _row_epoch(data), bool(newest_is_stop)
+                return preview, newest_epoch or _row_epoch(data), bool(newest_is_stop), True
             if size <= window:
-                break
-        return "", newest_epoch, bool(newest_is_stop)
+                # The window held the whole file: nothing previewable exists.
+                return "", newest_epoch, bool(newest_is_stop), True
+        # Both windows spent, older rows unread: "" is not an answer.
+        return "", newest_epoch, bool(newest_is_stop), False
 
     @staticmethod
     def _content_text(content: object) -> str:

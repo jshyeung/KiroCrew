@@ -54,7 +54,7 @@ unit's id must not be enumerated as that other unit.
 | `member/config` | the roster's config-derived fields plus `changed: [field, ...]` | `handlers.agents` after a save that changed at least one roster field; `handlers.members.api_members` when the folded roster disagrees with the agents config (hand-edited config) |
 | `member/binding` | `{slot_key}` | `handlers.members.api_member_thread` after the DM binding is written |
 | `member/rules` | `{text}` | `handlers.members.api_member_rules_put` after the rules file is written |
-| `member/message` | `{ts, preview}` | `DashboardState._broadcast_chat_message` for a member DM slot |
+| `member/message` | `{ts, preview?}` — `preview` only for a SPEECH row (`user` / `assistant` with visible text); a machinery row (tool call, auto-nudge turn, envelope, say-nothing reply) carries `ts` alone, so the roster's `last_message` keeps the last thing said while `last_active_ts` still bumps. The payload is built by `eventlog_hooks.member_message_payload`, whose preview is `preview_text.speech_preview` (strip markdown → redact → cap at 120 with `…`) — the same function the cold roster read uses through `last_speech_info`, so the fold and the read agree byte for byte | `DashboardState._broadcast_chat_message` for a member DM slot |
 | `activity/record` | the participation record, including `ts` | `members.record_activity` (replaces the former `activity.jsonl`) |
 | `slot/opened` · `slot/closed` | `{slot_key}` · `{slot_key, reason}` | the `slots` broadcast, diffing member-driven slots against the previous set |
 | `patrol/started` · `patrol/stopped` | `{slot_key}` · `{slot_key, reason}` | the auto-nudge state callback in `slack.gateway` |
@@ -179,7 +179,34 @@ durably creates `.legacy-activity-folded` inside the fenced unit directory befor
 retiring the source files by rename; the binding and rules sources remain because
 their own events gate re-import. `api_members` reconciles the folded roster against
 the agents config on read, so a hand edit becomes one `member/config` event with the
-fields that differed.
+fields that differed. It reconciles the roster's `last_message` the same way
+(`eventlog_hooks.reconcile_member_preview`): the transcript's speech-only read is the
+authority, so a fold still quoting a machinery preview written before the preview
+became speech-only gets one correcting `member/message` — carrying the empty string
+when the member has never spoken, so the stale line does not stand beside an empty
+chat — and a second read appends nothing. The correction is written through
+`append_closer_if_still_applies` with `_preview_is_still_at`: the roster's
+`last_message` and `last_active_ts` must still read as they did when `api_members`
+observed them BEFORE its transcript read, re-checked under the per-slug write lock,
+so a `member/message` the crewmate speaks while the read is in flight refuses the
+older answer instead of being overwritten by it (the fold is last-wins by append
+order, so a stale append would otherwise regress both fields durably).
+The correction is also gated on the read being TRUSTWORTHY: `last_speech_info`
+returns a fourth value, `exhaustive`, true only when the tail walk reached the
+start of the transcript. A patroller that has written more than the widest tail
+window of machinery since it last spoke reads as `""` without it, and that `""`
+is "spoke further back than the read reaches", not "never spoke" — `api_members`
+leaves the row's own `last_message` empty (the client falls back to the folded
+quote) and appends nothing, so the quote the transcript still holds is never
+erased. The correction is also skipped for a member whose live slot holds rows
+the last flush has not persisted (`_slot_has_unflushed_rows`, the same three
+gates `_reconcile_slot_window` checks): the live `member/message` fires at
+in-memory append time while the transcript copy lands at flush, so in that
+window the disk read returns the PREVIOUS speech while the roster already holds
+the new one, and a correction would append the older quote on top.
+Content is normalised through `_content_text` before `is_speech_row`
+judges it, so a legacy structured (list-of-blocks) speech row is quoted, not
+mistaken for machinery.
 
 A slug is LOSSY: `slug_for_name` says so in its own docstring, and `Review_Agent`
 and `review-agent` both fold to `review-agent`. Colliding names are SUPPORTED, and

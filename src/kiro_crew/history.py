@@ -121,7 +121,10 @@ from kiro_crew.llm_helpers import (  # noqa: F401 - facade re-exports
     stream_and_collect_json,
 )
 from kiro_crew.messaging.link import canonical_key, is_legacy_slack_key, legacy_key
-from kiro_crew.preview_text import strip_markdown_preview  # noqa: F401 - facade re-export
+from kiro_crew.preview_text import (  # noqa: F401 - facade re-export
+    PREVIEW_MAX_CHARS,
+    strip_markdown_preview,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel  # noqa: F401 - facade re-export
 from kiro_crew.skills import (  # noqa: F401 - facade re-export
@@ -3401,13 +3404,16 @@ class ConversationLog:
     #: paying a full-file parse on large sessions.
     _PREVIEW_TAIL_BYTES = 16_384
     #: Max characters returned in a last-message preview.
-    _PREVIEW_MAX_CHARS = 120
+    _PREVIEW_MAX_CHARS = PREVIEW_MAX_CHARS
 
     def last_message_preview(self, key: str, sanitize=None) -> str:
         return self._read_projection.last_message_preview(key, sanitize=sanitize)
 
     def last_message_info(self, key: str, sanitize=None) -> tuple[str, float, bool]:
         return self._read_projection.last_message_info(key, sanitize=sanitize)
+
+    def last_speech_info(self, key: str, sanitize=None) -> tuple[str, float, bool, bool]:
+        return self._read_projection.last_speech_info(key, sanitize=sanitize)
 
     @staticmethod
     def _content_text(content: object) -> str:
