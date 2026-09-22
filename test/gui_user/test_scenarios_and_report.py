@@ -57,6 +57,7 @@ SHIPPED_SMOKE = {
     "taskrunner-projects-page-compose",
 }
 SHIPPED = SHIPPED_SMOKE | {
+    "crewmate-create-first",
     "crewmate-panel-tabs",
     "knowledge-add-folder-source-and-scan",
     "meet-crewmates-flow",
@@ -185,6 +186,7 @@ class TestShippedScenarios:
             ],
             "search": ["search-everywhere-jump-to-setting"],
             "members": [
+                "crewmate-create-first",
                 "crewmate-panel-tabs",
                 "meet-crewmates-flow",
                 "members-dm-hello",
@@ -599,7 +601,7 @@ class TestReport:
         md = report.render_features(catalog, _summary(), run_url="https://x/run")
         assert md.startswith("# GUI user-test feature catalog\n")
         assert (
-            f"_18 of {len(scenarios.FEATURES)} features covered · 37 scenarios (32 smoke / 5 nightly)._"
+            f"_18 of {len(scenarios.FEATURES)} features covered · 38 scenarios (32 smoke / 6 nightly)._"
             in md
         )
         assert (
