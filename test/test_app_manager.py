@@ -398,9 +398,7 @@ class TestUninstall:
         if not _mgr.platform_compat.IS_WINDOWS:
             linked_home = tmp_path / "home-link"
             linked_home.symlink_to(app_home)
-            monkeypatch.setattr(
-                _mgr, "app_dir", lambda name: linked_home / "apps" / name
-            )
+            monkeypatch.setattr(_mgr, "app_dir", lambda name: linked_home / "apps" / name)
 
         src = _make_app_source(tmp_path)
         install_app(src)
@@ -510,9 +508,7 @@ class TestUninstall:
         assert marker.exists(), "preserved data must be restored to data/"
         assert not (app_home / "apps" / ".test-app-data-tmp").exists()
 
-    def test_app_owned_names_sharing_the_deps_prefix_survive_uninstall(
-        self, tmp_path, app_home
-    ):
+    def test_app_owned_names_sharing_the_deps_prefix_survive_uninstall(self, tmp_path, app_home):
         """The sweep deletes only the gateway's own generated names: an
         app-owned entry that merely shares the .kirocrew-deps prefix (a
         user's backup dir) is preserved data, not a purge target."""
@@ -536,9 +532,7 @@ class TestUninstall:
             app_root / "data" / ".kirocrew-deps-staging-assets" / "art.bin"
         ).exists(), "app-owned staging-prefix data must survive"
 
-    def test_a_file_shaped_deps_artifact_is_purged_and_does_not_poison(
-        self, tmp_path, app_home
-    ):
+    def test_a_file_shaped_deps_artifact_is_purged_and_does_not_poison(self, tmp_path, app_home):
         """rmtree refuses non-directories, so a FILE written at a deps-tree
         name survives every uninstall and poisons the next quarantine
         rename. Shape-aware removal purges it - and a second
@@ -1192,9 +1186,7 @@ class TestInstalledApp:
             "deploy:local-segment@host.example:Owner/Repo.git",
         ],
     )
-    def test_write_boundary_preserves_non_uri_source_metadata(
-        self, app_home, coordinate: str
-    ):
+    def test_write_boundary_preserves_non_uri_source_metadata(self, app_home, coordinate: str):
         _write_installed(
             "metadata-app",
             InstalledApp(
@@ -1638,9 +1630,7 @@ class TestCopyAppTree:
         assert not (orphan / "leftover.bin").exists()
         assert (orphan / APP_MANIFEST_FILENAME).is_file()
 
-    def test_local_install_cannot_claim_a_repository_bound_grant(
-        self, tmp_path, app_home
-    ):
+    def test_local_install_cannot_claim_a_repository_bound_grant(self, tmp_path, app_home):
         from kiro_crew.config.loader import _invalidate_config_cache
 
         reviewed = "https://clone.example.test/Owner/reviewed-app"
@@ -1664,9 +1654,7 @@ class TestCopyAppTree:
         assert result.error_code == "app_trust_repository_mismatch"
         assert get_app("test-app") is None
 
-    def test_external_registration_cannot_claim_a_repository_bound_grant(
-        self, app_home
-    ):
+    def test_external_registration_cannot_claim_a_repository_bound_grant(self, app_home):
         from kiro_crew.config.loader import _invalidate_config_cache
 
         reviewed = "https://clone.example.test/Owner/reviewed-app"
@@ -1690,9 +1678,7 @@ class TestCopyAppTree:
         assert result.error_code == "app_trust_repository_mismatch"
         assert get_app("test-app") is None
 
-    def test_legacy_name_grant_cannot_install_repository_code(
-        self, tmp_path, app_home
-    ):
+    def test_legacy_name_grant_cannot_install_repository_code(self, tmp_path, app_home):
         from kiro_crew.config.loader import _invalidate_config_cache
 
         (app_home / "config.json").write_text(
@@ -1711,9 +1697,7 @@ class TestCopyAppTree:
         assert "Secret" not in result.error
         assert get_app("test-app") is None
 
-    def test_legacy_name_grant_cannot_claim_fresh_local_install(
-        self, tmp_path, app_home
-    ):
+    def test_legacy_name_grant_cannot_claim_fresh_local_install(self, tmp_path, app_home):
         from kiro_crew.config.loader import _invalidate_config_cache
 
         (app_home / "config.json").write_text(
@@ -1826,9 +1810,7 @@ class TestCopyAppTree:
         assert persisted is not None
         assert persisted.sourceUrl == reviewed
 
-    def test_registry_context_rechecks_binding_at_replacement_boundary(
-        self, tmp_path, app_home
-    ):
+    def test_registry_context_rechecks_binding_at_replacement_boundary(self, tmp_path, app_home):
         """A source changed after registry preflight cannot reach the copy step."""
         from kiro_crew.config.loader import _invalidate_config_cache
 
@@ -1875,9 +1857,7 @@ class TestCopyAppTree:
         assert first == "https://example.test/owner/first"
         assert second == "https://example.test/owner/second"
 
-    def test_legacy_name_grant_cannot_update_to_repository_code(
-        self, tmp_path, app_home
-    ):
+    def test_legacy_name_grant_cannot_update_to_repository_code(self, tmp_path, app_home):
         from kiro_crew.apps.manager import update_app
         from kiro_crew.config.loader import _invalidate_config_cache
 
@@ -1917,9 +1897,7 @@ class TestCopyAppTree:
         assert result.error_code == "app_trust_repository_mismatch"
         assert get_app("test-app") is None
 
-    def test_installed_legacy_local_grant_can_update_local_code(
-        self, tmp_path, app_home
-    ):
+    def test_installed_legacy_local_grant_can_update_local_code(self, tmp_path, app_home):
         from kiro_crew.apps.manager import update_app
         from kiro_crew.config.loader import _invalidate_config_cache
 
@@ -2071,9 +2049,7 @@ class TestCopyAppTree:
         assert get_app("test-app")["sessionApprovalConsentPending"] is False
 
     def test_fresh_install_with_session_approval_requires_consent(self, tmp_path, app_home):
-        result = install_app(
-            _make_app_source(tmp_path, permissions={"sessionApproval": True})
-        )
+        result = install_app(_make_app_source(tmp_path, permissions={"sessionApproval": True}))
 
         assert result.ok, result.error
         assert result.notice == "session_approval_reconsent"
@@ -2090,9 +2066,7 @@ class TestCopyAppTree:
         # refresh that keeps it is not a new request.
         from kiro_crew.apps.manager import update_app
 
-        assert install_app(
-            _make_app_source(tmp_path, permissions={"sessionApproval": True})
-        ).ok
+        assert install_app(_make_app_source(tmp_path, permissions={"sessionApproval": True})).ok
         assert enable_app("test-app", session_approval_consent=True).ok
         v2 = _make_app_source(
             tmp_path / "v2",
@@ -2187,9 +2161,7 @@ class TestCopyAppTree:
         assert get_app("ext-keypad")["enabled"] is False
         assert get_app("ext-keypad")["sessionApprovalConsentPending"] is False
 
-    def test_failed_self_registration_widening_restores_metadata(
-        self, app_home, monkeypatch
-    ):
+    def test_failed_self_registration_widening_restores_metadata(self, app_home, monkeypatch):
         from kiro_crew.apps import manager as manager_mod
 
         assert register_external_app("ext-keypad", "1.0.0", "Keypad").ok
@@ -2232,9 +2204,7 @@ class TestCopyAppTree:
             "version": "1.0.0",
             "permissions": {"sessionApproval": True},
         }
-        assert register_external_app(
-            "ext-keypad", "1.0.0", "Keypad", manifest_data=manifest
-        ).ok
+        assert register_external_app("ext-keypad", "1.0.0", "Keypad", manifest_data=manifest).ok
         original = _read_installed("ext-keypad")
         assert original is not None
         real_write = manager_mod._write_installed
@@ -2382,9 +2352,7 @@ def _ship_test_builtin(monkeypatch, root, manifest_data):
     shipped = root / "shipped-builtins"
     shipped_app = shipped / manifest_data["name"]
     shipped_app.mkdir(parents=True)
-    (shipped_app / "app.json").write_text(
-        json.dumps(manifest_data), encoding="utf-8"
-    )
+    (shipped_app / "app.json").write_text(json.dumps(manifest_data), encoding="utf-8")
     monkeypatch.setattr(execution, "_BUILTINS_DIR", shipped)
     return shipped_app
 
@@ -2471,9 +2439,7 @@ class TestEnabledStateTellsUnreadableFromNotInstalled:
 
         assert app_enabled_state("shape-probe") is None
 
-    def test_genuine_absence_stays_false_under_the_windows_error_class(
-        self, app_home, monkeypatch
-    ):
+    def test_genuine_absence_stays_false_under_the_windows_error_class(self, app_home, monkeypatch):
         """The control for the above: the shape check must not swallow real absence.
 
         Uninstall depends on this False, so a fix for the wrong-shape case that also
@@ -2969,9 +2935,7 @@ class TestBootSkillReconcile:
         assert "test-app/kept-skill" in registered
         # symlink on POSIX, directory junction on non-admin Windows.
         assert platform_compat.is_link_or_junction(skills_root / "test-app" / "kept-skill")
-        assert (
-            skills_root / "test-app" / "kept-skill"
-        ).resolve() == kept_skill.resolve()
+        assert (skills_root / "test-app" / "kept-skill").resolve() == kept_skill.resolve()
         # Stale skill symlinks removed
         assert not (app_skills_dir / "old-skill").exists()
         assert not (skills_root / "old-skill").exists()
@@ -3425,9 +3389,7 @@ class TestRegisterExternalPreservesServerProvenance:
         assert meta.sourceUrl == self._REPOSITORY
         assert meta.origin == "registry"
 
-    def test_allow_all_refresh_preserves_pin_and_pinned_resolver(
-        self, app_home, monkeypatch
-    ):
+    def test_allow_all_refresh_preserves_pin_and_pinned_resolver(self, app_home, monkeypatch):
         from kiro_crew.apps import registry
 
         self._seed_registry_app()
@@ -3456,9 +3418,7 @@ class TestRegisterExternalPreservesServerProvenance:
             "gitUrl": self._REPOSITORY,
             "_registry": self._REGISTRY,
         }
-        monkeypatch.setattr(
-            registry, "_registry_app_candidates", lambda name: [attacker, pinned]
-        )
+        monkeypatch.setattr(registry, "_registry_app_candidates", lambda name: [attacker, pinned])
 
         def _bare_name_lookup(name):
             raise AssertionError(f"bare-name lookup attempted for {name}")
@@ -3466,9 +3426,7 @@ class TestRegisterExternalPreservesServerProvenance:
         monkeypatch.setattr(registry, "get_registry_app", _bare_name_lookup)
         assert registry._resolve_install_entry("self-app") == (pinned, "")
 
-    def test_repository_bound_refresh_uses_existing_pin_and_rejects_rebind(
-        self, app_home
-    ):
+    def test_repository_bound_refresh_uses_existing_pin_and_rejects_rebind(self, app_home):
         from kiro_crew.config.loader import _invalidate_config_cache
 
         self._seed_registry_app()
@@ -3536,3 +3494,472 @@ class TestRegisterExternalPreservesServerProvenance:
         assert meta.source == "C:/local/second"
         assert meta.sourceUrl == ""
         assert meta.origin == "external"
+
+
+class TestAnUpdateMovesTheGrantGeneration:
+    """A narrowed manifest must not keep serving the grants it dropped.
+
+    The scope caches key on the grant generation and have NO expiry, so nothing
+    but a generation change can dislodge them. revoke/unrevoke/invalidate move
+    it; a manifest replacement did not, which made the staleness unbounded
+    rather than merely long -- an app whose API access was removed by an update
+    kept it for the life of the process.
+    """
+
+    def test_an_update_that_narrows_api_access_moves_the_generation(self, tmp_path, app_home):
+        from kiro_crew.apps.manager import install_app, update_app
+        from kiro_crew.eventlog import grants
+
+        assert install_app(_make_app_source(tmp_path, permissions={"api": ["/api/wide/"]})).ok
+        before = grants.revocation_generation()
+
+        result = update_app(
+            _make_app_source(tmp_path / "v2", version="2.0.0", permissions={"api": []})
+        )
+
+        assert result.ok, result.error
+        assert grants.revocation_generation() != before, (
+            "the manifest was replaced but the generation did not move, so every "
+            "cache keyed on it still answers for the old manifest"
+        )
+
+    def test_the_allowlist_stops_returning_a_removed_prefix(self, tmp_path, app_home):
+        """The property the generation bump exists for, read through the cache."""
+        from kiro_crew.apps.manager import install_app, update_app
+        from kiro_crew.dashboard import token_auth
+
+        assert install_app(_make_app_source(tmp_path, permissions={"api": ["/api/wide/"]})).ok
+        # Warm it, so the assertion below is about cache invalidation and not
+        # about a cold read that never had a stale entry to serve.
+        assert "/api/wide/" in token_auth._app_api_allowlist("test-app")
+
+        assert update_app(
+            _make_app_source(tmp_path / "v2", version="2.0.0", permissions={"api": []})
+        ).ok
+
+        assert "/api/wide/" not in token_auth._app_api_allowlist(
+            "test-app"
+        ), "a removed api grant is still authorized from the warm cache"
+
+
+class TestAGrantCannotOutliveTheUpdateThatRemovesIt:
+    """The generation must move BEFORE a manifest replacement, not only after.
+
+    The scope caches key on the generation and never expire, and an in-flight mutation
+    is fenced on the generation it read. While the generation sat still for the whole
+    of an update, a request that started before it could commit in the MIDDLE of it,
+    against the wide grant the operator was in the act of narrowing. The window is not
+    a nanosecond: it spans a tree copy and an ``rmtree``.
+    """
+
+    def test_the_generation_has_already_moved_while_the_tree_is_being_replaced(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        """Observed from inside the window, the only place the bug was visible.
+
+        Asserting only that the generation differs before and after an update passes
+        just as well with the bump at the end, which is what shipped. The question is
+        WHEN, so this looks from the middle.
+        """
+        from kiro_crew.apps import manager
+        from kiro_crew.eventlog import grants
+        from kiro_crew.eventlog.contrib import ContribError, assert_grants_unchanged
+
+        assert install_app(_make_app_source(tmp_path, permissions={"api": ["/api/wide/"]})).ok
+
+        # An append that checked its grant and then suspended, as the real path does
+        # when it offloads unit resolution.
+        fence_in_flight = grants.revocation_generation()
+        observed: dict[str, object] = {}
+        real_copy = manager._copy_app_tree
+
+        def copy_and_look_around(source, dest):
+            observed["generation"] = grants.revocation_generation()
+            try:
+                assert_grants_unchanged(fence_in_flight)
+                observed["fence"] = "PASSED -- the stale grant could commit here"
+            except ContribError as exc:
+                observed["fence"] = f"refused:{exc.code}"
+            return real_copy(source, dest)
+
+        monkeypatch.setattr(manager, "_copy_app_tree", copy_and_look_around)
+        result = manager.update_app(
+            _make_app_source(tmp_path / "v2", version="2.0.0", permissions={"api": []})
+        )
+
+        assert result.ok, result.error
+        assert observed, "the copy step never ran, so nothing was observed"
+        assert observed["generation"] != fence_in_flight, (
+            "mid-replacement the generation still matched what an in-flight request "
+            "read, so that request's commit fence would let it write against the "
+            "grant this update is removing"
+        )
+        assert observed["fence"] == "refused:app_revoked", observed["fence"]
+
+    def test_a_failed_update_also_moves_the_generation(self, tmp_path, app_home, monkeypatch):
+        """A rollback leaves a cache that may describe neither tree.
+
+        Asserting only that the generation differs from BEFORE the call would prove
+        nothing here: the pre-write bump already satisfies that, so such a test passes
+        with the rollback bump deleted. A mutation run caught exactly that, so this
+        reads the generation from inside the failing step -- after the pre-write bump
+        -- and requires it to move AGAIN by the time the call returns.
+        """
+        from kiro_crew.apps import manager
+        from kiro_crew.eventlog import grants
+
+        assert install_app(_make_app_source(tmp_path)).ok
+        observed: dict[str, int] = {}
+
+        def boom(source, dest):
+            observed["inside"] = grants.revocation_generation()
+            raise OSError("copy failed")
+
+        monkeypatch.setattr(manager, "_copy_app_tree", boom)
+        result = manager.update_app(_make_app_source(tmp_path / "v2", version="2.0.0"))
+
+        assert not result.ok
+        assert "inside" in observed, "the copy step never ran"
+        assert grants.revocation_generation() != observed["inside"], (
+            "the rollback did not move the generation, so an entry cached while the "
+            "tree was half-replaced stays answerable afterwards"
+        )
+
+    def test_external_re_registration_is_fenced_the_same_way(self, tmp_path, app_home):
+        """The sibling path narrows too, so it needs the same pre-write bump."""
+        import inspect
+
+        from kiro_crew.apps import manager
+        from kiro_crew.eventlog import grants
+
+        assert install_app(_make_app_source(tmp_path)).ok
+
+        source = inspect.getsource(manager.register_external_app)
+        before_write = source.split("atomic_write(manifest_path, manifest_text)")[0]
+        assert "_bump_grant_generation" in before_write, (
+            "external re-registration replaces the manifest without moving the "
+            "generation first, which is the window update_app just closed"
+        )
+
+        generation_before = grants.revocation_generation()
+        assert manager.register_external_app(
+            "test-app",
+            "3.0.0",
+            "Test App",
+            manifest_data={
+                "name": "test-app",
+                "version": "3.0.0",
+                "permissions": {"api": []},
+            },
+        ).ok
+        assert grants.revocation_generation() != generation_before
+
+    def test_every_replacement_path_bumps_before_and_after(self):
+        """Both paths, both sides of the write.
+
+        Pinned on the source so that dropping one side is caught even where no
+        behavioural test reaches it -- the rollback branches especially.
+
+        Counts CALLS, not the helper's name: a first version counted the bare name and
+        so counted a comment that mentions it, which left the count at 3 with a real
+        call deleted. A mutation run caught that.
+        """
+        import inspect
+
+        from kiro_crew.apps import manager
+
+        for func in (manager.update_app, manager.register_external_app):
+            source = inspect.getsource(func)
+            count = source.count('_bump_grant_generation(name, "')
+            assert count == 3, (
+                f"{func.__name__} should bump before the write, after it commits, and "
+                f"after a rollback; found {count} call(s)"
+            )
+
+    def test_a_bump_that_fails_is_reported_not_swallowed(self, caplog):
+        """The only operator signal that grants are now stale.
+
+        If the invalidation itself fails, the process keeps serving authority from a
+        manifest that is gone. That must not pass in silence, and nothing else reports
+        it -- the helper deliberately does not raise, so the log IS the signal.
+        """
+        import logging
+
+        from kiro_crew.apps import manager
+        from kiro_crew.eventlog import grants
+
+        def boom(app=None):
+            raise RuntimeError("cache unavailable")
+
+        original = grants.invalidate
+        grants.invalidate = boom
+        try:
+            with caplog.at_level(logging.ERROR, logger=manager.logger.name):
+                manager._bump_grant_generation("test-app", "in a test")
+        finally:
+            grants.invalidate = original
+
+        assert any(
+            r.levelno >= logging.ERROR and "test-app" in r.getMessage() for r in caplog.records
+        ), "a failed grant invalidation produced no error-level record"
+
+
+# ---------------------------------------------------------------------------
+# R25 -- the approval record is a cross-process transaction
+# ---------------------------------------------------------------------------
+class TestApprovalUpdatesAreSerializedAcrossProcesses:
+    """One file holds EVERY app's approvals, so its read-modify-write is one
+    transaction across PROCESSES and not merely across threads.
+
+    The CLI and the gateway are separate processes and both run lifecycle
+    operations -- ``uninstall_app`` argues that case at length for the execution
+    grant -- so a thread lock leaves two writers each replacing a snapshot taken
+    before the other's change. The loser's approval disappears, and in the worse
+    direction a stale snapshot RESTORES a kind an app had just narrowed away.
+
+    The concurrency pins drive a REAL second process and order it with sentinel
+    files. Nothing sleeps to guess an interleaving: the exclusion pin asserts an
+    event that must NEVER happen -- the child completing while the lock is held --
+    and a timeout on the child's own exit answers exactly that. Polling for a
+    sentinel that MUST appear is a different thing and is bounded.
+    """
+
+    # Written as source because the child is a separate interpreter: it inherits
+    # KIROCREW_HOME from the fixture and therefore resolves the same record.
+    CHILD = (
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text('1')\n"
+        "from kiro_crew.apps.manager import record_unit_approvals\n"
+        "record_unit_approvals(sys.argv[3], ('member',))\n"
+        "pathlib.Path(sys.argv[2]).write_text('1')\n"
+    )
+
+    def _spawn(self, tmp_path, app):
+        import subprocess
+        import sys
+
+        started = tmp_path / f"{app}.started"
+        done = tmp_path / f"{app}.done"
+        proc = subprocess.Popen(
+            [sys.executable, "-c", self.CHILD, str(started), str(done), app],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return proc, started, done
+
+    @staticmethod
+    def _await(path, proc, *, timeout=60.0):
+        """Wait for a sentinel that must appear, failing loudly if the child dies."""
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists():
+                return
+            if proc.poll() is not None:
+                _, err = proc.communicate()
+                raise AssertionError(f"child exited early with rc={proc.returncode}: {err[-600:]}")
+            time.sleep(0.02)
+        raise AssertionError(f"child never reached {path.name}")
+
+    def test_another_process_cannot_enter_the_transaction_while_it_is_held(
+        self, app_home, tmp_path
+    ):
+        import subprocess
+
+        from kiro_crew.apps import manager
+
+        manager.record_unit_approvals("holder-app", ("member",))
+        proc, started, done = self._spawn(tmp_path, "waiter-app")
+        try:
+            with manager._unit_approvals_update() as approvals:
+                self._await(started, proc)
+                # The child is running and its write is the next thing it does. It
+                # must not be able to finish while this transaction holds the
+                # record, so its own exit timing out IS the assertion.
+                with pytest.raises(subprocess.TimeoutExpired):
+                    proc.wait(timeout=2.0)
+                assert not done.exists(), "another process wrote while the lock was held"
+                approvals["holder-app"] = ("member",)
+            # Released, so the child may now proceed -- and must, or the lock would
+            # be an exclusion that never lets go.
+            assert proc.wait(timeout=60) == 0
+            self._await(done, proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
+
+    def test_a_write_from_another_process_is_not_erased_by_the_next_one(self, app_home, tmp_path):
+        from kiro_crew.apps.manager import approved_unit_kinds, record_unit_approvals
+
+        record_unit_approvals("first-app", ("member",))
+        proc, _started, done = self._spawn(tmp_path, "second-app")
+        try:
+            self._await(done, proc)
+            assert proc.wait(timeout=60) == 0
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
+
+        # This process has not read the record since the child wrote it, so its
+        # own next write is exactly the stale-snapshot case.
+        record_unit_approvals("third-app", ("member",))
+
+        assert approved_unit_kinds("first-app") == frozenset({"member"})
+        assert approved_unit_kinds("second-app") == frozenset({"member"})
+        assert approved_unit_kinds("third-app") == frozenset({"member"})
+
+    def test_the_record_is_re_read_inside_the_lock(self, app_home, monkeypatch):
+        """Order is the property, so order is what this asserts.
+
+        A value read BEFORE acquiring describes a record another writer may already
+        have replaced, and the write then puts that stale value back. Locking the
+        write alone would leave exactly that hole, and the consequence is only
+        observable on an interleaving no test can force once the lock is correct --
+        so the discipline is pinned directly.
+        """
+        import contextlib
+
+        from kiro_crew.apps import manager
+
+        order: list[str] = []
+        real_read = manager._read_unit_approvals
+        real_lock = manager.platform_compat.file_lock
+
+        def _read():
+            order.append("read")
+            return real_read()
+
+        @contextlib.contextmanager
+        def _lock(fd, **kwargs):
+            order.append("lock")
+            with real_lock(fd, **kwargs):
+                yield
+            order.append("unlock")
+
+        monkeypatch.setattr(manager, "_read_unit_approvals", _read)
+        monkeypatch.setattr(manager.platform_compat, "file_lock", _lock)
+
+        manager.record_unit_approvals("ordered-app", ("member",))
+
+        assert order == ["lock", "read", "unlock"]
+
+
+class TestAFailedApprovalWriteRollsTheInstallBack:
+    """Metadata, approvals and the secret are one transaction.
+
+    The metadata alone is what the already-installed refusal keys on, so a failure
+    after it and before the secret leaves an app that cannot be used and cannot be
+    reinstalled. The trigger is an ordinary write failure, not an extreme condition.
+    """
+
+    def test_the_install_reports_failure_and_leaves_no_installed_record(
+        self, app_home, tmp_path, monkeypatch
+    ):
+        from kiro_crew.apps import manager
+
+        def _boom(name, kinds):
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(manager, "record_unit_approvals", _boom)
+
+        result = install_app(_make_app_source(tmp_path, name="rollback-app"))
+
+        assert result.ok is False
+        assert "rollback-app" in (result.error or "")
+        # The refusal above keys on this record, so leaving it behind is what
+        # strands the name.
+        assert _read_installed("rollback-app") is None
+
+    def test_a_retry_after_the_failure_is_not_refused_as_already_installed(
+        self, app_home, tmp_path, monkeypatch
+    ):
+        from kiro_crew.apps import manager
+
+        calls: list[str] = []
+        real_record = manager.record_unit_approvals
+
+        def _once(name, kinds):
+            calls.append(name)
+            if len(calls) == 1:
+                raise OSError("read-only file system")
+            real_record(name, kinds)
+
+        monkeypatch.setattr(manager, "record_unit_approvals", _once)
+        src = _make_app_source(tmp_path, name="retry-app")
+
+        assert install_app(src).ok is False
+        second = install_app(src)
+
+        assert second.ok is True, second.error
+        assert _read_installed("retry-app") is not None
+
+    def test_the_approval_entry_does_not_survive_the_failed_install(
+        self, app_home, tmp_path, monkeypatch
+    ):
+        from kiro_crew.apps import manager
+
+        real_record = manager.record_unit_approvals
+
+        def _write_then_fail(name, kinds):
+            # The approval lands and a LATER step fails, which is the ordering that
+            # would otherwise leave an approval for an app that is not installed.
+            real_record(name, kinds)
+            raise OSError("disk quota exceeded")
+
+        monkeypatch.setattr(manager, "record_unit_approvals", _write_then_fail)
+
+        assert install_app(_make_app_source(tmp_path, name="orphan-app")).ok is False
+        assert manager.approved_unit_kinds("orphan-app") == frozenset()
+
+
+class TestAFailedApprovalCleanupDoesNotAbortTheUninstall:
+    """The files are already gone, so a cleanup failure may only be reported.
+
+    Raising here would skip the SECOND trust withdrawal, which that block's own
+    argument identifies as the only closure of the orphan-grant window -- the state
+    that lets a different app later installed under this name execute with no
+    consent prompt. Losing a cleanup is the smaller harm.
+    """
+
+    def test_the_uninstall_succeeds_and_reports_the_residual(self, app_home, tmp_path, monkeypatch):
+        from kiro_crew.apps import manager
+
+        install_app(_make_app_source(tmp_path, name="cleanup-app"))
+
+        def _boom(name):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(manager, "forget_unit_approvals", _boom)
+
+        result = uninstall_app("cleanup-app", keep_data=False)
+
+        assert result.ok is True, result.error
+        assert "approvals" in (result.message or "").lower()
+        assert "cleanup-app" in (result.message or "")
+
+    def test_the_second_trust_withdrawal_still_runs(self, app_home, tmp_path, monkeypatch):
+        from kiro_crew.apps import manager
+
+        install_app(_make_app_source(tmp_path, name="withdraw-app"))
+
+        drops: list[str] = []
+        real_drop = manager._drop_trust_grant
+
+        def _counted(name):
+            drops.append(name)
+            real_drop(name)
+
+        def _boom(name):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(manager, "_drop_trust_grant", _counted)
+        monkeypatch.setattr(manager, "forget_unit_approvals", _boom)
+
+        assert uninstall_app("withdraw-app", keep_data=False).ok is True
+        # Twice: once before the delete so a failure is retryable with nothing
+        # destroyed, once after so no grant is left over a name with no app.
+        assert drops == ["withdraw-app", "withdraw-app"]
