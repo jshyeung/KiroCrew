@@ -10365,6 +10365,32 @@
         "thinking": "Riflessione",
         "thought_process": "Processo di ragionamento"
       },
+      "thread": {
+        "title": "Thread",
+        "close": "Chiudi il thread",
+        "reply_in_thread": "Rispondi nel thread",
+        "open_thread": "Apri il thread",
+        "replies_count_one": "{{count}} risposta",
+        "replies_count_many": "{{count}} risposte",
+        "replies_count_other": "{{count}} risposte",
+        "last_reply": "Ultima risposta {{when}}",
+        "you": "Tu",
+        "no_replies_yet": "Ancora nessuna risposta",
+        "replying": "{{name}} sta rispondendo…",
+        "reply_placeholder": "Rispondi nel thread…",
+        "reply_after_retry": "Premi Riprova per caricare il thread, poi rispondi.",
+        "send_reply": "Invia risposta",
+        "err_replying": "{{name}} sta ancora rispondendo. Aspetta quella risposta.",
+        "err_parent_gone": "Quel messaggio non è più in questa chat.",
+        "err_too_long": "Quella risposta è troppo lunga. Accorciala e riprova.",
+        "err_full": "Questo thread è pieno. Chiedi nella chat principale.",
+        "err_chat_full": "Questa chat non ha spazio per altre risposte nei thread. Apri una nuova chat per continuare.",
+        "err_send_failed": "La risposta non è stata inviata. Premi invia per riprovare.",
+        "err_load_failed": "Impossibile caricare questo thread.",
+        "err_summary_failed": "Impossibile caricare i thread di risposta di questa chat. Le tue risposte sono ancora salvate; la chat in sé è aggiornata.",
+        "err_flag_failed": "Impossibile verificare se i thread di risposta sono attivi per questa chat. La chat in sé è aggiornata; le eventuali risposte sono ancora salvate.",
+        "retry": "Riprova"
+      },
       "toolCallLine": {
         "diff_truncated": "diff troncato",
         "aria_awaiting_approval": "In attesa di approvazione per lo strumento: {{label}}",
@@ -14460,6 +14486,14 @@
         "on_windows_keystrokes_take_your_keyboard_focus": "Su Windows, i tasti premuti assumono il focus della tastiera e i clic per coordinate spostano il cursore reale: questa piattaforma non ha un percorso di input per singola app.",
         "the_app_lists_in_computer_use_json_could_not_be": "Non è stato possibile leggere gli elenchi di app in computer_use.json, quindi qui appaiono vuoti. L’agente continua a rifiutare ogni azione che dipende da essi fino a quando il file non è JSON valido.",
         "your_chat_sessions_were_restarted_so_this_takes": "Le tue sessioni di chat sono state riavviate perché questa modifica abbia effetto subito — Kiro legge l’elenco dei suoi strumenti una volta per sessione, quindi una chat aperta non l’avrebbe recepita. I tuoi messaggi sono ancora lì; l’agente rilegge il proprio contesto al tuo prossimo messaggio."
+      },
+      "crewmatesSection": {
+        "title": "Membri della crew",
+        "reply_threads": "Thread di risposta sui messaggi della chat di un membro",
+        "reply_threads_desc": "Consenti a qualsiasi messaggio nella chat di un membro della crew di avere il proprio thread di risposta, aperto nel pannello laterale mentre la chat resta visibile. Disattivato, Rispondi nel thread non viene offerto e i thread esistenti sono nascosti, non eliminati.",
+        "failed_to_save": "Impossibile salvare l'impostazione della crew. Riprova.",
+        "failed_to_load": "Impossibile caricare le impostazioni della crew.",
+        "retry": "Riprova"
       },
       "developerPanel": {
         "developer_mode": "Modalità sviluppatore",

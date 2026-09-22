@@ -40,6 +40,8 @@ import { REASONING_ROLES } from '../pages/chat/groupDisplayItems'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
 import { renderUserContent } from '../pages/chat/ChatPageMessageContent'
+import ThreadFooter from '../pages/chat/ThreadFooter'
+import type { ThreadSummary } from '../api/threads'
 import type { ChatMessage } from '../types'
 import { fmtMessageTime, fmtMessageTimeFull } from '../pages/chat/messageTime'
 import { turnHadPolicyBlock } from './turnPolicyBlock'
@@ -47,6 +49,16 @@ import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { isRejectedDecision } from '../utils/approvalDecision'
 
 /** Everything a renderer may read. Passed per row so entries stay pure functions. */
+/** What a host that offers reply threads hands the rows: the footer data per
+ *  parent `mid`, and the open action. Both are keyed by the message's durable
+ *  `meta.mid`, the only identity a thread can hang off. */
+export interface ThreadHooks {
+  summaryOf: (mid: string) => ThreadSummary | undefined
+  onOpen: (mid: string) => void
+  /** The crewmate's display name -- the face beside its replies. */
+  crewmateName: string
+}
+
 export interface MessageRenderContext {
   /** Index of this message in `messages`. Needed by rows that look ahead. */
   index: number
@@ -67,6 +79,9 @@ export interface MessageRenderContext {
   autoDeniedIds: Set<string>
   /** Host-injected tool row, kept as a shorthand for replacing the tool entries. */
   renderTool?: (message: ChatMessage) => React.ReactNode
+  /** Reply threads on this transcript's messages (a crewmate's chat). Absent
+   *  on every other surface: no footer, no "Reply in thread" action. */
+  threads?: ThreadHooks
   /** Bubble layout used by conversational rows. `isUser` right-aligns. */
   wrapper: (children: React.ReactNode, isUser?: boolean) => React.ReactNode
   /** Full-width row layout used by cards, pills and banners. */
@@ -93,6 +108,32 @@ export interface MessageRenderer {
 export function formatTs(ts?: string): string | undefined {
   if (!ts) return undefined
   return fmtMessageTime(ts) || undefined
+}
+
+/** The durable id a thread hangs off, or `undefined` for a row that has none
+ *  (a pre-id transcript row cannot carry a thread). */
+export function threadMidOf(m: ChatMessage): string | undefined {
+  const mid = (m.meta as Record<string, unknown> | undefined)?.mid
+  return typeof mid === 'string' && mid ? mid : undefined
+}
+
+/** The footer under a bubble whose thread has replies, or null. `align` follows
+ *  the bubble: the user's sits on the right. */
+export function threadFooterFor(m: ChatMessage, ctx: MessageRenderContext, align: 'start' | 'end'): React.ReactNode {
+  const hooks = ctx.threads
+  const mid = threadMidOf(m)
+  if (!hooks || !mid) return null
+  const summary = hooks.summaryOf(mid)
+  if (!summary || summary.count <= 0) return null
+  return <ThreadFooter summary={summary} crewmateName={hooks.crewmateName} align={align} onOpen={() => hooks.onOpen(mid)} />
+}
+
+/** The row action that opens (or starts) the thread on this message, or undefined. */
+export function replyInThreadFor(m: ChatMessage, ctx: MessageRenderContext): (() => void) | undefined {
+  const hooks = ctx.threads
+  const mid = threadMidOf(m)
+  if (!hooks || !mid) return undefined
+  return () => hooks.onOpen(mid)
 }
 
 /**
@@ -373,32 +414,35 @@ export function renderAssistantBubble(
     if (!nextRelevant) showFooter = !ctx.running
     if (opts.forceFooter) showFooter = true
   }
-  return (
-    <div className="flex flex-col gap-0">
-      <AssistantMessage
-        content={m.content}
-        isStreaming={isStreaming}
-        timestamp={formatTs(m.ts)}
-        timestampTitle={fmtMessageTimeFull(m.ts)}
-        showFooter={showFooter}
-        slotRunning={ctx.running}
-        onFileOpen={ctx.onFileOpen}
-        onQuote={ctx.onQuote}
-        onAsk={ctx.onAsk}
-        variants={m.variants}
-        variantIdx={m.variant_idx}
-        turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
-        decisionsStrip={decisionStripFieldOf(m)}
-        fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
-        suppressSteerAck={
-          opts.policyBlockTranscript
-            ? turnHadPolicyBlock(opts.policyBlockTranscript.messages, opts.policyBlockTranscript.index)
-            : turnHadPolicyBlock(ctx.messages, ctx.index)
-        }
-        bubbleClassName={bubbleClassName}
-      />
-    </div>
+  const bubble = (
+    <AssistantMessage
+      content={m.content}
+      isStreaming={isStreaming}
+      timestamp={formatTs(m.ts)}
+      timestampTitle={fmtMessageTimeFull(m.ts)}
+      showFooter={showFooter}
+      slotRunning={ctx.running}
+      onFileOpen={ctx.onFileOpen}
+      onQuote={ctx.onQuote}
+      onAsk={ctx.onAsk}
+      variants={m.variants}
+      variantIdx={m.variant_idx}
+      turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
+      decisionsStrip={decisionStripFieldOf(m)}
+      fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
+      suppressSteerAck={
+        opts.policyBlockTranscript
+          ? turnHadPolicyBlock(opts.policyBlockTranscript.messages, opts.policyBlockTranscript.index)
+          : turnHadPolicyBlock(ctx.messages, ctx.index)
+      }
+      bubbleClassName={bubbleClassName}
+      onReplyInThread={isStreaming ? undefined : replyInThreadFor(m, ctx)}
+    />
   )
+  // The column's child is the bubble itself unless this message has a thread
+  // footer to hang under it, so a host reading the bubble finds it in place.
+  const footer = threadFooterFor(m, ctx, 'start')
+  return <div className="flex flex-col gap-0">{footer ? <>{bubble}{footer}</> : bubble}</div>
 }
 
 /**
@@ -447,16 +491,22 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     // `meta.files` — rendered as nothing, though the same row drew fine on
     // ChatPage. A host that opens files supplies `ctx.onFileOpen`; without it
     // the cards and chips still render, inert.
-    render: (m, ctx) => ctx.wrapper(
-      <UserMessage
-        content={m.content}
-        meta={m.meta}
-        timestamp={formatTs(m.ts)}
-        timestampTitle={fmtMessageTimeFull(m.ts)}
-        renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
-      />,
-      true,
-    ),
+    render: (m, ctx) => {
+      const bubble = (
+        <UserMessage
+          content={m.content}
+          meta={m.meta}
+          timestamp={formatTs(m.ts)}
+          timestampTitle={fmtMessageTimeFull(m.ts)}
+          renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
+          onReplyInThread={replyInThreadFor(m, ctx)}
+        />
+      )
+      // The bubble alone on every surface without a thread footer to draw, so
+      // the row's shape (and what a host reads off it) is unchanged there.
+      const footer = threadFooterFor(m, ctx, 'end')
+      return ctx.wrapper(footer ? <>{bubble}{footer}</> : bubble, true)
+    },
   },
   {
     // Refines `assistant`, so it must precede it: a gateway system notice

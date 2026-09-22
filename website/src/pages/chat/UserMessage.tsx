@@ -1,6 +1,6 @@
 import { memo, useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
-import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff, X } from 'lucide-react'
+import { Pencil, Send, Copy, Check, Link2, MessageSquare, Target, Pin, PinOff, X } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
 import { ICON_ACTION_ROW_CLS } from '../../utils/touchActions'
@@ -41,6 +41,8 @@ interface UserMessageProps {
   mode?: string
   pinned?: boolean
   onTogglePin?: () => void
+  /** Open (or start) the reply thread on this message. Only a crewmate's chat offers it. */
+  onReplyInThread?: () => void
   /** Whether the slot currently has a running turn. Gates the pending-steer
    *  indicator: the backend settle is best-effort, so a row can be stranded in
    *  `written` forever, and a perpetual "Steering…" pulse on an idle slot
@@ -57,7 +59,7 @@ interface UserMessageProps {
   hideSteerBadge?: boolean
 }
 
-const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin, slotRunning, hideSteerBadge }: UserMessageProps) {
+const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin, onReplyInThread, slotRunning, hideSteerBadge }: UserMessageProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [editing, setEditing] = useState(false)
   const ime = useImeGuard()
@@ -405,6 +407,17 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
           icon + 10px padding); hover-capable pointers keep the reveal-on-hover
           behavior and the compact 14px icons untouched. */}
       <div className={`flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${ICON_ACTION_ROW_CLS}`}>
+        {onReplyInThread && (
+          <button
+            onClick={onReplyInThread}
+            className="text-muted hover:text-text p-0.5 rounded transition-colors"
+            data-testid="reply-in-thread"
+            title={i18nT('pages.chat.thread.reply_in_thread')}
+            aria-label={i18nT('pages.chat.thread.reply_in_thread')}
+          >
+            <MessageSquare size={14} />
+          </button>
+        )}
         <button
           onClick={() => {
             const pastes = (meta?.pastes as PasteBlock[] | undefined) || []

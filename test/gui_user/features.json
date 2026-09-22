@@ -3,11 +3,11 @@
   "raw_record_count": 387,
   "counts": {
     "smoke": 42,
-    "nightly": 166,
+    "nightly": 167,
     "native-only": 12,
     "needs-secret": 27,
     "excluded": 22,
-    "total": 269
+    "total": 270
   },
   "priorities": {
     "P0": 10,
@@ -1978,6 +1978,39 @@
         "members-roster-filter"
       ],
       "component": "website/src/pages/members/MembersPage.tsx"
+    },
+    {
+      "id": "crewmate-reply-thread",
+      "feature": "members",
+      "title": "Reply in thread on a crewmate's bubble opens the thread panel and the bubble gains a replies footer",
+      "user_story": "As a user talking to a crewmate, I want to ask about one thing it said in a reply thread on that message, so that the follow-up stays beside the message it is about instead of pushing the crewmate's findings up the main chat.",
+      "start_url": "/settings",
+      "entry_path": "Settings > Developer > Feature Previews > enable Crew Members; Settings > Developer > Crewmates > enable Reply threads on crewmate chat messages; Rail > Crew Members > Nova Sky > send a message, get a reply > hover the reply bubble > Reply in thread > Thread panel (quoted parent, 'No replies yet') > send a reply in the panel",
+      "preconditions": {
+        "seed": "rich",
+        "members": [
+          "nova-sky"
+        ],
+        "feature_flags": [
+          "mc-preview-crew"
+        ],
+        "notes": "Threads exist only on a crewmate's chat (a member-mode slot); the fake ACP backend answers the main-chat message so a finished crewmate bubble carries the Reply in thread action, and answers the thread reply too, so the footer reads '1 reply' then '2 replies'. Replies live in the slot's .threads sidecar, never in the transcript."
+      },
+      "runnable": "nightly",
+      "estimated_steps": 8,
+      "rationale": "Hover-revealed action, a side panel opening beside the chat and a footer count under one bubble are pixel-level judgements over two model turns; the DOM tests cover the store, the renderer shape and the panel in isolation.",
+      "source": [
+        "website/src/pages/members/ThreadPanel.tsx",
+        "website/src/pages/chat/ThreadFooter.tsx",
+        "website/src/app-sdk/messageRenderers.tsx",
+        "src/kiro_crew/dashboard/chat_threads.py",
+        "docs/system-specs/modules/history.md"
+      ],
+      "priority": "P1",
+      "merged_from": [
+        "crewmate-reply-thread"
+      ],
+      "component": "website/src/pages/members/ThreadPanel.tsx"
     },
     {
       "id": "members-private-memory-keeps-thread",

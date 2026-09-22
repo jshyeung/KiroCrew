@@ -50,7 +50,7 @@ import { FileCard } from '../../components/FileCard'
 import UserMessage from './UserMessage'
 import CrewmateMessage, { type CrewmateIdentity } from './CrewmateMessage'
 import { crewmateBubbleClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
-import { formatTs, renderAssistantBubble, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
+import { formatTs, renderAssistantBubble, replyInThreadFor, threadFooterFor, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
 import { renderUserContent } from './ChatPageMessageContent'
 import { fmtMessageTimeFull } from './messageTime'
 import type { ChatMessage } from '../../types'
@@ -458,14 +458,18 @@ export function createTranscriptRenderers(
           id: 'user',
           roles: ['user'],
           render: (m: ChatMessage, ctx: MessageRenderContext) => ctx.wrapper(
-            <UserMessage
-              content={m.content}
-              meta={m.meta}
-              timestamp={formatTs(m.ts)}
-              timestampTitle={fmtMessageTimeFull(m.ts)}
-              renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
-              hideSteerBadge
-            />,
+            <>
+              <UserMessage
+                content={m.content}
+                meta={m.meta}
+                timestamp={formatTs(m.ts)}
+                timestampTitle={fmtMessageTimeFull(m.ts)}
+                renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
+                hideSteerBadge
+                onReplyInThread={replyInThreadFor(m, ctx)}
+              />
+              {threadFooterFor(m, ctx, 'end')}
+            </>,
             true,
           ),
         } satisfies MessageRenderer]

@@ -45,8 +45,22 @@ vi.mock('../../api/client', () => ({
     // tab raises a red alert, so a silent fallback (a remembered crew that
     // was renamed away) would read as an error on a page that is behaving.
     memberPanel: vi.fn(() => Promise.resolve({ panel: null, html: null })),
+    // `dashboard.crewmate_threads` (reply threads) is read from the shared config
+    // query; an empty config is the default -- the flag is OFF.
+    kirocrewConfig: vi.fn(() => Promise.resolve({})),
   },
 }))
+
+// The reply-thread footer read. Spied so the flag cases below can pin that it
+// is never issued while `dashboard.crewmate_threads` is off.
+const threadsSummary = vi.fn(() => Promise.reject(new Error('threads unavailable')))
+vi.mock('../../api/threads', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../api/threads')>()
+  return {
+    ...actual,
+    threadsApi: { ...actual.threadsApi, summary: (...args: unknown[]) => threadsSummary(...args) },
+  }
+})
 
 /* The page now hosts the chat page's SidePanel. Its strip and + menu are what
  * these cases drive; the heavy tab BODIES (editors, terminals, previews) are
@@ -256,6 +270,8 @@ beforeEach(() => {
   vi.mocked(api.memberActivity).mockImplementation(() =>
     Promise.resolve({ slug: '', member: '', capped: false, entries: [] }),
   )
+  // The flag case above turns reply threads ON for one test; back to the default.
+  vi.mocked(api.kirocrewConfig).mockImplementation(() => Promise.resolve({}))
   vi.mocked(api.memberBriefing).mockImplementation(() =>
     Promise.resolve({ slug: '', member: '', supported: true, text: '', updated_ts: null, redacted: false, truncated: false }),
   )
@@ -278,6 +294,41 @@ beforeEach(() => {
 })
 
 describe('MembersPage roster', () => {
+  it('reply threads off (the default): no footer read is issued and no thread notice is drawn', async () => {
+    await renderPage([row()], 'kirocrew', { route: '/members?member=oncall' })
+    await screen.findByTestId('chat-pane-stub', PANE_READY)
+    // The config read has resolved (to an empty config) by the time the pane is up.
+    await waitFor(() => expect(api.kirocrewConfig).toHaveBeenCalled())
+    expect(threadsSummary).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('member-threads-error-row')).toBeNull()
+    expect(screen.queryByTestId('thread-panel')).toBeNull()
+  })
+
+  it('reply threads on: the footer read is issued for the confirmed slot and its failure is shown', async () => {
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ dashboard: { crewmate_threads: true } })
+    await renderPage([row()], 'kirocrew', { route: '/members?member=oncall' })
+    await screen.findByTestId('chat-pane-stub', PANE_READY)
+    await waitFor(() => expect(threadsSummary).toHaveBeenCalledWith('member-oncall'))
+    await screen.findByTestId('member-threads-error-row', PANE_READY)
+  })
+
+  it('a failed config read is said with a Retry, not rendered as threads off', async () => {
+    vi.mocked(api.kirocrewConfig).mockRejectedValueOnce(new Error('boom'))
+    await renderPage([row()], 'kirocrew', { route: '/members?member=oncall' })
+    await screen.findByTestId('chat-pane-stub', PANE_READY)
+    // The failure is a notice on the standard path, with the read offered again.
+    await screen.findByTestId('member-threads-flag-error-row', PANE_READY)
+    expect(screen.getByTestId('member-threads-flag-error')).toHaveTextContent(/Couldn't check whether reply threads are on/)
+    // Not known to be on: no footer read, no panel -- and no silent "off" either.
+    expect(threadsSummary).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('thread-panel')).toBeNull()
+    // Retry re-reads; a config that now says on turns the feature on in place.
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ dashboard: { crewmate_threads: true } })
+    fireEvent.click(screen.getByTestId('member-threads-flag-retry'))
+    await waitFor(() => expect(threadsSummary).toHaveBeenCalledWith('member-oncall'))
+    await waitFor(() => expect(screen.queryByTestId('member-threads-flag-error-row')).toBeNull())
+  })
+
   it('renders one row per member from the API', async () => {
     await renderPage([row(), row({ name: 'research', slug: 'research' })])
     expect(await rosterRow('oncall')).toBeInTheDocument()

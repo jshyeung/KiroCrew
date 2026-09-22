@@ -10365,6 +10365,32 @@
         "thinking": "Pensando",
         "thought_process": "Processo de raciocínio"
       },
+      "thread": {
+        "title": "Tópico",
+        "close": "Fechar o tópico",
+        "reply_in_thread": "Responder no tópico",
+        "open_thread": "Abrir o tópico",
+        "replies_count_one": "{{count}} resposta",
+        "replies_count_many": "{{count}} respostas",
+        "replies_count_other": "{{count}} respostas",
+        "last_reply": "Última resposta {{when}}",
+        "you": "Você",
+        "no_replies_yet": "Ainda não há respostas",
+        "replying": "{{name}} está respondendo…",
+        "reply_placeholder": "Responder no tópico…",
+        "reply_after_retry": "Toque em Tentar de novo para carregar o tópico e depois responda.",
+        "send_reply": "Enviar resposta",
+        "err_replying": "{{name}} ainda está respondendo. Espere essa resposta.",
+        "err_parent_gone": "Essa mensagem não está mais neste chat.",
+        "err_too_long": "Essa resposta é longa demais. Encurte e tente de novo.",
+        "err_full": "Este tópico está cheio. Pergunte no chat principal.",
+        "err_chat_full": "Este chat não tem espaço para mais respostas em tópicos. Comece um chat novo para continuar.",
+        "err_send_failed": "A resposta não foi enviada. Toque em enviar para tentar de novo.",
+        "err_load_failed": "Não foi possível carregar este tópico.",
+        "err_summary_failed": "Não foi possível carregar os tópicos de resposta deste chat. Suas respostas continuam salvas; o chat em si está atualizado.",
+        "err_flag_failed": "Não foi possível verificar se os tópicos de resposta estão ativados neste chat. O chat em si está atualizado; as respostas que existirem continuam salvas.",
+        "retry": "Tentar de novo"
+      },
       "toolCallLine": {
         "diff_truncated": "diff truncado",
         "aria_awaiting_approval": "Aguardando aprovação da ferramenta: {{label}}",
@@ -14460,6 +14486,14 @@
         "on_windows_keystrokes_take_your_keyboard_focus": "No Windows, as teclas assumem o foco do teclado e os cliques por coordenadas movem o cursor real — esta plataforma não tem uma rota de entrada por aplicativo.",
         "the_app_lists_in_computer_use_json_could_not_be": "As listas de apps em computer_use.json não puderam ser lidas, então aparecem vazias aqui. O agente continua recusando toda ação que depende delas até o arquivo ser um JSON válido.",
         "your_chat_sessions_were_restarted_so_this_takes": "As suas sessões de conversa foram reiniciadas para que isso tenha efeito imediato — o Kiro lê a lista de ferramentas uma vez por sessão, então uma conversa aberta não teria percebido a mudança. As suas mensagens continuam lá; o agente relê o contexto na sua próxima mensagem."
+      },
+      "crewmatesSection": {
+        "title": "Membros da equipe",
+        "reply_threads": "Tópicos de resposta nas mensagens do chat de um membro",
+        "reply_threads_desc": "Deixa qualquer mensagem do chat de um membro da equipe ter seu próprio tópico de resposta, aberto no painel lateral enquanto o chat continua visível. Desligado, Responder no tópico não aparece e os tópicos existentes ficam ocultos, não apagados.",
+        "failed_to_save": "Não foi possível salvar a configuração da equipe. Tente de novo.",
+        "failed_to_load": "Não foi possível carregar as configurações da equipe.",
+        "retry": "Tentar de novo"
       },
       "developerPanel": {
         "developer_mode": "Modo desenvolvedor",

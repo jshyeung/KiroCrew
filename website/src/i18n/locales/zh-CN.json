@@ -10075,6 +10075,30 @@
         "thinking": "思考中",
         "thought_process": "思考过程"
       },
+      "thread": {
+        "title": "话题",
+        "close": "关闭话题",
+        "reply_in_thread": "在话题中回复",
+        "open_thread": "打开话题",
+        "replies_count_other": "{{count}} 条回复",
+        "last_reply": "最后回复于{{when}}",
+        "you": "你",
+        "no_replies_yet": "还没有回复",
+        "replying": "{{name}} 正在回复…",
+        "reply_placeholder": "在话题中回复…",
+        "reply_after_retry": "按“重试”加载话题，然后再回复。",
+        "send_reply": "发送回复",
+        "err_replying": "{{name}} 还在回复中，等它回复完。",
+        "err_parent_gone": "这条消息已不在此对话中。",
+        "err_too_long": "这条回复太长了。缩短后再试一次。",
+        "err_full": "这个话题已满。到主对话里问吧。",
+        "err_chat_full": "这个对话已容纳不了更多话题回复。开始新对话继续讨论。",
+        "err_send_failed": "回复没有发出去，点发送再试一次。",
+        "err_load_failed": "无法加载这个话题。",
+        "err_summary_failed": "无法加载这个对话的回复话题。你的回复仍然保存着；对话本身是最新的。",
+        "err_flag_failed": "无法确认这个对话是否开启了回复话题。对话本身是最新的；如果有回复，它们仍然保存着。",
+        "retry": "重试"
+      },
       "toolCallLine": {
         "diff_truncated": "diff 已截断",
         "aria_awaiting_approval": "等待批准工具：{{label}}",
@@ -14050,6 +14074,14 @@
         "on_windows_keystrokes_take_your_keyboard_focus": "在 Windows 上，按键会夺取你的键盘焦点，坐标点击会移动真实光标——这个平台没有面向单个应用的输入通道。",
         "the_app_lists_in_computer_use_json_could_not_be": "无法读取 computer_use.json 中的应用列表，因此这里显示为空。在该文件成为有效 JSON 之前，代理仍会拒绝所有依赖这些列表的操作。",
         "your_chat_sessions_were_restarted_so_this_takes": "你的聊天会话已重启，所以改动立即生效 — Kiro 每个会话只读取一次工具列表，否则已经打开的聊天不会拾取到改动。你的消息都还在；代理会在你下一条消息时重新读取上下文。"
+      },
+      "crewmatesSection": {
+        "title": "团队成员",
+        "reply_threads": "团队成员对话消息的回复话题",
+        "reply_threads_desc": "让团队成员对话里的任何消息都能带自己的回复话题，在侧栏打开，对话保持可见。关闭时不显示“在话题中回复”，已有话题会隐藏而不是删除。",
+        "failed_to_save": "无法保存团队设置。请再试一次。",
+        "failed_to_load": "无法加载团队设置。",
+        "retry": "重试"
       },
       "developerPanel": {
         "developer_mode": "开发者模式",

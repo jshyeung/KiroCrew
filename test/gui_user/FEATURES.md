@@ -26,7 +26,7 @@ under `scenarios/` says how the lane checks it.
 
 | | Total | smoke | nightly | native-only | needs-secret | excluded |
 |---|---|---|---|---|---|---|
-| **All features** | 269 | 42 | 166 | 12 | 27 | 22 |
+| **All features** | 270 | 42 | 167 | 12 | 27 | 22 |
 | Chat sessions (`chat`) | 26 | 3 | 19 | 0 | 2 | 2 |
 | Side panel tabs (`side-panel`) | 4 | 1 | 3 | 0 | 0 | 0 |
 | Terminal panel (`terminal`) | 3 | 0 | 3 | 0 | 0 | 0 |
@@ -34,7 +34,7 @@ under `scenarios/` says how the lane checks it.
 | Routing & redirects (`navigation`) | 10 | 0 | 10 | 0 | 0 | 0 |
 | Top bar (`topbar`) | 3 | 0 | 3 | 0 | 0 | 0 |
 | Search everywhere & command palette (`search`) | 1 | 1 | 0 | 0 | 0 | 0 |
-| Crew Members (`members`) | 3 | 0 | 3 | 0 | 0 | 0 |
+| Crew Members (`members`) | 4 | 0 | 4 | 0 | 0 | 0 |
 | Agent capabilities (crews, templates, skills, prompts, steering, hooks, workflows) (`capabilities`) | 14 | 2 | 12 | 0 | 0 | 0 |
 | Connections (MCP servers & services) (`connections`) | 2 | 1 | 0 | 0 | 1 | 0 |
 | Memory, lessons & usage (`memory`) | 6 | 1 | 4 | 0 | 1 | 0 |
@@ -63,7 +63,7 @@ under `scenarios/` says how the lane checks it.
 | Security & governance (`security`) | 10 | 1 | 9 | 0 | 0 | 0 |
 | Developer tools (`developer`) | 12 | 0 | 12 | 0 | 0 | 0 |
 
-Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
+Priorities: P0 10 · P1 37 · P2 162 · P3 61. Deduped from 387 raw records.
 
 ## Chat sessions (`chat`)
 
@@ -163,6 +163,7 @@ Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
 | P0 | `members-crew-members` | As a crew operator, I want a durable DM thread per member with a docked side panel (Crew summary, activity by day, worker sessions, auto-patrol status) and a filterable roster, so that I can supervise each crew in one place. | `/members` | rich | nightly | 6 |
+| P1 | `crewmate-reply-thread` | As a user talking to a crewmate, I want to ask about one thing it said in a reply thread on that message, so that the follow-up stays beside the message it is about instead of pushing the crewmate's findings up the main chat. | `/settings` | rich | nightly | 8 |
 | P1 | `members-private-memory-keeps-thread` | As a crew operator, I want a member's direct-message thread to survive leaving and returning to the member, so that our earlier conversation and the member's ability to answer are not lost. | `/settings` | rich | nightly | 8 |
 | P2 | `sidebar-crew-members-create-menu-entry` | As a user, I want the Crew Members menu entry to open the page or the setting that enables it, so that I can find the feature either way. | `/chat` | minimal | nightly | 3 |
 

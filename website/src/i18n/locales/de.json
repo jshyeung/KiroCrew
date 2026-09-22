@@ -10220,6 +10220,31 @@
         "thinking": "Denkt nach",
         "thought_process": "Denkprozess"
       },
+      "thread": {
+        "title": "Thread",
+        "close": "Thread schließen",
+        "reply_in_thread": "Im Thread antworten",
+        "open_thread": "Thread öffnen",
+        "replies_count_one": "{{count}} Antwort",
+        "replies_count_other": "{{count}} Antworten",
+        "last_reply": "Letzte Antwort {{when}}",
+        "you": "Du",
+        "no_replies_yet": "Noch keine Antworten",
+        "replying": "{{name}} antwortet…",
+        "reply_placeholder": "Im Thread antworten…",
+        "reply_after_retry": "Tippe auf „Erneut versuchen“, um den Thread zu laden, und antworte dann.",
+        "send_reply": "Antwort senden",
+        "err_replying": "{{name}} antwortet noch. Warte auf diese Antwort.",
+        "err_parent_gone": "Diese Nachricht ist nicht mehr in diesem Chat.",
+        "err_too_long": "Diese Antwort ist zu lang. Kürze sie und versuche es noch einmal.",
+        "err_full": "Dieser Thread ist voll. Frag stattdessen im Hauptchat.",
+        "err_chat_full": "Dieser Chat hat keinen Platz für weitere Thread-Antworten. Starte einen neuen Chat, um weiterzudiskutieren.",
+        "err_send_failed": "Die Antwort ist nicht angekommen. Drück auf Senden, um es noch einmal zu versuchen.",
+        "err_load_failed": "Dieser Thread konnte nicht geladen werden.",
+        "err_summary_failed": "Die Antwort-Threads dieses Chats konnten nicht geladen werden. Deine Antworten sind weiterhin gespeichert; der Chat selbst ist aktuell.",
+        "err_flag_failed": "Ob Antwort-Threads für diesen Chat aktiv sind, konnte nicht geprüft werden. Der Chat selbst ist aktuell; vorhandene Antworten sind weiterhin gespeichert.",
+        "retry": "Erneut versuchen"
+      },
       "toolCallLine": {
         "diff_truncated": "Diff gekürzt",
         "aria_awaiting_approval": "Warten auf Genehmigung für Werkzeug {{label}}",
@@ -14255,6 +14280,14 @@
         "on_windows_keystrokes_take_your_keyboard_focus": "Unter Windows übernehmen Tastenanschläge Ihren Tastaturfokus und Koordinatenklicks bewegen Ihren echten Mauszeiger — auf dieser Plattform gibt es keinen App-spezifischen Eingabeweg.",
         "the_app_lists_in_computer_use_json_could_not_be": "Die App-Listen in computer_use.json konnten nicht gelesen werden, daher werden sie hier leer angezeigt. Der Agent verweigert weiterhin jede Aktion, die von ihnen abhängt, bis die Datei gültiges JSON ist.",
         "your_chat_sessions_were_restarted_so_this_takes": "Deine Chat-Sitzungen wurden neu gestartet, damit dies sofort wirkt — Kiro liest seine Werkzeugliste einmal pro Sitzung, ein offener Chat hätte sie sonst nicht übernommen. Deine Nachrichten sind weiterhin da; der Agent liest seinen Kontext bei deiner nächsten Nachricht erneut."
+      },
+      "crewmatesSection": {
+        "title": "Crew-Mitglieder",
+        "reply_threads": "Antwort-Threads auf Nachrichten im Chat eines Crew-Mitglieds",
+        "reply_threads_desc": "Jede Nachricht im Chat eines Crew-Mitglieds kann einen eigenen Antwort-Thread tragen, der im Seitenbereich aufgeht, während der Chat sichtbar bleibt. Aus: „Im Thread antworten“ wird nicht angeboten, und vorhandene Threads sind ausgeblendet, nicht gelöscht.",
+        "failed_to_save": "Die Crew-Einstellung konnte nicht gespeichert werden. Versuch es noch einmal.",
+        "failed_to_load": "Die Crew-Einstellungen konnten nicht geladen werden.",
+        "retry": "Erneut versuchen"
       },
       "developerPanel": {
         "developer_mode": "Entwicklermodus",

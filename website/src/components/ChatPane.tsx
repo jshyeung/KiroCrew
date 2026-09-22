@@ -7,6 +7,7 @@ import { useQuery, useMutation } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
 import ChatMessageList from '../app-sdk/ChatMessageList'
 import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
+import type { ThreadHooks } from '../app-sdk/messageRenderers'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
@@ -109,6 +110,7 @@ export default function ChatPane({
   busyMode = 'split',
   crewmate,
   onOpenCrewWorkLog,
+  threads,
 }: {
   slotKey: string
   focused?: boolean
@@ -177,6 +179,10 @@ export default function ChatPane({
    *  is a link that opens it, so the words that read as a destination are one;
    *  without it the line is plain text. Only meaningful with `crewmate`. */
   onOpenCrewWorkLog?: () => void
+  /** Reply threads on this pane's messages. Only a host presenting a
+   *  crewmate's chat (the Members page) passes it; absent, the rows draw no
+   *  thread footer and no "Reply in thread" action. */
+  threads?: ThreadHooks
 }) {
   // One instance covers both dropdown filter inputs (never open at once).
   const dispatch = useAppDispatch()
@@ -1498,6 +1504,7 @@ export default function ChatPane({
           hiddenRow={pinHiddenRow}
           onQuote={onQuote}
           onAsk={onAsk}
+          threads={threads}
           transcript={{
             sessionId: `pane:${slotKey}`,
             scrollerRef,

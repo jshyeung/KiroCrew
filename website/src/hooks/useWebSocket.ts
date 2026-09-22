@@ -31,6 +31,8 @@ import { forgetUnobservedMemberThreads } from '../api/membersQuery'
 import { observedPaneSlots } from '../api/slotMessagesQuery'
 import { MEMBERS_ROSTER_QUERY_KEY } from '../api/membersQuery'
 import { memberProjectionStore } from '../state/memberProjectionStore'
+import { threadLiveStore, type ThreadReplyFrame } from '../state/threadLiveStore'
+import { threadQueryKey, threadsQueryKey } from '../api/threads'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { deriveToolCallTitle } from '../utils/toolCallTitle'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
@@ -1252,6 +1254,15 @@ export function useWebSocket() {
         // comes back with its folders missing.
         queryClient.invalidateQueries({ queryKey: ['artifacts'] })
         queryClient.invalidateQueries({ queryKey: ['artifact-folders'] })
+        // Same one-shot problem for a reply thread on a crewmate chat message:
+        // the terminal `chat.thread_reply` frame of a reply that finished while
+        // the socket was down was never delivered, so the live store would show
+        // a partial reply forever and the stored row would never be refetched.
+        // Drop every live row (streamed text only; the stored replies are the
+        // truth) and refetch every observed thread and footer count.
+        threadLiveStore.reset()
+        queryClient.invalidateQueries({ queryKey: ['chat-thread'] })
+        queryClient.invalidateQueries({ queryKey: ['chat-threads'] })
         // A dropped socket is the one client-visible sign the gateway may have
         // restarted — and a restart drops an unmessaged member slot while its
         // binding survives. The Crew Members page mounts a cached thread key
@@ -2281,6 +2292,20 @@ export function useWebSocket() {
           case 'chat.side_result':
             dispatch(sseSideResult(data as { slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; final?: boolean; is_error?: boolean; steer?: boolean }))
             break
+          case 'chat.thread_reply': {
+            // A reply landing in a thread on a crewmate chat message. Streamed
+            // deltas go to the live store the thread panel reads; a stored row
+            // (the user's reply, or the crewmate's terminal frame) refreshes the
+            // thread and the per-slot footer counts through React Query.
+            const frame = data as ThreadReplyFrame
+            if (typeof frame.slot !== 'string' || typeof frame.mid !== 'string') break
+            threadLiveStore.apply(frame)
+            if (frame.role === 'user' || frame.final) {
+              queryClient.invalidateQueries({ queryKey: threadQueryKey(frame.slot, frame.mid) })
+              queryClient.invalidateQueries({ queryKey: threadsQueryKey(frame.slot) })
+            }
+            break
+          }
           case 'chat.side_queue': {
             // `raw` marks content the LOCAL client typed; broadcast payloads are scrubbed by
             // definition. Stripped rather than merely left out of the cast, so a future

@@ -26,6 +26,7 @@ import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import {
   type MessageRenderer,
   type MessageRenderContext,
+  type ThreadHooks,
   GROUPED_ROLES,
   mergeRenderers,
   resolveRenderer,
@@ -68,6 +69,9 @@ export interface ChatMessageListProps {
    *  hides its action (see chat-core/composer/selectionActions). */
   onQuote?: (text: string, rect: DOMRect) => void
   onAsk?: (text: string) => void
+  /** Reply threads on this transcript's messages (a crewmate's chat): footer
+   *  data per `mid` and the open action. Absent on every other surface. */
+  threads?: ThreadHooks
   /** Optional host-injected renderer for tool messages (role 'tool'/'tool_call'/
    *  'tool_result'). Lets a Redux-connected host (e.g. the dashboard's split-view
    *  ChatPane) render the full slot-aware ToolCallLine while this component stays
@@ -158,6 +162,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
   onFileOpen,
   onQuote,
   onAsk,
+  threads,
   renderTool,
   hideCardOwnedOAuth = false,
   renderers,
@@ -273,6 +278,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
       onFileOpen,
       onQuote,
       onAsk,
+      threads,
       hideCardOwnedOAuth,
       autoDeniedIds,
       renderTool,
@@ -280,7 +286,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
       row,
     }
     return entry.render(m, ctx)
-  }, [messages, running, contentWidth, onFileOpen, onQuote, onAsk, renderTool, autoDeniedIds, hideCardOwnedOAuth, activeRenderers])
+  }, [messages, running, contentWidth, onFileOpen, onQuote, onAsk, threads, renderTool, autoDeniedIds, hideCardOwnedOAuth, activeRenderers])
 
 
   // Render a TurnItem (single or group)

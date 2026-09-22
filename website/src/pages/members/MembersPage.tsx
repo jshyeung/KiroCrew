@@ -41,8 +41,9 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Cloud, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Pencil, Plus, Route, Sparkles, Square, Star, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Cloud, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Pencil, Plus, RotateCw, Route, Sparkles, Square, Star, Zap } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
+import { Btn } from '../../components/ui'
 import { CrewMemberMark } from '../../components/CrewMemberMark'
 import DeployMyCrewDialog from './DeployMyCrew'
 import { useTranslation } from 'react-i18next'
@@ -73,6 +74,10 @@ import { setViewedThreadSlot, clearViewedThreadSlot } from '../../lib/viewedThre
 import CrewAvatar from '../../components/CrewAvatar'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
 import ChatPane from '../../components/ChatPane'
+import type { ThreadHooks } from '../../app-sdk/messageRenderers'
+import { threadsApi, threadsQueryKey } from '../../api/threads'
+import ThreadPanel from './ThreadPanel'
+import { useCrewmateThreadsFlag } from '../../hooks/useCrewmateThreadsFlag'
 import CrewWebview from './CrewWebview'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -1233,6 +1238,47 @@ export default function MembersPage() {
     tabsCtl.setActive(CREW_WORK_LOG_TAB_ID)
     if (!beside) setOverlayOpen(true)
   }, [tabsCtl, beside])
+  // Reply threads (screen 07). The footer data per message is one small read
+  // beside the transcript; the open thread takes over the side panel while it
+  // is on screen, and closing it hands the panel's tabs back. Keyed on the
+  // CONFIRMED slot only, like every other slot-bound view here.
+  // Behind `dashboard.crewmate_threads` (off by default): off, no footer read
+  // is made, no Reply in thread control is offered and no panel is mounted --
+  // the routes answer 404 then, so a control drawn anyway would only reach a
+  // refusal. Flipping the flag off closes an open thread. A config read that
+  // FAILED is not "off": the flag keeps its last known value and the failure
+  // is said below (ErrorNotice + Retry), so threads that are on do not vanish
+  // as if the switch had been flipped.
+  const {
+    on: threadsOn,
+    failed: threadsFlagFailed,
+    retrying: threadsFlagRetrying,
+    retry: retryThreadsFlag,
+  } = useCrewmateThreadsFlag()
+  const [openThreadMid, setOpenThreadMid] = useState<string | null>(null)
+  useEffect(() => { setOpenThreadMid(null) }, [confirmedSlot, threadsOn])
+  const threadsQuery = useQuery({
+    queryKey: threadsQueryKey(confirmedSlot || ''),
+    queryFn: () => threadsApi.summary(confirmedSlot),
+    enabled: threadsOn && !!confirmedSlot,
+    staleTime: 30_000,
+  })
+  const threadSummaries = threadsQuery.data?.threads
+  const openReplyThread = useCallback((mid: string) => {
+    setOpenThreadMid(mid)
+    if (!beside) setOverlayOpen(true)
+  }, [beside])
+  const closeReplyThread = useCallback(() => setOpenThreadMid(null), [])
+  const threadHooks = useMemo<ThreadHooks | undefined>(
+    () => (threadsOn && confirmedSlot
+      ? {
+          summaryOf: (mid: string) => threadSummaries?.[mid],
+          onOpen: openReplyThread,
+          crewmateName: activeName,
+        }
+      : undefined),
+    [threadsOn, confirmedSlot, threadSummaries, openReplyThread, activeName],
+  )
   // Whether each leading tab's body is on screen — the gate for its data reads.
   // Read from what the panel SHOWS (`onActiveTabChange`), not from the stored
   // focus: a stored focus on a withheld view falls back to the first leading tab
@@ -2270,6 +2316,55 @@ export default function MembersPage() {
                 />
               </div>
             )}
+            {threadsFlagFailed && (
+              /* The config read behind the reply-threads flag failed. Said
+                 here, not rendered as "threads are off": with nothing cached
+                 the Reply control is withheld (the routes would refuse), with
+                 a cached value the last reading stands; either way the user
+                 can ask for the read again in place. No hand-off: the DM
+                 composer below holds an unsaved draft. */
+              <div className="px-4 py-2 flex items-start gap-2" data-testid="member-threads-flag-error-row">
+                <ErrorNotice
+                  message={t('pages.chat.thread.err_flag_failed')}
+                  variant="inline"
+                  className="flex-1 min-w-0"
+                  testId="member-threads-flag-error"
+                />
+                <Btn
+                  disabled={threadsFlagRetrying}
+                  onClick={retryThreadsFlag}
+                  className="shrink-0"
+                  data-testid="member-threads-flag-retry"
+                >
+                  <RotateCw className="lucide-inline" aria-hidden />
+                  {t('pages.chat.thread.retry')}
+                </Btn>
+              </div>
+            )}
+            {threadsOn && threadsQuery.isError && (
+              /* The per-message reply counts failed to load: the chat itself is
+                 fine and stays mounted below, so this says only what is
+                 missing (the footers) and offers the read again in place. No
+                 hand-off, for the reason the notices around it give: the DM
+                 composer below holds an unsaved draft. */
+              <div className="px-4 py-2 flex items-start gap-2" data-testid="member-threads-error-row">
+                <ErrorNotice
+                  message={t('pages.chat.thread.err_summary_failed')}
+                  variant="inline"
+                  className="flex-1 min-w-0"
+                  testId="member-threads-error"
+                />
+                <Btn
+                  disabled={threadsQuery.isFetching}
+                  onClick={() => { void threadsQuery.refetch() }}
+                  className="shrink-0"
+                  data-testid="member-threads-retry"
+                >
+                  <RotateCw className="lucide-inline" aria-hidden />
+                  {t('pages.chat.thread.retry')}
+                </Btn>
+              </div>
+            )}
             {activeThreadFailed && (
               /* No hand-off while a cached thread is mounted under this line:
                  its DM composer still holds whatever the user typed (ChatPane
@@ -2339,6 +2434,7 @@ export default function MembersPage() {
                     openSideChat={openMemberSideChat}
                     crewmate={crewmateIdentity}
                     onOpenCrewWorkLog={openCrewWorkLog}
+                    threads={threadHooks}
                   />
                 </ErrorBoundary>
               </div>
@@ -2954,8 +3050,33 @@ export default function MembersPage() {
                     animate={innerMotion.animate}
                     exit={innerMotion.exit}
                     transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
-                    className={beside ? 'h-full flex justify-end' : 'h-full flex justify-end max-w-full'}
+                    className={beside ? 'h-full flex justify-end relative' : 'h-full flex justify-end max-w-full relative'}
                   >
+                    {/* The open reply thread covers the panel's tabs while it is on
+                        screen and slides away on close, so the tabs the user had are
+                        where they left them. `mb-2` + `rounded-l-xl` match the
+                        panel's own frame (SidePanel's root) so the thread reads as
+                        the panel showing something else, not a second panel. */}
+                    <AnimatePresence initial={false}>
+                      {threadsOn && openThreadMid && confirmedSlot && (
+                        <motion.div
+                          key={`thread-${openThreadMid}`}
+                          initial={reduceMotion ? { opacity: 1 } : { x: 24, opacity: 0 }}
+                          animate={{ x: 0, opacity: 1 }}
+                          exit={reduceMotion ? { opacity: 0 } : { x: 24, opacity: 0 }}
+                          transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
+                          className={`absolute inset-0 z-20 overflow-hidden ${beside ? 'mb-2 rounded-l-xl border-l border-t border-b border-border' : ''}`}
+                          style={beside ? { inset: 0, bottom: 8 } : undefined}
+                        >
+                          <ThreadPanel
+                            slot={confirmedSlot}
+                            mid={openThreadMid}
+                            crewmateName={activeName}
+                            onClose={closeReplyThread}
+                          />
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
                     <SidePanel
                       {...panelProps}
                       panelHidden={panelHidden}

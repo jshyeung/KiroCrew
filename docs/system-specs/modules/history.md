@@ -1130,6 +1130,34 @@ class name (the ACP type lives behind the agent-SDK import boundary) and
 answered with `host_auth.signed_out_message`, latching the readiness service
 signed-out as the main chat does.
 
+**Dashboard.** Only a crewmate's chat (the Members page) offers threads: it
+hands `ChatPane` a `threads` hook set (`app-sdk/messageRenderers.ThreadHooks`:
+`summaryOf(mid)`, `onOpen(mid)`, the crewmate's name), which the assistant and
+user rows read off `MessageRenderContext.threads`; every other surface has none
+and draws neither footer nor action. The page reads the flag through
+`hooks/useCrewmateThreadsFlag` (the shared `['kirocrewConfig']` query): `on`
+only once a successful read said `true`; a read that FAILED is its own state,
+said beside the chat through `ErrorNotice` with a Retry while the last known
+value stands -- never rendered as the flag being off, which would make an
+enabled feature vanish under a config blip. A bubble whose `mid` has replies gets a
+`ThreadFooter` under it (faces of who took part, "N replies" in accent, "Last
+reply 2h ago" muted); every bubble's hover action row gets "Reply in thread"
+(`MessageSquare`), the user's row included. Either opens the thread in the
+right side panel: `pages/members/ThreadPanel` covers the panel's tabs while it
+is on screen (slides in; `prefers-reduced-motion` fades) and hands them back on
+close, so the main chat stays visible beside it. The panel shows the parent
+quoted as one bubble, a hairline reply count, the replies as small bubbles on
+the main chat's run and corner rule (`components/chat/crewmateBubbles.ts`:
+the crewmate's consecutive replies group on the left, the user's right-aligned
+bubbles are always singles), a typing row while the crewmate replies (an ordinary item, never a
+notice) and a one-line "Reply…" composer with the real `SendBtn`, disabled
+while a reply is in flight. Stored replies and the per-slot summary are React
+Query reads (`api/threads.ts`); the reply in progress streams through
+`state/threadLiveStore` from `chat.thread_reply` frames, and a stored frame
+(the user's reply, the crewmate's `final`) invalidates both queries. Failures
+render through `ErrorNotice` in the panel with one plain sentence picked by the
+backend `code`; a failed send keeps the draft.
+
 **Wire.** `ws.broadcast_thread_reply` emits owner-only `chat.thread_reply`
 frames `{slot, mid, run_id, role, content, ts, final?, is_error?, reply?}`: the
 user's reply once, the crewmate's reply as streamed deltas grouped by `run_id`
