@@ -186,6 +186,7 @@ class TestShippedScenarios:
             "search": ["search-everywhere-jump-to-setting"],
             "members": [
                 "crewmate-panel-tabs",
+                "crewmate-team-view",
                 "meet-crewmates-flow",
                 "members-dm-hello",
                 "members-private-memory-keeps-thread",
