@@ -306,6 +306,37 @@ def _replace(value: Any, pattern: re.Pattern, replacement: str) -> Any:
     return value
 
 
+def _require_editable_record(before: dict, *, episode: bool) -> None:
+    """Refuse a whole-value replacement when the record's content cannot be shown exactly.
+
+    A ``set`` replaces the record's value with text the browser drafted, and the browser
+    drafts from what the records API returned. That response is display-safe: a credential
+    is a tag, and a payload this scan cannot certify is a marker. Accepting the draft back
+    writes the display form into the store, so the original content is gone and the loss
+    shows nowhere, because every surface reads through the same scrub.
+
+    The test is whether the stored source survives the scrub unchanged. When it does, the
+    draft and the source are the same text and the write is faithful. When it does not, the
+    draft is a view, and a view is not a value. The whole-document editor holds the same
+    bar, so the two editors agree on which content is read-only.
+
+    ``replace`` needs no such bar: it rewrites the stored value server side and only the
+    matched span changes, so display text never reaches the store.
+    """
+    # circular import: the handler package reaches this module, so importing the shared
+    # scrubber at module scope would close the loop. Deferred to the one call that needs it.
+    from kiro_crew.dashboard.handlers._shared import _redact_memory_field
+
+    source = before["text"] if episode else before["value_json"]
+    if _redact_memory_field(source) != source:
+        raise MemoryEditError(
+            "Sensitive values are hidden in this record, so its content is read-only. "
+            "Use find and replace to change it.",
+            "memory_record_redacted",
+            409,
+        )
+
+
 def _after(store: Any, before: dict, operation: dict) -> dict | None:
     from kiro_crew.vector_memory import _contains_injection
 
@@ -316,6 +347,7 @@ def _after(store: Any, before: dict, operation: dict) -> dict | None:
     episode = before["kind"] == "episode"
     value = before["text"] if episode else json.loads(before["value_json"])
     if mode == "set":
+        _require_editable_record(before, episode=episode)
         field = "text" if episode else "value"
         if field not in operation:
             raise MemoryEditError(f"This record requires {field}.")
