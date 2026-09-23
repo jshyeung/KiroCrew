@@ -4433,12 +4433,144 @@ def _jev_route_baseline(slot: Any, client: Any) -> tuple[str, str, int]:
     return live_model, baseline, epoch
 
 
+def _jev_route_premise_moved(slot: Any, client: Any, *, live_model: str, epoch: int) -> bool:
+    """Whether a pick has moved the premise this turn's routed answer was computed on.
+
+    Three signals, and any one of them drops the answer: the flag a manual pick
+    clears, the model the turn STARTED on, and the shared pick epoch a pick through
+    ANOTHER alias moves while leaving this slot's own cache untouched. The model is
+    the live value rather than the receipt's pre-route baseline -- those differ from
+    the second routed turn on, and comparing the baseline would drop every turn after
+    the first as a phantom re-pick.
+
+    ONE predicate, because every exit that ACTS on the answer asks the same question,
+    and recording that the answer was refused is such an exit: those rows are durable
+    and never rewritten, so one written for an answer a pick has already superseded
+    describes a decision nothing acted on and nothing can clear.
+    """
+    epoch_now = getattr(pick_epoch_host(client), "_explicit_pick_epoch", 0)
+    return (
+        not _jev_route_armed(slot)
+        or _crew_log_model(slot) != live_model
+        or (isinstance(epoch_now, int) and epoch_now != epoch)
+    )
+
+
+def _jev_current_window(client: Any, model_route: Any, live_model: str) -> int | None:
+    """The window the session is SERVED on, else the registry's reading of *live_model*.
+
+    ONE reading, for both window rules AND for the landing a refused tier is sent
+    to: the served value is the denominator the meter's own percentage is taken
+    against, so a registry entry lagging it hides a shrink the meter can already
+    see -- and a landing sized by the other reading can be handed exactly the window
+    the rules just refused.
+    """
+    try:
+        served = int(client.context_window_tokens() or 0)
+    except Exception:
+        # A provider with no window accessor is the registry case, not a raised turn.
+        logger.debug("model.route: no served window reading", exc_info=True)
+        served = 0
+    return served or model_route.known_window(live_model)
+
+
+def _jev_downgrade_refused(
+    state: DashboardState,
+    client: Any,
+    session_key: str,
+    model_route: Any,
+    *,
+    current_window: int | None,
+    target: str,
+    p: Any,
+    prompt: str,
+    rollback_target: str,
+    target_window: int | None = None,
+) -> bool:
+    """Whether routing must NOT put this turn on *target*'s smaller context window.
+
+    Two rules, each only for a move to a SMALLER window, because the harm is
+    one-directional: a window at least as large changes nothing about what fits,
+    and an unknown one on either side is not evidence of a shrink.
+
+    The ROLLBACK rule comes first because it is a question about this seam rather
+    than about the turn: a shrink is only ever applied because it can be taken back
+    if what actually serves turns out smaller still, and the model to go back to is
+    the one the session was on. A session the backend never named a model for reads
+    that as ``""`` -- there is no id to ask for -- so a smaller window is refused on
+    the same grounds an unknown one is: nothing here confirms the turn could be put
+    back. A window at least as large needs no way back and is unaffected.
+
+    The CONFIDENCE rule is the point's own floor. The FIT rule asks what the
+    session's context reading becomes once the window is the smaller one: the meter
+    is a percentage of the SERVED window, so the same transcript that sits well
+    inside a large one can land at or above this session's compaction threshold in a
+    small one, and that turn ends by handing the backend a history it replaces with
+    a summary no later switch back recovers.
+
+    The FIT rule PERMITS only on a reading that confirms the target holds this turn.
+    Anything unmeasurable refuses instead: a meter the provider itself calls unknown
+    (the post-compaction and resumed state, where the history is real and unread), a
+    meter that cannot be reached, and a threshold that cannot be read. Refusing there
+    costs the turn one gear and nothing else, because a window that does not shrink
+    never compacts -- and it is not a veto on ROUTING, only on shrinking this turn:
+    the next turn asks again with a meter that has since reported. A reading of 0 the
+    provider vouches for is a KNOWN small history, not an unmeasurable one, so a
+    fresh session downgrades as it always did.
+
+    *current_window* is the caller's single reading of the window the session is on
+    (:func:`_jev_current_window`), passed rather than taken here so the landing a
+    refusal is sent to is sized by the same number these rules refused on.
+
+    *target_window* overrides the registry lookup of *target*. The post-switch caller
+    passes the window the session is NOW SERVED on, because that is the only reading a
+    substituted model appears in: its id can still read as the one that was asked for
+    while the meter has already been rebased to whatever is actually serving.
+
+    *prompt* is the ASSEMBLED text this turn sends -- the person's words under
+    whatever request prefix, replayed history and hook context the turn carries -- and
+    not the excerpt the tier was classified from. The meter answers for the history
+    the session already holds, and the turn being decided for adds all of this on top,
+    so the fit reading is the pair rather than the meter alone.
+
+    *model_route* is the point module the caller already holds, passed rather than
+    imported here: the whole ``decisions`` package is reached lazily from this turn
+    path, and a second import statement would be a second place that decision holds.
+    """
+    if target_window is None:
+        target_window = model_route.known_window(target)
+    if not model_route.permits_smaller_window(p, current=current_window, target=target_window):
+        return True
+    if not model_route.is_smaller_window(current=current_window, target=target_window):
+        return False
+    if not rollback_target:
+        return True
+    try:
+        unknown = bool(client.context_usage_unknown())
+        used = int(client.context_used_tokens() or 0)
+        limit = float(state.sessions.effective_autocompact_pct(session_key))
+    except Exception:
+        # Nothing here CONFIRMS the target holds this turn, and a window that does not
+        # shrink never compacts, so the unreadable answer is the refusing one.
+        logger.debug("model.route: no context reading for the fit rule", exc_info=True)
+        return True
+    if unknown:
+        # The provider's own word that its 0 means "not measured" rather than "empty".
+        return True
+    # A vouched-for 0 is a KNOWN small history, and the prompt is in hand either way,
+    # so it is still weighed: one that alone crosses the threshold in the smaller
+    # window compacts that turn, and skipping it would exempt the largest prompts.
+    return (max(used, 0) + model_route.prompt_tokens(prompt)) / target_window * 100.0 >= limit
+
+
 async def _route_model_for_turn(
     state: DashboardState,
     slot: _ChatSlot,
     client: Any,
     message: str,
     session_key: str,
+    *,
+    prompt: str,
 ) -> None:
     """Ask ``model.route`` which model this turn should run on, and switch to it.
 
@@ -4512,11 +4644,14 @@ async def _route_model_for_turn(
     # ``_epoch`` is that call's pick-epoch reading, re-read inside the locks below.
     try:
         _live_model, _baseline, _epoch = _jev_route_baseline(slot, client)
+        # Read once: the same list answers what the tier may route to and where a
+        # refused downgrade may land.
+        _advertised = provider_advertised_ids(client)
         routed = await model_route.routed_model(
             message,
             session_key=session_key,
             current_model=_baseline,
-            advertised=provider_advertised_ids(client),
+            advertised=_advertised,
             history_source=_route_history_source(state, session_key),
         )
     except asyncio.CancelledError:
@@ -4546,6 +4681,49 @@ async def _route_model_for_turn(
     _target = _chosen or _restore_to
     if not _target:
         await asyncio.to_thread(model_route.record_outcome, session_key, routed)
+        return
+
+    async def _record_refused() -> None:
+        """The refusal's own row: the suppressed tier and the probability it came
+        with, in the shape every other dropped tier takes. Written at each exit that
+        DISCARDS the tier rather than once up front, because the locked re-pick guard
+        below drops the whole answer, and a row already appended for it would outlive
+        a decision nothing acted on. Off the loop, and never published -- the answer a
+        receipt would show is the one that was refused."""
+        await asyncio.to_thread(
+            model_route.record_error,
+            session_key,
+            turn_id=str(routed.get("turn_id") or ""),
+            tier=str(routed.get("tier") or ""),
+            latency_ms=int(routed.get("latency_ms") or 0),
+            error=model_route.ERROR_WINDOW_REFUSED,
+            p=routed.get("p"),
+        )
+
+    # The window rules apply to a TIER's model only. An unpinned tier's restore goes
+    # to the model the session ran on with routing off, which is the owner's own
+    # choice rather than a shrink this seam chose.
+    _current_window = _jev_current_window(client, model_route, _live_model)
+    _refused = False
+    if bool(_chosen) and _jev_downgrade_refused(
+        state,
+        client,
+        session_key,
+        model_route,
+        current_window=_current_window,
+        target=_target,
+        p=routed.get("p"),
+        prompt=prompt,
+        rollback_target=_live_model,
+    ):
+        # A refused tier STAYS PUT. The turn keeps the window it already has, which
+        # is a window these rules read and accepted, and nothing is asked of the
+        # provider -- so there is no switch to undo, nothing to land on, and no turn
+        # to stop. The row says which tier was suppressed and at what probability.
+        # The premise is still asked first: the locks below are never reached, and a
+        # durable row must not outlive an answer a pick has already superseded.
+        if not _jev_route_premise_moved(slot, client, live_model=_live_model, epoch=_epoch):
+            await _record_refused()
         return
     set_model_fn = resolve_substitute_set_model(client)
     if set_model_fn is None:
@@ -4586,12 +4764,7 @@ async def _route_model_for_turn(
             # a cross-alias pick landing inside the await is overwritten here. Any
             # of the three having moved drops the answer -- re-asking would spend
             # again on a turn whose model the owner just chose.
-            _epoch_now = getattr(pick_epoch_host(client), "_explicit_pick_epoch", 0)
-            if (
-                not _jev_route_armed(slot)
-                or _crew_log_model(slot) != _live_model
-                or (isinstance(_epoch_now, int) and _epoch_now != _epoch)
-            ):
+            if _jev_route_premise_moved(slot, client, live_model=_live_model, epoch=_epoch):
                 logger.debug(
                     "model.route: dropping the routed model for slot %s, the slot was "
                     "re-picked during the await",
@@ -4606,17 +4779,56 @@ async def _route_model_for_turn(
             # row appended below is durable and never rewritten, so it is read here
             # rather than assumed, and it records the model the turn RAN on.
             _used = _crew_log_model(slot)
-            routed["model_used"] = _used
-            # Two ways a switch counts. The session reports the id that was asked
-            # for, or it reports something other than where the turn started -- the
-            # ladder's own fallback spelling, which is the ask under a name this
-            # build serves. Only staying put, on a model that was not the ask, is a
-            # failed switch. Read against ``_target``, the model THIS turn asked
-            # for, so the pair describes a restore on the same terms as a pin: a
-            # restore that does not take leaves the turn on the previous tier's
-            # model, and a reader takes an absent ``applied`` as applied, so a row
-            # silent about it would report that turn as healthy.
-            routed["applied"] = _used == _target or _used != _live_model
+            # The rules authorised the window of the id that was ASKED for. A backend
+            # answering a tier-policy substitution leaves the turn live on a different
+            # model, and only the meter says so: it is rebased to what serves while the
+            # id can still read as the one requested. So the FIT rule is asked once
+            # more, against the served window, before any prompt is streamed.
+            # A refused tier never reaches this point -- it stayed put -- so every
+            # answer here is about a model the backend SUBSTITUTED for the one the
+            # rules sized.
+            if _chosen and _jev_downgrade_refused(
+                state,
+                client,
+                session_key,
+                model_route,
+                current_window=_current_window,
+                target=_used or _target,
+                target_window=_jev_current_window(client, model_route, _used or _target),
+                p=routed.get("p"),
+                prompt=prompt,
+                rollback_target=_live_model,
+            ):
+                logger.warning(
+                    "model.route: the model serving slot %s after set_model(%r) has a "
+                    "smaller window than the rules allowed; putting the turn back",
+                    slot.key,
+                    _target,
+                )
+                # Marked BEFORE the switch back, so a restore that raises is still
+                # reported as the refusal it is rather than as a failed apply.
+                _refused = True
+                # The ROLLBACK rule made this expressible for a shrink the rules
+                # authorised: the id to go back to is the one the session was on. A
+                # substitution under an UPGRADE can still land here with nothing
+                # named to go back to, and then the turn keeps the model it is on --
+                # the same residual a switch that cannot be undone has always had.
+                if _live_model:
+                    await set_model_fn(_live_model)
+                    _sync_served_model(slot, client)
+            if not _refused:
+                routed["model_used"] = _used
+                # Two ways a switch counts. The session reports the id that was asked
+                # for, or it reports something other than where the turn started -- the
+                # ladder's own fallback spelling, which is the ask under a name this
+                # build serves. Only staying put, on a model that was not the ask, is a
+                # failed switch. Read against ``_target``, the model THIS turn asked
+                # for, so the pair describes a restore on the same terms as a pin: a
+                # restore that does not take leaves the turn on the previous tier's
+                # model, and a reader takes an absent ``applied`` as applied, so a row
+                # silent about it would report that turn as healthy. Not written for a
+                # REFUSED tier: the row's error category is what describes that turn.
+                routed["applied"] = _used == _target or _used != _live_model
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -4646,10 +4858,14 @@ async def _route_model_for_turn(
             error=model_route.ERROR_SWITCH_FAILED,
         )
         return
+    if _refused:
+        await _record_refused()
+        return
     # Written and published only once the switch has landed, so the strip and the
     # log describe the model the turn actually ran on. Off the loop: the row is a
     # filesystem append.
     await asyncio.to_thread(model_route.record_outcome, session_key, routed)
+    return
 
 
 def _session_auto_approves(state: DashboardState, slot: _ChatSlot) -> bool:
@@ -11328,7 +11544,12 @@ async def _run_chat(
             and message not in _SYNTHETIC_RECOVERY_MSGS
             and not _synthetic_recovery_turn
         ):
-            await _route_model_for_turn(state, slot, client, _jev_route_text, session_key)
+            # Two texts, kept apart on purpose: the person's own words are what the
+            # tier is classified from, and ``full_message`` is what the turn SENDS, so
+            # it is what the fit rule has to size.
+            await _route_model_for_turn(
+                state, slot, client, _jev_route_text, session_key, prompt=full_message
+            )
 
         state.broadcast_ws("chat_status", {"slot": slot.key, "status": "Thinking…"})
         state.broadcast_ws(
