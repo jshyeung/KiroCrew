@@ -939,6 +939,29 @@ class TestWriteStructuredMemory:
         assert "0 written" in caplog.text
         assert "1 refused" in caplog.text
 
+    def test_refusal_logs_the_reason_and_points_at_the_audit_trail(self, caplog) -> None:
+        """A bare reject code cannot say WHICH rule refused the write.
+
+        ``set_semantic`` returns ``(code, reason)`` and the reason carries the
+        specific cause -- here which confidence won. Dropping it left an operator
+        with ``conflict`` and no way to tell a confidence loss from a queued
+        proposal, so the warning must carry the reason and name the table that
+        holds the stored and rejected values.
+        """
+        vs = MagicMock()
+        vs.set_semantic.return_value = (
+            SemanticRejectCode.CONFLICT,
+            "Existing entry has higher confidence (0.90 vs 0.60)",
+        )
+        c = _consolidator(vector_store=vs)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.history"):
+            c._write_structured_memory({"semantic": [{"key": "head_sha", "value": "b"}]}, "k")
+        assert "Existing entry has higher confidence (0.90 vs 0.60)" in caplog.text
+        # The pointer is scoped to audited causes: VALUE_SIZE and VALUE_ENCODING are
+        # outside ``_AUDITABLE_REJECT_CODES``, so a blanket promise of a row would send
+        # an operator to an audit record that was never written.
+        assert "audited causes carry both values in memory_events" in caplog.text
+
     def test_semantic_is_capped(self) -> None:
         vs = MagicMock()
         vs.set_semantic.return_value = None

@@ -1885,10 +1885,19 @@ class HistoryConsolidator:
                 else:
                     # Counted apart from `skipped`: several reject causes reach here and only
                     # VALUE_EMPTY is a missing value, so a shared label names the wrong cause.
-                    reject_code, _reason = err
+                    reject_code, reason = err
                     refused += 1
+                    # The reason names the specific cause a bare code cannot (which
+                    # confidence lost, which proposal holds the value). Causes the store
+                    # audits also carry both values in memory_events under the cause as
+                    # the event type; VALUE_SIZE and VALUE_ENCODING audit nothing, which
+                    # is why the pointer is scoped rather than a promise for every code.
                     self._logger.warning(
-                        "Semantic consolidation refused %r: %s", item["key"], reject_code.value
+                        "Semantic consolidation refused %r: %s: %s"
+                        " (audited causes carry both values in memory_events)",
+                        item["key"],
+                        reject_code.value,
+                        reason,
                     )
             if written or deleted or skipped or refused:
                 self._logger.info(
