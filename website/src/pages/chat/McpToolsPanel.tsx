@@ -177,12 +177,14 @@ export default function McpToolsPanel({
           const sessionReason = mcpSessionFailureReason(s.name, sessionReport)
           const sessionLabel = i18nT(SESSION_LABEL_KEY[sessionState])
           // With a report in hand the mark answers "did this start HERE" and is
-          // drawn as a ring; without one it falls back to the configured enabled
-          // flag as a filled dot, which is all the dashboard used to know. The
-          // row's own opacity still carries disabled.
+          // drawn as a ring. Without one there is nothing to answer it with: the
+          // configured `enabled` flag is a read of mcp.json, so painting it `ok`
+          // claimed a session nobody had measured. That arm now wears the
+          // `no_report` mark, which is exactly the state it is in. The row's own
+          // opacity still carries disabled.
           const serverDotClass = hasSessionReport
             ? `w-2 h-2 ${SESSION_DOT_CLASS[sessionState]}`
-            : `w-1.5 h-1.5 ${serverDim ? 'bg-muted' : 'bg-ok'}`
+            : `w-1.5 h-1.5 ${serverDim ? 'bg-muted' : SESSION_DOT_CLASS.no_report}`
           const toggleRow = () => {
             if (tools.length) toggle(s.name)
           }
@@ -210,13 +212,13 @@ export default function McpToolsPanel({
               >
                 <span
                   className={`rounded-full shrink-0 ${serverDotClass}`}
-                  title={
-                    hasSessionReport
-                      ? sessionReason
-                        ? `${sessionLabel}: ${sessionReason}`
-                        : sessionLabel
-                      : undefined
-                  }
+                  // Ungated on purpose. `mcpSessionServerState` already answers
+                  // `no_report` for a null report, so `sessionLabel` names the
+                  // no-report arm correctly -- and that arm is the one whose mark
+                  // a reader cannot otherwise decode, because the legend above is
+                  // gated on `hasSessionReport`. A reason only exists with a
+                  // report in hand.
+                  title={sessionReason ? `${sessionLabel}: ${sessionReason}` : sessionLabel}
                 />
                 <code className="text-text flex-1">{s.name}</code>
                 {totalLoadable > 0 && toolSearchOn && (
