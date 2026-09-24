@@ -205,6 +205,28 @@ meets, `connect.mint_token`'s `ttl="6h"` session token, and the two bound differ
 things. `FargateConfig.task_bounds()` is the one place that key name maps onto the
 engine's `ttl_seconds`.
 
+The bound is enforced at TWO points, and the second is the one that reaches the case
+the first cannot. `provision` sweeps the cluster before it launches, which clears a
+leftover from an earlier launch; it cannot reach a cluster whose last launch has
+already happened, so a task leaked by an owner's final launch bills until someone
+reads an invoice. The launcher therefore also derives the same number into the
+`RunTask` container override as `SMC_TASK_TTL_SECONDS`, and the crew supervisor stops
+its essential container once that deadline passes. The task's own deadline needs no
+scheduler, no further launch, and no gateway running. Both points read one number, so
+they cannot name different lifetimes, and the sweep measures from the task's
+`startedAt` while the in-task deadline starts when the supervisor begins waiting --
+earlier, so where a launch does happen the sweep is the one that fires.
+
+Two things an operator should expect from the in-task half. It takes effect only in an
+image that carries it, and the image is digest-pinned in this file, so a task launched
+against an older digest is bounded by the sweep alone until the pin moves. And a task
+that stops itself leaves its crew record behind for the same reason a crash or an
+out-of-memory stop does: the record lives with the gateway, and a container cannot
+reach it.
+
+A lifetime stop is an ORDERLY stop. The supervisor exits zero on it, so an expiry does
+not appear on the console beside a crash loop; the container log names the reason.
+
 The OTHER half of `TaskBounds` is deliberately not operator-reachable.
 `DEFAULT_MAX_RUNNING_TASKS` stays fixed at the engine's value, because
 `fargate_engine` describes it as a ceiling on the population an operator reaches "only
@@ -773,14 +795,21 @@ The refusals, each stated as a property rather than as the case that prompted it
   thought of is not a guarantee, so the channel is closed by set membership and
   this module writes the derived values itself.
 - A name belongs to the closed set when a caller-supplied value could CONTRADICT
-  what the request already asserts, on one of two limbs: it decides **what the
-  task is**, which the spec's secrets fix through the crew they name, or it
+  what the request already asserts, on one of three limbs: it decides **what the
+  task is**, which the spec's secrets fix through the crew they name, it
   decides **who may reach it**, which is the credential set and the trust-domain
-  declaration. `SMC_CREW_NAME` and `SMC_SINGLE_PRINCIPAL` are derived and written
+  declaration, or it decides **what it may cost**, which is the lifetime the
+  launcher also enforces. `SMC_CREW_NAME`, `SMC_SINGLE_PRINCIPAL` and
+  `SMC_TASK_TTL_SECONDS` are derived and written
   here; `SMC_CONTROL_SECRET`, `KIRO_API_KEY`, `SMC_BUNDLE_DIR` and
   `SMC_FRONT_PORT` are refused and never written. Everything else stays the
   caller's: a bucket cannot contradict the spec, because the spec says nothing
   about buckets.
+- `SMC_TASK_TTL_SECONDS` is derived rather than accepted because a caller who could
+  raise it could keep a task past the bound the sweep enforces, which is opting out
+  of a cost cap rather than configuring it. `0` is written when no lifetime is asked
+  for and the container reads that as unbounded, so the variable is always present
+  and its absence never has to be told apart from a launcher that forgot it.
 - Writing `SMC_CREW_NAME` is what gives the container's own
   `manifest crew_name == SMC_CREW_NAME` refusal something to catch. When both
   values came from the caller they could agree with each other while contradicting

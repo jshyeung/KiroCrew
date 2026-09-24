@@ -392,7 +392,56 @@ def test_an_unrelated_environment_override_is_carried_as_a_sorted_list():
         {"name": "B", "value": "2"},
         {"name": "SMC_CREW_NAME", "value": BINDING.crew},
         {"name": "SMC_SINGLE_PRINCIPAL", "value": "1"},
+        {"name": rt.TASK_TTL_ENV, "value": "0"},
     ]
+
+
+def test_the_task_lifetime_is_carried_into_the_container_override():
+    """A bound the task holds itself is one no future launch has to arrive to apply."""
+    emitted = {
+        e["name"]: e["value"]
+        for e in request(ttl_seconds=3600)["overrides"]["containerOverrides"][0]["environment"]
+    }
+    assert emitted[rt.TASK_TTL_ENV] == "3600"
+
+
+def test_an_absent_lifetime_is_written_as_unbounded():
+    """No lifetime asked for is the behaviour of no lifetime at all, said out loud.
+
+    The variable is always present so the container never has to tell a launcher
+    that means "unbounded" apart from one that forgot to say anything, and ``"0"``
+    is what the container reads as no deadline.
+    """
+    for produced in (request(), request(ttl_seconds=0)):
+        emitted = {
+            e["name"]: e["value"]
+            for e in produced["overrides"]["containerOverrides"][0]["environment"]
+        }
+        assert emitted[rt.TASK_TTL_ENV] == "0"
+
+
+def test_a_caller_cannot_supply_the_task_lifetime():
+    """The bound is a cost cap, so the channel that could raise it stays closed.
+
+    A caller who could name this could name a lifetime longer than the sweep's and
+    keep a task past the bound the launcher enforces, which is opting out of the
+    cap rather than configuring it.
+    """
+    assert rt.TASK_TTL_ENV in rt.DERIVED_ENV
+    assert rt.TASK_TTL_ENV in rt.CLOSED_ENV
+    with pytest.raises(DocumentRefused, match="derives or refuses"):
+        request(environment={rt.TASK_TTL_ENV: "999999"})
+
+
+def test_a_negative_lifetime_is_refused_at_generation():
+    """A deadline already past would cost a task that never did any work.
+
+    Refused here rather than at the container's own startup check, for the reason
+    the whole module exists: a launch-time failure is harder to read than a
+    generation-time one, and this one would arrive as a container fault.
+    """
+    with pytest.raises(DocumentRefused, match="not a lifetime"):
+        request(ttl_seconds=-1)
 
 
 def test_the_container_override_addresses_the_crew_container_by_name():
@@ -415,12 +464,16 @@ def test_the_image_command_cannot_be_replaced():
 
 
 def test_the_derived_identity_is_emitted_even_with_no_caller_environment():
-    """The crew and the trust domain are written by this module, not requested."""
+    """The crew, the trust domain and the lifetime are written here, not requested."""
     produced = request()
     container_override = produced["overrides"]["containerOverrides"][0]
     assert set(container_override) == {"name", "environment"}
     emitted = {e["name"]: e["value"] for e in container_override["environment"]}
-    assert emitted == {"SMC_CREW_NAME": BINDING.crew, "SMC_SINGLE_PRINCIPAL": "1"}
+    assert emitted == {
+        "SMC_CREW_NAME": BINDING.crew,
+        "SMC_SINGLE_PRINCIPAL": "1",
+        rt.TASK_TTL_ENV: "0",
+    }
     assert "ephemeralStorage" not in produced["overrides"]
 
 
@@ -467,6 +520,7 @@ INPUT_DISPOSITION = {
     ("run_task_request", "launch_tag"): "caller",
     ("run_task_request", "environment"): "closed",
     ("run_task_request", "started_by"): "caller",
+    ("run_task_request", "ttl_seconds"): "closed",
     # Placement fields
     ("Placement", "cluster"): "caller",
     ("Placement", "subnets"): "caller",
@@ -508,6 +562,7 @@ DERIVED_IN_PAYLOAD = frozenset(
         "awslogs-group",
         "SMC_CREW_NAME",
         "SMC_SINGLE_PRINCIPAL",
+        rt.TASK_TTL_ENV,
         MANAGED_TAG_KEY,
         td.FINGERPRINT_TAG_KEY,
         td.CREW_TAG_KEY,

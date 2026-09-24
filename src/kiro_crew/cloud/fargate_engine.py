@@ -1177,6 +1177,10 @@ class FargateLaunchEngine:
             size=size,
             launch_tag=tag,
             started_by=started_by,
+            # The same bound the sweep above enforces, carried into the task so it
+            # still holds where the sweep cannot reach: a cluster whose last launch
+            # has already happened is never swept again.
+            ttl_seconds=self._bounds.ttl_seconds,
         )
         result = aws.checked_json(
             ["ecs", "run-task", "--cli-input-json", _json(request)],

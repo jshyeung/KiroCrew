@@ -28,6 +28,7 @@ from kiro_crew.cloud.aws import AWSError
 from kiro_crew.cloud.ec2 import MANAGED_TAG_KEY
 from kiro_crew.cloud.fargate import (
     CREW_TAG_KEY,
+    TASK_TTL_ENV,
     Placement,
     SecretRef,
     TaskDefinitionSpec,
@@ -2579,6 +2580,25 @@ def test_an_engine_given_no_bounds_is_still_bounded() -> None:
     bound that defaulted to absent would be the unbounded launch this engine is
     not allowed to make."""
     assert FargateLaunchEngine(_spec())._bounds == TaskBounds()
+
+
+def test_the_launch_carries_the_same_lifetime_the_sweep_enforces(monkeypatch) -> None:
+    """The bound reaches the task, not only the sweep that runs at launch time.
+
+    This is the half the sweep cannot cover: a cluster whose last launch has
+    already happened is never swept again, so a bound that exists only here stops
+    nothing. Asserted against the request this engine actually sends, and against
+    the engine's OWN number, so a launch that quietly sent a different lifetime
+    than the one it enforces would fail.
+    """
+    double = _EcsDouble()
+    _patch_aws(monkeypatch, double)
+    engine = FargateLaunchEngine(_spec(), bounds=TaskBounds(ttl_seconds=1234))
+
+    engine.provision(tag=TAG, size_key="1024/2048", profile="p", region="us-west-2")
+
+    sent = double.run_requests[0]["overrides"]["containerOverrides"][0]["environment"]
+    assert {e["name"]: e["value"] for e in sent}[TASK_TTL_ENV] == "1234"
 
 
 def test_a_task_that_never_started_is_aged_from_when_it_was_created(monkeypatch) -> None:

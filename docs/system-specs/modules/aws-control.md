@@ -2029,7 +2029,14 @@ anything still alive afterwards is an escaped worker, which the teardown sweeps 
 process group over bounded rounds, because a killed process's children reparent to
 PID 1 and surface in the next round.
 
-The exit code distinguishes the two reasons, because it is the only thing the
-platform reads: a stop signal is the one success case, and any other reason,
-including one this code cannot account for, exits non-zero. Reporting both as 0
-told ECS that a crash loop was a clean shutdown.
+The exit code distinguishes the reasons, because it is the only thing the
+platform reads: a stop signal and a spent task lifetime are the success cases, and
+any other reason, including one this code cannot account for, exits non-zero.
+Reporting all of them as 0 told ECS that a crash loop was a clean shutdown.
+
+The lifetime is a cost bound the launcher derives into `SMC_TASK_TTL_SECONDS`, and
+the supervisor's wait carries the deadline: an unattended task then stops billing
+with no scheduler and no further launch, which is the case the launcher's own sweep
+cannot reach. Zero, and an absent variable, mean unbounded. A stop on that deadline
+is ORDERLY -- the task ran for as long as it was allowed -- so it exits 0 and says
+why in the log, rather than sitting on the console beside a crash.
