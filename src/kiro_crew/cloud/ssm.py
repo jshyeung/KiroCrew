@@ -601,10 +601,10 @@ def task_exec_readiness(
         region,
     )
     if rc != 0:
-        # !r-quoted and capped, matching connect_fargate's sibling error and unlike
-        # instance_is_managed, which discards stderr entirely. AWS names the full
-        # caller ARN on an AccessDenied, and the repr turns an ESC or a newline in
-        # the tail into a literal rather than something a terminal acts on.
+        # !r-quoted and capped, unlike instance_is_managed, which discards stderr
+        # entirely. AWS names the full caller ARN on an AccessDenied, and the repr
+        # turns an ESC or a newline in the tail into a literal rather than
+        # something a terminal acts on.
         return TaskExecReadiness(
             ready=False,
             reason=(
