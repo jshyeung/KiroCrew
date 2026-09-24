@@ -148,17 +148,53 @@ def test_the_report_builds_its_required_ref_from_the_cited_unit():
 def test_the_cited_span_is_clamped_to_the_cap_rather_than_refused(monkeypatch):
     """A long run is cited by its relevant span, which is what the cap is for.
 
-    Patched on both names the value is read through: the emitter reads it off the
-    package and ``Ref`` enforces it from the schema module, so a test that patched
-    one would measure the other.
+    One name carries the cap: ``Ref`` enforces it from the schema module and the
+    emitter reads it from there too, so lowering it here is the whole patch and
+    there is one attribute to restore.
     """
     monkeypatch.setattr(crew_schema, "MAX_REF_SPAN", 2)
-    monkeypatch.setattr(lg, "MAX_REF_SPAN", 2, raising=False)
     _seed_session(entries=5)
     emit.on_crew_dispatch(CREW, DISPATCH_DATA)
     emit.on_crew_report(CREW, {"item": "it_1", "status": "done"}, cite_unit=WORKER_UNIT)
     ref = _crew_entries()[1]["ref"]
     assert ref["from"] == 4 and ref["to"] == 5
+
+
+def test_lowering_the_cap_on_its_owner_reaches_the_emitter(monkeypatch):
+    """The owner is what the emitter reads, so one name is enough to lower it.
+
+    The package re-exports the cap and caches the value the first time anything
+    reads it (:pep:`562`), which makes the re-export a second copy of one number.
+    The first line here is that first read, so the copy exists for the rest of this
+    test -- and the cap is then lowered on its owner alone. An emitter reading the
+    copy cites the unit whole; an emitter reading the owner clamps.
+    """
+    assert lg.MAX_REF_SPAN == crew_schema.MAX_REF_SPAN
+    monkeypatch.setattr(crew_schema, "MAX_REF_SPAN", 2)
+    _seed_session(entries=5)
+    emit.on_crew_dispatch(CREW, DISPATCH_DATA)
+    emit.on_crew_report(CREW, {"item": "it_1", "status": "done"}, cite_unit=WORKER_UNIT)
+    ref = _crew_entries()[1]["ref"]
+    assert ref["from"] == 4 and ref["to"] == 5
+
+
+def test_a_stale_cap_on_the_package_does_not_narrow_what_a_report_cites(monkeypatch):
+    """A copy of the cap sitting on the package cannot change a citation.
+
+    ``monkeypatch`` restores an attribute to whatever ``getattr`` answered when it
+    was set, and on the package that answer comes from the re-export reading the
+    owner. So a caller that lowers the owner and then the re-export has the lowered
+    value recorded as the re-export's original, and teardown writes it back as a
+    real attribute holding a value the owner does not have. This installs that
+    state directly: the citation stays the whole unit, because the emitter reads
+    the owner.
+    """
+    monkeypatch.setitem(vars(lg), "MAX_REF_SPAN", 2)
+    _seed_session(entries=4)
+    emit.on_crew_dispatch(CREW, DISPATCH_DATA)
+    emit.on_crew_report(CREW, {"item": "it_1", "status": "done"}, cite_unit=WORKER_UNIT)
+    ref = _crew_entries()[1]["ref"]
+    assert ref == {"unit": lg.KIND_SESSION, "id": WORKER_UNIT, "from": 1, "to": 4}
 
 
 @pytest.mark.parametrize("cite_unit", ["", "unit:never-written"])

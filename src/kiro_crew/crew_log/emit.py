@@ -5163,6 +5163,25 @@ def on_crew_dispatch(store: str, data: dict[str, Any]) -> int:
     return _crew_append(store, CREW_DISPATCH, data, src=crew_src(store))
 
 
+def _max_ref_span() -> int:
+    """The cited-span cap, read from the module that owns and enforces it.
+
+    ``Ref`` validates a span against ``schema``, so ``schema`` holds the cap and is
+    the single name a caller lowers to change it. The package re-exports the cap and
+    caches the value on first access (:pep:`562`), which makes the re-export a
+    second copy of one number: a reader that goes through the package can hold a
+    value the owner does not have. Reading the owner keeps the clamp this function
+    applies and the bound ``Ref`` enforces the same number.
+
+    Imported per call, for the reason :func:`_crew_log` gives: this module stays
+    free of import-time work. Every caller reaches here with the store already
+    open, so the schema module is loaded by then and the lookup is a dict hit.
+    """
+    from kiro_crew.crew_log import schema
+
+    return int(schema.MAX_REF_SPAN)
+
+
 def on_crew_report(
     store: str, data: dict[str, Any], *, cite_unit: str, replying: bool = True
 ) -> int:
@@ -5205,7 +5224,7 @@ def on_crew_report(
         return 0
     if last < 1:
         return 0
-    span = subsystem.MAX_REF_SPAN
+    span = _max_ref_span()
     evidence = subsystem.Ref(_KIND, cite_unit, max(1, last - span + 1), last)
     log = None
     try:
