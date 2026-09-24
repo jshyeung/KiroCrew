@@ -9,6 +9,7 @@ import AgentSelector, { type KiroCrewAgent } from './AgentSelector'
 import SimpleSelect from './SimpleSelect'
 import type { ChatFolder, CronJob } from '../types'
 import { orderFoldersWithPaths } from '../utils/folderTree'
+import { useFolderSortMode } from '../hooks/useFolderSortMode'
 import type { CronPrefill } from '../utils/schedulePresets'
 import { SaveCreateLabel, expandDow } from '../utils/cronUtils'
 import { adviseCronMode } from '../utils/cronModeAdvice'
@@ -401,10 +402,11 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
    *  folders in the order and with the ancestry labels the reader already knows --
    *  and a fix to either (a cycle guard, a non-string name off disk) reaches all
    *  of them at once. */
+  const { mode: folderSortMode, error: folderSortError } = useFolderSortMode()
   const folderOptions = useMemo(() => {
-    const ordered = orderFoldersWithPaths(chatFolders)
+    const ordered = orderFoldersWithPaths(chatFolders, folderSortMode)
     return { values: ordered.map(f => f.folder.id), labels: ordered.map(f => f.path) }
-  }, [chatFolders])
+  }, [chatFolders, folderSortMode])
   /** `hide_in_chat` is the explicit "this job gets no tab" opt-out, and a run with
    *  no tab has nothing to file -- so with it on the picker cannot do anything.
    *  Saying that and refusing input beats accepting a setting whose only
@@ -600,6 +602,20 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
             clearLabel={i18nT('components.jobForm.chat_folder_none')}
             aria-label={i18nT('components.jobForm.chat_folder')}
           />
+          {/* The picker lists folders in the sidebar's folder order
+              (dashboard.folder_sort). When that read failed the list is drawn in
+              the stored order, and the reader is told why it is not the order
+              they chose. No hand-off: the notice sits beside unsaved form input
+              (the job's name, message and schedule), and the hand-off navigates
+              away, which would discard what the reader typed. */}
+          {folderSortError && !chatFolderUnavailable && (
+            <ErrorNotice
+              variant="inline"
+              title={i18nT('pages.chatSidebar.folder_order_unavailable')}
+              message={folderSortError}
+              testId="job-folder-order-unavailable"
+            />
+          )}
         </div>
       )}
 
@@ -748,6 +764,22 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
                   : i18nT('components.jobForm.chat_folder_retry')}
               </Btn>
             </div>
+          )}
+          {/* The picker lists folders in the sidebar's folder order
+              (dashboard.folder_sort). When that read failed the list is drawn in
+              the stored order, and the reader is told why it is not the order
+              they chose -- the same notice the sidebar shows over its own tree.
+              No hand-off: the notice sits beside unsaved form input (the job's
+              name, message and schedule), and the hand-off navigates away, which
+              would discard what the reader typed -- the folder-list notice above
+              keeps its Retry in place for the same reason. */}
+          {folderSortError && !chatFolderUnavailable && (
+            <ErrorNotice
+              variant="inline"
+              title={i18nT('pages.chatSidebar.folder_order_unavailable')}
+              message={folderSortError}
+              testId="job-folder-order-unavailable"
+            />
           )}
           {/* A genuinely empty tree is not an error, but it IS a dead end without
               this: the picker offers nothing and says nothing about where folders

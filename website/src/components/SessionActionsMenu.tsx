@@ -3,6 +3,8 @@ import { useQuery } from '@tanstack/react-query'
 import { Pencil, Circle, Pin, Zap, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop } from 'lucide-react'
 import type { ChatFolder } from '../types'
 import FolderMoveSubmenu from './FolderMoveSubmenu'
+import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
+import { useFolderSortMode } from '../hooks/useFolderSortMode'
 import SendToInstanceSubmenu from './SendToInstanceSubmenu'
 import ExportSessionItem from './ExportSessionItem'
 import ImportSessionItem from './ImportSessionItem'
@@ -113,6 +115,12 @@ export default function SessionActionsMenu({
   const slot = useAppSelector(s => s.dashboard.slots.find(x => x.key === slotKey))
   const isPinned = !!slot?.pinned
   const isRunning = !!slot?.running
+  // The move-to submenu lists chat folders in the order the sidebar draws them.
+  // When the read behind that order failed, the submenu is drawn in the stored
+  // order and the reader is told why -- in the Radix menu form: a passive notice
+  // plus the hand-off as a sibling menu item, described by the notice's id.
+  const { mode: folderSortMode, error: folderSortError } = useFolderSortMode()
+  const folderOrderErrorId = React.useId()
   // Reload is also refused while sub-agent children are attached (the reset
   // would tear down their shared runtime) — mirror that in the disable so a
   // slot whose turn ended but whose children still run doesn't offer a click
@@ -158,7 +166,30 @@ export default function SessionActionsMenu({
           currentFolderId={currentFolderId}
           onPick={(folderId) => move(slotKey, folderId)}
           label={i18nT('components.sessionActionsMenu.move_to_folder')}
+          sortMode={folderSortMode}
         />
+      ),
+      // Rendered exactly where the submenu above is: the notice explains that
+      // submenu's order, so without folders there is nothing it would explain.
+      // Inside menu content a button nested in an item is skipped by the roving
+      // focus, so the hand-off is the sibling menu item, pointing back at the
+      // passive alert through `describedBy` -- the ExportSessionItem form.
+      folders.length > 0 && folderSortError && (
+        <React.Fragment key="folder-order-error">
+          <ErrorNotice
+            id={folderOrderErrorId}
+            variant="inline"
+            className="px-2 py-1.5"
+            title={i18nT('pages.chatSidebar.folder_order_unavailable')}
+            message={folderSortError}
+            testId="session-menu-folder-order-unavailable"
+          />
+          <ErrorNoticeMenuItem
+            Item={Item}
+            message={folderSortError}
+            describedBy={folderOrderErrorId}
+          />
+        </React.Fragment>
       ),
       <Item key="tags" onSelect={() => openTagPopover(slotKey)}>
         <TagIcon size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.tags')}

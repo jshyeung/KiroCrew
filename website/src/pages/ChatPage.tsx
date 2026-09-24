@@ -6,6 +6,7 @@ import { useModelsDegraded } from '../providers/modelListHealth'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { useVisualViewport } from '../hooks/useVisualViewport'
 import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
+import { useFolderSortMode } from '../hooks/useFolderSortMode'
 import { useRailWidth } from '../hooks/useRailWidth'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
 import { settingsPath } from '../components/settingsPath'
@@ -3162,6 +3163,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // future payload change) can resolve to a non-array, and `= []` only covers
   // undefined — which crashed the whole chat page on `.find`.
   const chatFolders: ChatFolder[] = Array.isArray(chatFoldersRaw) ? chatFoldersRaw : []
+  // The sidebar's folder sort mode, for the folder-suggestion card's option list:
+  // the card draws the same tree the sidebar draws and must list it in the same
+  // order. Read here (shared kirocrewConfig query) so the card stays pure; the
+  // read's failure is rendered beside the card, below.
+  const { mode: folderSortMode, error: folderSortError } = useFolderSortMode()
   const activeFolderName =
     chatFolders.find(f => f.id === currentSlot?.folder_id)?.name || ''
   // The session IDENTITY, not the display slot. `activeSlot` is the slot id
@@ -7609,6 +7615,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   <AnimatePresence>
                     {folderSuggestion && activeSlot ? (
                       <div className="pt-1.5" key="folder-suggestion">
+                        {/* The card's option list follows the sidebar's folder
+                            order (dashboard.folder_sort). When that read failed
+                            the list is drawn in the stored order, and the person
+                            is told why it is not the order they chose -- the
+                            same notice the sidebar shows over its own tree,
+                            hand-off included: the hand-off opens a fresh session
+                            for the error, the composer draft below is persisted
+                            per slot before the switch and the suggestion itself
+                            lives in the store, so nothing here is lost. */}
+                        <ErrorNotice
+                          title={i18nT('pages.chatSidebar.folder_order_unavailable')}
+                          message={folderSortError}
+                          askAgent
+                          className="mb-1.5"
+                          testId="folder-suggestion-order-unavailable"
+                        />
                         {/* Keyed by the suggestion's ts: a replacement card
                             remounts the component, so its dropdown re-prefills
                             and a selection made against the previous suggestion
@@ -7623,6 +7645,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                           suggestedFolderName={folderSuggestion.folderName}
                           suggestedFolderBreadcrumb={folderSuggestion.breadcrumb}
                           folders={chatFolders}
+                          folderSortMode={folderSortMode}
                           onAccept={folderSuggestionAccept}
                           onDecline={folderSuggestionDecline}
                         />
