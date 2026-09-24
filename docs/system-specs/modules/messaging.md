@@ -2103,8 +2103,18 @@ answer is not permission: a raised evaluation and a `Decision` without
   untrusted UNC share, a device namespace, a drive-relative target or a
   `..`-climbing suffix is refused before `realpath` can probe it, while a
   link whose target is another local directory is rewritten to that target
-  so benign junctions still resolve; canonicalizes through every symlink on
-  POSIX, and refuses a resolved
+  so benign junctions still resolve; on Windows it then RESOLVES that screened
+  string with every existing component of it held open
+  (`pinned_fs.hold_no_follow_chain`, reached through `_resolve_held`), because the
+  screen reaches each component by name and a junction planted between the last
+  name it read and the `realpath` would otherwise be followed -- a component that
+  cannot be renamed or deleted cannot be replaced, so the components the screen
+  proved are the components `realpath` traverses. A component the walk finds to be
+  a link after all, and a component whose state it cannot read at all, both refuse
+  rather than resolve; a component that holds NOTHING does not, because a path that
+  does not exist yet is what every write caller hands in. POSIX keeps
+  `realpath` on the string the gates judged and
+  canonicalizes through every symlink, and both platforms refuse a resolved
   target under a sensitive root, so an innocent-looking path that resolves into a
   blocked root is refused through the link. The **canonical** path is what reaches
   `runner.start_background`, not the raw argument, because validating one string and

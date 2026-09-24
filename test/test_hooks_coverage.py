@@ -12,6 +12,7 @@ filesystem write lands under ``tmp_path``.
 
 from __future__ import annotations
 
+import errno
 import json
 import ntpath
 import os
@@ -496,10 +497,27 @@ class TestValidateFilePath:
         Windows CI shard exercises real backslash shapes via tmp_path. The
         namespace carries every os attribute the validate_file_path call
         graph can reach (unc_probe_allowed folds with normcase/normpath and
-        joins with sep) so a stub miss cannot masquerade as a product bug."""
+        joins with sep) so a stub miss cannot masquerade as a product bug.
+
+        The held no-follow walk is stubbed for the same reason the link
+        predicates are: it opens real components on the host, and a simulated
+        Windows path names none. The default answer holds the whole chain, which
+        puts the walk out of the way of the screen these tests are about: the
+        resolution then runs on the whole candidate, so what they assert about
+        the screen's output is what the validator returns. A test about the
+        walk's own verdicts drives real paths in
+        ``TestValidateFilePathHeldResolution`` instead.
+        """
         import types
 
         from kiro_crew import hooks as hooks_mod
+        from kiro_crew import pinned_fs as pinned_fs_mod
+
+        monkeypatch.setattr(
+            pinned_fs_mod,
+            "hold_no_follow_chain",
+            lambda path, **_kw: pinned_fs_mod.HeldChain(pinned_fs_mod.CHAIN_HELD, (), path),
+        )
 
         monkeypatch.setattr(
             hooks_mod,
@@ -977,6 +995,324 @@ class TestValidateFilePath:
         swapped = Path("//other-server/profiles/bob/.kiro/crew")
         monkeypatch.setattr(hooks_mod._config_paths, "peek_data_home", lambda: swapped)
         assert hooks_mod._unc_data_home_root() == swapped
+
+
+class TestValidateFilePathHeldResolution:
+    r"""The ``check -> realpath`` window on the Windows branch.
+
+    The link screen reaches every component by NAME, so between the last name it
+    inspected and ``realpath`` a junction can be planted at one of them -- and
+    resolving a junction aimed at ``\\host\share`` is an outbound SMB authentication,
+    not a local lookup. The resolution therefore runs with every existing component
+    held open. What the hold BUYS can only be observed on Windows, where a handle
+    without ``FILE_SHARE_DELETE`` blocks the rename that a swap needs; what can be
+    pinned on any host is that the resolution is gated on the walk's verdict, and that
+    every way the walk can decline refuses instead of resolving.
+    """
+
+    def _windows(self, monkeypatch, realpath=os.path.realpath):
+        import types
+
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda _p: False)
+        monkeypatch.setattr(hooks_mod, "is_sensitive_path", lambda _p: False)
+        monkeypatch.setattr(
+            hooks_mod,
+            "os",
+            types.SimpleNamespace(
+                name="nt",
+                sep=os.sep,
+                environ=os.environ,
+                readlink=os.readlink,
+                path=types.SimpleNamespace(
+                    expanduser=os.path.expanduser,
+                    abspath=os.path.abspath,
+                    realpath=realpath,
+                    normcase=os.path.normcase,
+                    normpath=os.path.normpath,
+                    isabs=os.path.isabs,
+                    join=os.path.join,
+                    dirname=os.path.dirname,
+                    relpath=os.path.relpath,
+                ),
+            ),
+        )
+
+    def _hold(self, monkeypatch, answer, *, held=None):
+        """Install *answer* as the walk's verdict, recording what it was asked about.
+
+        The boundary handed back with the verdict is the deepest component of the path
+        that exists, which is what a real walk of that path proves. A test that needs a
+        boundary the filesystem does not agree with names one.
+        """
+        from kiro_crew import pinned_fs as pinned_fs_mod
+
+        asked: list[str] = []
+
+        def _deepest_existing(path):
+            current = path
+            while not os.path.lexists(current):
+                parent = os.path.dirname(current)
+                if parent == current:
+                    return current
+                current = parent
+            return current
+
+        def _walk(path, **_kw):
+            asked.append(path)
+            if isinstance(answer, BaseException):
+                raise answer
+            return pinned_fs_mod.HeldChain(
+                answer, (), held if held is not None else _deepest_existing(path)
+            )
+
+        monkeypatch.setattr(pinned_fs_mod, "hold_no_follow_chain", _walk)
+        return asked
+
+    def test_a_held_chain_resolves_the_screened_string(self, tmp_path, monkeypatch):
+        """The happy path: the walk holds the whole chain and the resolution runs
+        on the SAME string the walk was asked about, not a re-derived one."""
+        from kiro_crew import pinned_fs as pinned_fs_mod
+
+        f = _write(tmp_path / "ok.txt", "x")
+        self._windows(monkeypatch)
+        asked = self._hold(monkeypatch, pinned_fs_mod.CHAIN_HELD)
+
+        assert _same(validate_file_path(str(f)) or "", str(f))
+        assert asked == [os.path.abspath(str(f))]
+
+    def test_a_missing_tail_still_resolves(self, tmp_path, monkeypatch):
+        """A path that does not exist yet is what every write caller hands in, so the
+        walk running out of path is not a refusal."""
+        from kiro_crew import pinned_fs as pinned_fs_mod
+
+        self._windows(monkeypatch)
+        self._hold(monkeypatch, pinned_fs_mod.CHAIN_MISSING)
+
+        assert validate_file_path(str(tmp_path / "not-created-yet.txt")) is not None
+
+    def test_a_missing_tail_is_never_resolved_by_name(self, tmp_path, monkeypatch):
+        """Where the hold ends, the resolution ends. A name that holds nothing while the
+        walk passes it can be filled a moment afterwards, so handing the whole string to
+        ``realpath`` would put the one unheld component back inside the window the hold
+        exists to close -- and following a junction planted there is the outbound probe.
+        ``realpath`` is therefore asked about the proven prefix ALONE, and the remainder
+        is joined as text, which is the answer a resolution reaches anyway."""
+        from kiro_crew import pinned_fs as pinned_fs_mod
+
+        proven = tmp_path / "proven"
+        proven.mkdir()
+        candidate = proven / "filled-in-later" / "leaf.txt"
+
+        seen: list[str] = []
+
+        def _spy(path):
+            seen.append(path)
+            return os.path.realpath(path)
+
+        self._windows(monkeypatch, realpath=_spy)
+        self._hold(monkeypatch, pinned_fs_mod.CHAIN_MISSING)
+
+        got = validate_file_path(str(candidate))
+
+        assert seen == [str(proven)]
+        assert got == os.path.join(os.path.realpath(str(proven)), "filled-in-later", "leaf.txt")
+
+    def test_a_remainder_outside_the_boundary_refuses(self, tmp_path, monkeypatch):
+        """A walk of this very string cannot report a boundary the string is not under,
+        so that pairing is a contradiction rather than a path. It refuses BEFORE
+        resolving, since joining a remainder that climbs out of the proven prefix would
+        name a component nothing vouched for."""
+        from kiro_crew import pinned_fs as pinned_fs_mod
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran on a remainder outside the boundary")
+
+        self._windows(monkeypatch, realpath=_boom)
+        self._hold(monkeypatch, pinned_fs_mod.CHAIN_MISSING, held=str(tmp_path / "somewhere-else"))
+
+        assert validate_file_path(str(tmp_path / "here" / "doc.txt")) is None
+
+    def test_a_component_that_is_a_link_refuses_before_realpath(self, tmp_path, monkeypatch):
+        """The walk found a reparse point the name-based screen did not. Whether the
+        screen missed it or it was planted a moment ago is not knowable from here, so
+        it is refused rather than resolved -- and refused BEFORE realpath, which is
+        the call that would contact the link's host."""
+        from kiro_crew import pinned_fs as pinned_fs_mod
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran on a chain the walk reported as linked")
+
+        self._windows(monkeypatch, realpath=_boom)
+        self._hold(monkeypatch, pinned_fs_mod.CHAIN_REPARSE)
+
+        assert validate_file_path(str(tmp_path / "doc.txt")) is None
+
+    def _real_windows_walk(self, monkeypatch):
+        """Run the REAL walk, on the route Windows takes.
+
+        The tests above stub the walk to pin what the validator does with each verdict.
+        These two need the verdict itself to come from the walk's own handling of a
+        component, so they select the by-name route -- the Windows one -- and let it open
+        real components on this host.
+        """
+        from kiro_crew import pinned_fs as pinned_fs_mod
+
+        monkeypatch.setattr(pinned_fs_mod, "supports_chain_walk", lambda: False)
+
+    def test_a_leaf_that_cannot_be_held_still_validates(self, tmp_path, monkeypatch):
+        """A leaf that exists and refuses the pinning mask: Windows answers a sharing
+        violation as ``EACCES``, so this is a file another process holds exclusively. It
+        must NOT degrade to a refusal -- validation would start failing for files another
+        process happens to have open, which is the regression the literal remedy for the
+        interior case would have introduced. The walk re-opens the leaf through a mask
+        that takes no part in sharing, classifies it, and reports the boundary at the
+        parent; the leaf name is re-attached as text, so nothing resolves it."""
+        from kiro_crew import platform_compat
+
+        leaf = _write(tmp_path / "busy.txt", "x")
+        self._windows(monkeypatch)
+        self._real_windows_walk(monkeypatch)
+        real_open = platform_compat.open_entry_no_follow
+
+        def _exclusively_held(path, *, hold=True):
+            if os.path.basename(str(path)) == "busy.txt" and hold:
+                raise OSError(errno.EACCES, "sharing violation")
+            return real_open(path)
+
+        monkeypatch.setattr(platform_compat, "open_entry_no_follow", _exclusively_held)
+
+        got = validate_file_path(str(leaf))
+        assert got is not None
+        # The tail came back as text under the proven parent, not resolved.
+        assert os.path.basename(got) == "busy.txt"
+        assert _same(os.path.dirname(got), str(tmp_path))
+
+    def test_an_interior_component_that_cannot_be_opened_never_reaches_realpath(
+        self, tmp_path, monkeypatch
+    ):
+        """The chain the interior refusal exists to break. A same-user agent plants a
+        junction at an interior component with a DACL that denies a direct open; the
+        name-based screen reports it as not-a-link, because the query it uses answers
+        False when it is denied. If the walk reported a boundary above it, this function
+        would hand back a path whose remaining text names that junction, and the
+        consumer's own ``realpath`` would follow it -- an outbound SMB authentication.
+        The walk raises instead, so the refusal happens BEFORE any resolution runs, which
+        is what the substituted ``realpath`` here asserts."""
+        from kiro_crew import platform_compat
+
+        leaf = tmp_path / "mid" / "doc.txt"
+        leaf.parent.mkdir(parents=True)
+        _write(leaf, "x")
+        real_open = platform_compat.open_entry_no_follow
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran on a chain holding an unclassified component")
+
+        self._windows(monkeypatch, realpath=_boom)
+        self._real_windows_walk(monkeypatch)
+
+        def _interior_denied(path, *, hold=True):
+            if os.path.basename(str(path)) == "mid":
+                raise OSError(errno.EACCES, "access denied")
+            return real_open(path)
+
+        monkeypatch.setattr(platform_compat, "open_entry_no_follow", _interior_denied)
+
+        assert validate_file_path(str(leaf)) is None
+
+    def test_a_placeholder_component_still_validates(self, tmp_path, monkeypatch):
+        """A OneDrive Files-On-Demand placeholder, a WOF- or dedup-backed file. Windows
+        sets ``FILE_ATTRIBUTE_REPARSE_POINT`` on all of them while their tag names no
+        other path, so they redirect nothing and a resolution through them contacts no
+        host. Refusing them would deny ordinary local files on a machine with OneDrive
+        or compression enabled, which is a wider refusal than this change is allowed to
+        make -- so the classifier reads the TAG off the handle and answers False."""
+        import types
+
+        from kiro_crew import platform_compat
+
+        leaf = _write(tmp_path / "placeholder.txt", "x")
+        self._windows(monkeypatch)
+        self._real_windows_walk(monkeypatch)
+
+        real_fstat = os.fstat
+        monkeypatch.setattr(
+            platform_compat,
+            "os",
+            types.SimpleNamespace(
+                fstat=lambda fd: types.SimpleNamespace(
+                    st_file_attributes=platform_compat._WIN_FILE_ATTRIBUTE_REPARSE_POINT,
+                    st_mode=real_fstat(fd).st_mode,
+                ),
+                fspath=os.fspath,
+                open=os.open,
+                O_RDONLY=os.O_RDONLY,
+                O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0),
+                O_NONBLOCK=getattr(os, "O_NONBLOCK", 0),
+            ),
+        )
+        # IO_REPARSE_TAG_CLOUD: high bits carry no name surrogate.
+        monkeypatch.setattr(platform_compat, "_win_reparse_tag_from_fd", lambda _fd: 0x9000_001A)
+
+        assert validate_file_path(str(leaf)) is not None
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            OSError(errno.EIO, "input/output error"),
+            OSError(errno.ETIMEDOUT, "host unreachable"),
+            ValueError("refusing to hold a path with no anchor"),
+        ],
+        ids=["unreadable", "unreachable", "unholdable"],
+    )
+    def test_a_walk_that_cannot_answer_fails_closed(self, tmp_path, monkeypatch, failure):
+        """A component whose state cannot be read for a reason the walk has no reading
+        of, and a path the walk declines to hold at all. Both leave what sits there
+        genuinely unknown, so both refuse rather than resolve. A component that merely
+        cannot be HELD is a different case -- the walk answers that one with a shorter
+        boundary, which the two tests below pin."""
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran after the walk failed")
+
+        self._windows(monkeypatch, realpath=_boom)
+        self._hold(monkeypatch, failure)
+
+        assert validate_file_path(str(tmp_path / "doc.txt")) is None
+
+    def test_the_sensitive_fence_still_judges_the_resolved_path(self, tmp_path, monkeypatch):
+        """Holding the chain is added BEFORE the sensitive-path fence, not instead of
+        it: a held chain that resolves onto a credential leaf is still refused."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import pinned_fs as pinned_fs_mod
+
+        f = _write(tmp_path / "creds", "x")
+        self._windows(monkeypatch)
+        self._hold(monkeypatch, pinned_fs_mod.CHAIN_HELD)
+        monkeypatch.setattr(hooks_mod, "is_sensitive_path", lambda _p: True)
+
+        assert validate_file_path(str(f)) is None
+
+    def test_the_walk_is_not_consulted_on_posix(self, tmp_path, monkeypatch):
+        """POSIX resolution stays byte-identical. There is no UNC there, so following
+        a link is a local lookup rather than a network authentication, and the guard
+        remains is_sensitive_path on the resolved path."""
+        if os.name == "nt":
+            pytest.skip("the held walk is active on Windows by design")
+
+        def _boom(_path, **_kw):  # pragma: no cover
+            raise AssertionError("the held walk ran on POSIX")
+
+        from kiro_crew import pinned_fs as pinned_fs_mod
+
+        monkeypatch.setattr(pinned_fs_mod, "hold_no_follow_chain", _boom)
+        f = _write(tmp_path / "ok.txt", "x")
+
+        assert _same(validate_file_path(str(f)) or "", str(f))
 
 
 class TestSafeReadFile:
