@@ -31,7 +31,7 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.socket_mode.websockets import SocketModeClient as WSSocketModeClient
 from slack_sdk.web.async_client import AsyncWebClient
 
-from kiro_crew import __version__
+from kiro_crew import __version__, standing_approval
 from kiro_crew.agent_discovery import agent_spec_stems
 from kiro_crew.agent_spec_format import (
     is_markdown_spec,
@@ -920,9 +920,17 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
     set_tracking_channels(orch._tracking_channels)
     set_open_channels(orch._open_channels)
     set_owner_id(orch._owner_id)
-    if orch._cfg.agent.dangerously_skip_permissions:
+    # The STANDING grant is read from the operator-owned keystone, never from
+    # config.json: a standing skip of every approval must not be declarable by the
+    # population it governs, and config.json stays agent-READABLE by design, which
+    # leaves the inode behind its read-only seal a link(2) source. The retired
+    # config key grants nothing and says so once, rather than being honoured
+    # silently.
+    if standing_approval.is_declared():
         # grant_declared_yolo walks the profiles dir — blocking, so off-loop.
         await asyncio.to_thread(set_yolo_mode, True)
+    elif orch._cfg.agent.dangerously_skip_permissions:
+        logger.warning("%s", standing_approval.migration_notice())
     set_orch_cfg(orch._cfg)
     if orch.dashboard_state:
         set_dashboard_state(orch.dashboard_state)

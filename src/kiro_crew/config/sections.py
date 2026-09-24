@@ -1204,13 +1204,15 @@ class AgentConfig:
     dangerously_skip_permissions: bool = field(
         default=False,
         metadata=_meta(
-            "Dangerously Skip Permissions",
-            "Skip EVERY tool approval confirmation, permanently. Declaring it here "
-            "is a standing instruction: the grant does not expire and is "
-            "re-established on every startup. This is the advanced, "
-            "config-file-only escape hatch — there is deliberately no dashboard "
-            "toggle for it. An enterprise policy can forbid it, which falls back "
-            "to the ad-hoc duration below.",
+            "Dangerously Skip Permissions (RETIRED)",
+            "RETIRED and no longer a grant. The standing auto-approve declaration "
+            "moved to the operator-owned keystone standing-approval/grant.json, "
+            "which an agent sandbox cannot open at all — this document stays "
+            "agent-READABLE by design, and a readable inode the agent owns can be "
+            "given a second name in a writable directory, so a seal on this name "
+            "could not hold the switch. Still read here for ONE purpose: when it is "
+            "true and the keystone is absent, startup logs how to move it and grants "
+            "nothing. Set the keystone instead.",
             restart=True,
         ),
     )
