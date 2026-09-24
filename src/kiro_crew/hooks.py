@@ -1434,10 +1434,15 @@ class HookManager:
                 # allow-list, unchanged), and the title is model-authored
                 # prose. Both may NARROW — a non-read kind refuses even a
                 # host-known read tool, so the two must agree — never widen.
-                # An MCP-served tool carries no host-trusted read-only marker
-                # on the permission event (``readOnlyHint`` is a manifest claim
-                # nothing forwards to the gate), so it is not provable here and
-                # falls to the caller's path, which under READ_ONLY refuses.
+                # An MCP-served tool is now ANSWERABLE — the probe records each
+                # server's ``readOnlyHint`` per tool name and the dashboard's
+                # trust-reads tier reads it — and is still refused here, on
+                # purpose. Those are different bars. Trust-reads spends a
+                # server's self-claim to skip a card a person would otherwise
+                # have clicked, and the operator installed that server. This
+                # branch has no approver behind it at all, so a verdict EXECUTES
+                # the call: the only admissible proof is what the HOST knows,
+                # and a claim the server made about itself is not that.
                 if kind and kind not in _READ_ONLY_TOOL_KINDS:
                     return ToolHookResult.allow()
                 if _is_host_read_only_builtin(

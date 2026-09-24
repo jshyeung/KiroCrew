@@ -268,7 +268,7 @@ from kiro_crew.llm_helpers import (
     transient_retry_delay,
     usage_has_billing,
 )
-from kiro_crew.mcp_discovery import kirocrew_managed_names
+from kiro_crew.mcp_discovery import kirocrew_managed_names, probed_tool_read_only
 from kiro_crew.members import member_lifecycle, record_activity
 from kiro_crew.messaging.commands import compact_unsupported_reply
 from kiro_crew.messaging.dispatch import consume_reinjection, rearm_reinjection
@@ -13571,11 +13571,29 @@ async def _run_chat(
                 # a scope check is not a pure read — it retires a lapsed grant and
                 # logs that, which must happen once per event, not twice.
                 slot_trusted = _slot_is_trusted(slot)
+                # The MCP half of the same promise ("auto-approve read operations,
+                # ask for writes"). The ONLY admissible evidence is the server's
+                # own ``readOnlyHint`` as the HOST recorded it at probe time,
+                # looked up by the host-stamped ``_meta.kiro`` identity. Nothing
+                # the model can author is consulted: not the title, not
+                # ``tool_input``, not ``raw_tool_params`` — a hint in any of those
+                # is not this hint and cannot reach this decision. ``is True`` is
+                # load-bearing: a server that declared nothing yields ``None``,
+                # which must read as a write and keep prompting, never as a
+                # grant. ``mcp_identity_trusted`` is required IN ADDITION to a
+                # non-empty pair, so a future population path that forgets the
+                # flag fails closed instead of granting on a forgeable name.
+                _mcp_read_only = (
+                    not cmd
+                    and not event.is_shell
+                    and bool(event.mcp_identity_trusted)
+                    and probed_tool_read_only(event.mcp_server_name, event.tool_name) is True
+                )
                 if (
                     slot._trust_reads
                     and not slot_trusted
                     and not yolo_active
-                    and cmd
+                    and (cmd or _mcp_read_only)
                     and not _child_low_fidelity
                 ):
                     _tr_shim = (
@@ -13590,7 +13608,8 @@ async def _run_chat(
                             refusal=_tr_shim,
                             tier="trust_reads",
                         )
-                    if is_read_only_bash(cmd) and _tr_shim is None:
+                    if _mcp_read_only or (is_read_only_bash(cmd) and _tr_shim is None):
+                        _tr_reason = "trust_reads_mcp" if _mcp_read_only else "trust_reads"
                         try:
                             validated_tool = _validate_tool_name(
                                 event.title,
@@ -13604,7 +13623,7 @@ async def _run_chat(
                                 event,
                                 session_key=session_key,
                                 error=e,
-                                metadata={"reason": "trust_reads"},
+                                metadata={"reason": _tr_reason},
                                 refusal_reasons=_refusal_reasons,
                                 refusal_notices=_refusal_notices,
                                 state=state,
@@ -13627,7 +13646,7 @@ async def _run_chat(
                             tool_kind=event.tool_kind,
                             outcome="auto_approved",
                             request_id=event.request_id,
-                            metadata={"reason": "trust_reads"},
+                            metadata={"reason": _tr_reason},
                         )
                         continue
                 # Trust mode (per-slot) or YOLO mode (global) — auto-approve.
