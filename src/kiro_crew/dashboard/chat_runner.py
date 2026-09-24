@@ -4715,6 +4715,7 @@ async def _tool_risk_meta(
             policy=_auto_approve_reason(slot, state.is_yolo_active()),
             session_key=session_key,
             calls_this_turn=calls_this_turn,
+            tool_kind=event.tool_kind or "",
         )
         return {"decisions_tool_risk": record} if record else None
     except Exception:  # pragma: no cover - an observation may not cost a call

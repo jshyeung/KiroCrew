@@ -379,6 +379,8 @@ class TestTheModeItAnnotates:
         assert calls[0]["tool"] == "bash"
         assert calls[0]["arguments"] == '{"command": "rm -rf /data"}'
         assert calls[0]["message"] == "clean up /data"
+        # The harness's ACP kind rides along; it decides the file-write rule.
+        assert calls[0]["tool_kind"] == "execute"
 
 
 # ── the mutation check: permission behaviour is byte-identical ────────────────

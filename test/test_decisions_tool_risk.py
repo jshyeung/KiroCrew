@@ -117,7 +117,7 @@ class TestTheRecord:
 
     @pytest.mark.asyncio
     async def test_a_caution_answer_is_flagged_too(self, home):
-        with _answering(tr.TIER_CAUTION):
+        with _answering(tr.TIER_CAUTION, 0.95):
             record = await tr.risk_record(
                 tool="fsWrite", arguments="{}", policy="yolo", session_key="chat-1"
             )
@@ -517,9 +517,11 @@ class TestTheRiskyConfidenceThreshold:
             (tr.TIER_RISKY, tr.RISKY_CONFIDENCE_THRESHOLD, True),
             (tr.TIER_RISKY, 0.98, True),
             (tr.TIER_RISKY, 1.0, True),
-            # ``caution`` is the mild word and clears on its tier alone.
-            (tr.TIER_CAUTION, 0.0, True),
-            (tr.TIER_CAUTION, 0.34, True),
+            # ``caution`` has its own, higher bar -- also inclusive.
+            (tr.TIER_CAUTION, 0.0, False),
+            (tr.TIER_CAUTION, 0.34, False),
+            (tr.TIER_CAUTION, 0.89, False),
+            (tr.TIER_CAUTION, tr.CAUTION_CONFIDENCE_THRESHOLD, True),
             (tr.TIER_CAUTION, 1.0, True),
             # ``safe`` is never a badge at any confidence at all.
             (tr.TIER_SAFE, 0.0, False),
@@ -572,25 +574,25 @@ class TestTheRiskyConfidenceThreshold:
         assert [r for r in _rows(home) if r.get("tier")] == [record]
 
     @pytest.mark.asyncio
-    async def test_a_caution_answer_at_the_same_confidence_is_still_badged(self, home):
-        """The asymmetry is DELIBERATE and is pinned so it is not quietly repaired.
+    async def test_a_risky_answer_between_the_bars_badges_where_a_caution_does_not(self, home):
+        """The bars are per word, and ``caution``'s sits higher on purpose.
 
-        A ``caution`` under the bar draws a badge while a ``risky`` under it draws
-        none. That is not an ordering slip: the two words name different claims,
-        and only ``risky``'s is expensive to be wrong about.
+        Between 0.80 and 0.90 a ``risky`` draws a badge while a ``caution`` draws
+        none: ``caution`` is the mild word, so a hesitant one costs a reader little
+        when missed and every badge its meaning when printed.
         """
-        low = tr.RISKY_CONFIDENCE_THRESHOLD - 0.25
-        with _answering(tr.TIER_CAUTION, low):
+        between = 0.85
+        with _answering(tr.TIER_CAUTION, between):
             caution = await tr.risk_record(
-                tool="fsWrite", arguments="{}", policy="trust", session_key="chat-1"
+                tool="bash", arguments="mkdir build", policy="trust", session_key="chat-1"
             )
-        with _answering(tr.TIER_RISKY, low):
+        with _answering(tr.TIER_RISKY, between):
             risky = await tr.risk_record(
                 tool="bash", arguments="git push", policy="trust", session_key="chat-2"
             )
 
-        assert caution is not None
-        assert risky is None
+        assert caution is None
+        assert risky is not None
 
     @pytest.mark.asyncio
     async def test_the_constant_is_what_decides(self, home, monkeypatch):
@@ -629,6 +631,115 @@ class TestTheRiskyConfidenceThreshold:
         """``p`` is a 0..1 probability everywhere in this package, so the bar is too."""
         assert isinstance(tr.RISKY_CONFIDENCE_THRESHOLD, float)
         assert 0.0 < tr.RISKY_CONFIDENCE_THRESHOLD <= 1.0
+
+
+class TestTheCautionConfidenceThreshold:
+    """``caution`` must be believed too, and a plain file write never draws it."""
+
+    @pytest.mark.asyncio
+    async def test_a_hesitant_caution_draws_nothing_but_keeps_its_row(self, home):
+        with _answering(tr.TIER_CAUTION, 0.89):
+            record = await tr.risk_record(
+                tool="bash", arguments="mkdir build", policy="trust", session_key="chat-1"
+            )
+
+        assert record is None
+        outcome = [r for r in _rows(home) if r.get("tier")]
+        assert len(outcome) == 1
+        assert outcome[0]["tier"] == tr.TIER_CAUTION
+        assert outcome[0]["flagged"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_confident_caution_is_badged(self, home):
+        with _answering(tr.TIER_CAUTION, tr.CAUTION_CONFIDENCE_THRESHOLD):
+            record = await tr.risk_record(
+                tool="bash", arguments="mkdir build", policy="trust", session_key="chat-1"
+            )
+
+        assert record is not None
+        assert record["flagged"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_constant_is_what_decides(self, home, monkeypatch):
+        monkeypatch.setattr(tr, "CAUTION_CONFIDENCE_THRESHOLD", 0.50)
+        with _answering(tr.TIER_CAUTION, 0.57):
+            now_badged = await tr.risk_record(
+                tool="bash", arguments="mkdir b", policy="trust", session_key="chat-1"
+            )
+        assert now_badged is not None
+
+        monkeypatch.setattr(tr, "CAUTION_CONFIDENCE_THRESHOLD", 0.99)
+        with _answering(tr.TIER_CAUTION, 0.98):
+            now_hidden = await tr.risk_record(
+                tool="bash", arguments="mkdir b", policy="trust", session_key="chat-2"
+            )
+        assert now_hidden is None
+
+    def test_the_value_sits_above_the_risky_bar_and_below_certainty(self):
+        """Above ``risky``'s bar by design, and below 1.0 so the word can still print."""
+        assert tr.RISKY_CONFIDENCE_THRESHOLD < tr.CAUTION_CONFIDENCE_THRESHOLD < 1.0
+        assert isinstance(tr.CAUTION_CONFIDENCE_THRESHOLD, float)
+
+    @pytest.mark.parametrize(
+        "tier, p, badged",
+        [
+            (tr.TIER_CAUTION, 0.99, False),
+            (tr.TIER_CAUTION, 1.0, False),
+            # A risky write is still badged: outside the workspace is what the word names.
+            (tr.TIER_RISKY, 0.95, True),
+            (tr.TIER_RISKY, 0.79, False),
+            (tr.TIER_SAFE, 1.0, False),
+        ],
+    )
+    def test_a_file_write_never_draws_caution(self, tier, p, badged):
+        assert tr.earns_badge(tier, p, file_write=True) is badged
+
+    @pytest.mark.asyncio
+    async def test_a_file_write_caution_keeps_its_tier_on_the_row(self, home):
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments='{"path": "README.md"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind=tr.FILE_WRITE_KIND,
+            )
+
+        assert record is None
+        outcome = [r for r in _rows(home) if r.get("tier")]
+        assert len(outcome) == 1
+        assert outcome[0]["tier"] == tr.TIER_CAUTION
+        assert outcome[0]["p"] == 0.99
+        assert outcome[0]["flagged"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_file_write_risky_is_still_badged(self, home):
+        with _answering(tr.TIER_RISKY, 0.95):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments='{"path": "/home/u/.aws/credentials"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind=tr.FILE_WRITE_KIND,
+            )
+
+        assert record is not None
+        assert record["flagged"] is True
+
+    @pytest.mark.asyncio
+    async def test_only_the_structured_kind_marks_a_file_write(self, home):
+        """The display title is not the signal: a caution titled "Write File" with
+        another kind is judged on its confidence alone."""
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments="{}",
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="execute",
+            )
+
+        assert record is not None
 
 
 # ── the point's own identity ──────────────────────────────────────────────────

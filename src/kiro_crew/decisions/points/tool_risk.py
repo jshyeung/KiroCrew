@@ -51,8 +51,8 @@ Everything is a refusal back to "no badge"
 ------------------------------------------
 :func:`risk_record` returns ``None`` for: the seam off, the session unsampled, the
 tool-argument scope not consented to, the turn cap reached, a scrubbed or failed
-call, an unusable answer, a ``safe`` verdict, and a ``risky`` verdict the provider
-was not confident about. So an ordinary tool card is byte-identical to the one this
+call, an unusable answer, a ``safe`` verdict, a ``caution`` or ``risky`` verdict the
+provider was not confident about, and a ``caution`` on a plain file write. So an ordinary tool card is byte-identical to the one this
 build appends today, and a caller needs no try/except and no feature check.
 
 ``safe`` is a refusal to BADGE, not a refusal to record: the row is written with
@@ -60,13 +60,15 @@ build appends today, and a caller needs no try/except and no feature check.
 that makes the other two readable, and a badge on every card would cost the
 annotation its meaning.
 
-An unconvinced ``risky`` is refused the same way and recorded the same way. The
+An unconvinced answer is refused the same way and recorded the same way. The
 tier is not the flag on its own: ``p`` is the probability the provider assigned to
 the option it CHOSE, so a ``risky`` at 0.5 is a coin flip about the most alarming
-word in the domain, and :data:`RISKY_CONFIDENCE_THRESHOLD` is where this build
-stops printing one. The row still carries ``tier="risky"``, so the suppressed
-answers stay countable -- which is how the threshold was measured and the only way
-the next one can be.
+word in the domain. :data:`RISKY_CONFIDENCE_THRESHOLD` and
+:data:`CAUTION_CONFIDENCE_THRESHOLD` are where this build stops printing each
+word. A plain file write (ACP tool kind :data:`FILE_WRITE_KIND`) never draws a
+``caution`` badge at all. The row still carries the tier either way, so the
+suppressed answers stay countable -- which is how the thresholds were measured and
+the only way the next ones can be.
 
 Two bounds, because a turn can call many tools
 ---------------------------------------------
@@ -110,9 +112,9 @@ TIER_RISKY = "risky"
 TIERS = (TIER_SAFE, TIER_CAUTION, TIER_RISKY)
 
 #: The tiers that may earn a badge. ``safe`` is absent deliberately -- see the
-#: module docstring. Membership is NECESSARY and not sufficient: ``risky`` must
-#: also clear :data:`RISKY_CONFIDENCE_THRESHOLD`, and :func:`earns_badge` is the
-#: one function that answers the whole question.
+#: module docstring. Membership is NECESSARY and not sufficient: each tier must
+#: also clear its confidence threshold, a file write never draws ``caution``, and
+#: :func:`earns_badge` is the one function that answers the whole question.
 FLAGGED_TIERS = (TIER_CAUTION, TIER_RISKY)
 
 #: Confidence a ``risky`` answer needs before it reaches the card.
@@ -137,6 +139,32 @@ FLAGGED_TIERS = (TIER_CAUTION, TIER_RISKY)
 #: threshold would be a second, undocumented way to make the point a no-op
 #: (``1.0`` badges nothing) without turning the seam off.
 RISKY_CONFIDENCE_THRESHOLD = 0.80
+
+#: Confidence a ``caution`` answer needs before it reaches the card.
+#:
+#: 0.90, measured the same way. Over four consecutive live day-files --
+#: 6,984 annotated calls, 1,527 badges -- ``caution`` arrived with ``p`` spread
+#: across 0.3..1.0 and bunched between 0.5 and 0.8, so a tier-only rule printed a
+#: badge on nearly every hesitant one. Replaying those rows with ``caution``
+#: needing 0.90, ``risky`` keeping 0.80 and file writes never drawing ``caution``
+#: leaves about 490 badges (-68%). The bar sits HIGHER than ``risky``'s on
+#: purpose: ``caution`` is the mild word, so a missed one costs a reader little
+#: and a noisy one costs every badge its meaning. Raising ``risky`` to 0.90 in the
+#: same replay would have kept 33 of 86 push / force-push calls instead of 61,
+#: which is why that bar did not move.
+#:
+#: A CONSTANT for the same reason :data:`RISKY_CONFIDENCE_THRESHOLD` is one.
+CAUTION_CONFIDENCE_THRESHOLD = 0.90
+
+#: The ACP tool ``kind`` of a plain file write or edit (the harness's own label,
+#: e.g. kiro's ``write`` tool titled "Write File"). A call of this kind never
+#: draws a ``caution`` badge: writing a file inside the workspace is what the
+#: rubric's ``caution`` sentence describes, so the badge said nothing a reader of
+#: the card did not already know -- in that same reading 477 of 1,527 badges
+#: (31%) were "Write File" at ``caution``. ``risky`` still badges on a write, because
+#: a write outside the workspace or over a credential file is exactly what
+#: ``risky`` is for.
+FILE_WRITE_KIND = "edit"
 
 #: The rubric, sent as the question's prompt. One sentence per tier, because the
 #: tiers are the answer domain and a domain nobody defined is a domain every
@@ -191,28 +219,30 @@ LOG_BUDGET_SECS = 0.05
 ERROR_TURN_CAP = "turn-cap"
 
 
-def earns_badge(tier: str, p: float) -> bool:
+def earns_badge(tier: str, p: float, *, file_write: bool = False) -> bool:
     """Whether this answer reaches the tool card. The ONE place that is decided.
 
-    ``caution`` badges on its tier alone: it is the mild word -- "inside the
-    workspace, easy to put back" -- so a hesitant one costs a reader almost
-    nothing. ``risky`` must also clear :data:`RISKY_CONFIDENCE_THRESHOLD`, because
-    it is the alarming word and an alarm nobody believes is what costs every other
-    badge its meaning.
+    ``risky`` must clear :data:`RISKY_CONFIDENCE_THRESHOLD`: it is the alarming
+    word, and an alarm nobody believes is what costs every other badge its
+    meaning. ``caution`` must clear :data:`CAUTION_CONFIDENCE_THRESHOLD`, and is
+    never printed on a *file_write* (a call whose ACP kind is
+    :data:`FILE_WRITE_KIND`): it is the mild word -- "inside the workspace, easy to
+    put back" -- so the card only carries it when the provider is sure and the
+    call is not the ordinary workspace edit the word already describes.
 
-    The consequence is deliberate and is not an ordering slip: an unconvinced
-    ``risky`` draws NOTHING while a ``caution`` at the same confidence draws a
-    badge. The two words are not two points on one scale here. They name different
-    claims -- ``caution`` is about the workspace, ``risky`` is about data,
-    credentials and this machine's edge -- and only the second one is expensive to
-    be wrong about. Reading an unconvinced ``risky`` DOWN to ``caution`` was the
-    alternative and is not what this does: it would put "easy to put back" on a
-    call the provider was describing as a force-push, which is a claim nobody
-    made.
+    The bars are not two points on one scale. The words name different claims --
+    ``caution`` is about the workspace, ``risky`` is about data, credentials and
+    this machine's edge -- so each has its own bar, measured on its own rows.
+    Reading an unconvinced ``risky`` DOWN to ``caution`` is not what this does: it
+    would put "easy to put back" on a call the provider was describing as a
+    force-push, which is a claim nobody made. A ``risky`` file write still badges,
+    because a write outside the workspace is exactly what ``risky`` names.
     """
     if tier == TIER_RISKY:
         return p >= RISKY_CONFIDENCE_THRESHOLD
-    return tier in FLAGGED_TIERS
+    if tier == TIER_CAUTION:
+        return not file_write and p >= CAUTION_CONFIDENCE_THRESHOLD
+    return False
 
 
 def wait_budget() -> float:
@@ -311,6 +341,7 @@ async def risk_record(
     policy: str,
     session_key: str | None = None,
     calls_this_turn: int = 1,
+    tool_kind: str = "",
 ) -> dict[str, Any] | None:
     """The badge record for one tool call, or ``None`` to leave the card alone.
 
@@ -319,6 +350,10 @@ async def risk_record(
     failure, an unusable answer and a ``safe`` verdict all return it. A caller
     therefore writes ``record = await risk_record(...)`` and stamps it only when
     it is truthy.
+
+    *tool_kind* is the harness's ACP ``kind`` for the call; it is not sent to the
+    provider and only decides whether the call is a file write for
+    :func:`earns_badge`.
 
     *calls_this_turn* is this call's 1-based position in the turn. The caller
     already counts tool calls per turn, so the cap is enforced against the
@@ -370,6 +405,7 @@ async def risk_record(
             tier=tier,
             p=p,
             policy=bounded_policy,
+            file_write=tool_kind == FILE_WRITE_KIND,
         )
     except Exception:
         logger.debug("tool.risk: leaving the tool card unannotated", exc_info=True)
@@ -412,6 +448,7 @@ async def _record_outcome(
     tier: str,
     p: float,
     policy: str,
+    file_write: bool = False,
 ) -> dict[str, Any] | None:
     """Write the outcome row; return it only when the tier earns a badge.
 
@@ -441,7 +478,7 @@ async def _record_outcome(
     for. The bound on top is the shape ``gate._write`` already uses for the same
     write on the same loop.
     """
-    badge = earns_badge(tier, p)
+    badge = earns_badge(tier, p, file_write=file_write)
     row = _log.build_row(
         point=POINT,
         session_key=session_key,
