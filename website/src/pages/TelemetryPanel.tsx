@@ -292,6 +292,13 @@ type Col<R> = {
   color?: (r: R) => string | undefined
   /** Responsive drop class, applied to the header and its cells together. */
   hide?: string
+  /**
+   * Hover text on the column head, for a column whose VALUES cannot say where
+   * they came from. Two tabs of this page each carry a session-origin column
+   * derived a different way, and a bare noun in the head leaves a reader no way
+   * to tell which question a column answers.
+   */
+  tip?: string
 }
 
 /**
@@ -309,6 +316,7 @@ function HeadCell({
   active,
   desc,
   onToggle,
+  tip,
 }: {
   label: string
   left?: boolean
@@ -316,12 +324,17 @@ function HeadCell({
   active: boolean
   desc: boolean
   onToggle: () => void
+  tip?: string
 }) {
   return (
     <th
       className={`${HEAD_BASE} ${left ? 'text-left' : 'text-right'} ${hide ?? ''}`}
       aria-sort={active ? (desc ? 'descending' : 'ascending') : 'none'}
     >
+      {/* One line, whatever the column width: the tip is a 16px circle after a
+          short label, and letting it wrap put the glyph on a row of its own and
+          made every tipped header two lines tall. */}
+      <span className="inline-flex items-center gap-1 whitespace-nowrap align-middle">
       <Btn
         type="button"
         onClick={onToggle}
@@ -345,6 +358,12 @@ function HeadCell({
             <ChevronUp size={12} aria-hidden="true" className="lucide-inline" />
           ))}
       </Btn>
+      {/* Outside the Btn, never inside it: nesting the tip's own control in the
+          sort button would make one click both sort the table and open the tip,
+          and a button inside a button is invalid markup a screen reader cannot
+          announce as two actions. */}
+      {tip ? <InfoTip text={tip} placement="top" /> : null}
+      </span>
     </th>
   )
 }
@@ -446,6 +465,7 @@ function DataTable<R>({
                     active={c.key === activeKey}
                     desc={desc}
                     onToggle={() => toggle(c.key)}
+                    tip={c.tip}
                   />
                 ))}
               </tr>
@@ -810,6 +830,12 @@ function convoCols(navigable: string): Col<CostConvo>[] {
     {
       key: 'category',
       label: i18nT('pages.telemetryPanel.category_col'),
+      // Names which surface OWNS the session, from the session key. The Context
+      // tab's own origin column reads the token row's `surface` field instead,
+      // which answers a different question — which code path RAN one turn — so
+      // the same session can legitimately read `bg` here and `heartbeat` there.
+      // The tip is what carries that, because the values alone cannot.
+      tip: i18nT('pages.telemetryPanel.category_col_tip'),
       left: true,
       // Rendered verbatim: these are backend enum values (`dashboard`, `bg`,
       // `telegram`, `slack`), i.e. data, not copy to translate — the same
@@ -897,9 +923,19 @@ function categoryLabel(name: string): string {
   return name === 'bg' ? i18nT('pages.telemetryPanel.category_bg') : name
 }
 
-function shareCols(first: string, total: number): Col<CostRow>[] {
+function shareCols(first: string, total: number, firstTip?: string): Col<CostRow>[] {
   return [
-    { key: 'name', label: first, left: true, sort: r => r.name, render: r => categoryLabel(r.name) },
+    {
+      key: 'name',
+      label: first,
+      // The grouped view asks the same question of the same values as the
+      // session table's column, so it earns the same tip when that is the
+      // grouping in force; grouping by model leaves it unset.
+      tip: firstTip,
+      left: true,
+      sort: r => r.name,
+      render: r => categoryLabel(r.name),
+    },
     {
       key: 'credits',
       label: i18nT('pages.telemetryPanel.credits_col'),
@@ -989,6 +1025,7 @@ function SpendTab({ c }: { c: Cost }) {
               ? i18nT('pages.telemetryPanel.model_col')
               : i18nT('pages.telemetryPanel.category_col'),
             c.credits,
+            group === 'model' ? undefined : i18nT('pages.telemetryPanel.category_col_tip'),
           )}
           rowKey={r => r.name}
           defaultSort="credits"
@@ -1216,6 +1253,11 @@ function sessionCols(
     {
       key: 'surface',
       label: i18nT('pages.telemetryPanel.surface_col'),
+      // Read from the turn's own row, so it names the code path that RAN the
+      // turn. A monitor nudge or a webhook turn says so here while its credits
+      // stay booked to the conversation that owns the session, which is what
+      // the Spend tab's own origin column reports.
+      tip: i18nT('pages.telemetryPanel.surface_col_tip'),
       left: true,
       hide: 'max-[1100px]:hidden',
       sort: s => s.surface,

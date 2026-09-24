@@ -1152,6 +1152,27 @@ misattribute existing history. The stored slot/session key remains stable across
 the write-side correction and is still the compatibility boundary for this
 reader.
 
+**Two origin columns, deliberately, and they are labelled apart.** The page shows
+the session-origin dimension twice, derived two ways, because the two answer
+different questions. Spend's **Origin** column (`session_category`, from the slot
+key) answers WHICH SURFACE OWNS THE SESSION; the Context tab's **Turn surface**
+column (the row's own `surface` field) answers WHICH CODE PATH RAN ONE TURN. So
+the same unattended session reading `all background` on Spend and `heartbeat` on
+Context is correct, not a disagreement, and the two column headers each carry a
+tip naming their own derivation. The ruling that fixes this shape: **a trusted
+`surface` may NOT introduce Spend attribution values that do not exist today, and
+monitor spend stays booked to the conversation it nudged.** A monitor nudge exists
+only to serve one conversation, so moving its credits into a separate `monitor`
+bucket would make that conversation under-report what it actually cost — the one
+number the Spend tab exists to give. The consequence is that the two vocabularies
+are permanently different sets: `monitor` (`slack/gateway.py`) and `webhook`
+(`handlers/hooks.py`) are written as row surfaces and are NOT members of
+`TELEMETRY_CHANNELS`, and nothing in the read path compares one against the other.
+Unifying them is therefore a product decision that has been made and declined, not
+a cleanup: `test/metrics/test_telemetry_column_taxonomy.py` pins the two sets apart with
+those two values as the known non-members, so a later unification has to confront
+this ruling rather than discover it.
+
 **A conversation's `title` is attached by the endpoint, from two sources in
 order.** `cost_breakdown` names nothing — slot keys are all the row store holds.
 `handlers/telemetry._with_conversation_titles` resolves the live slot's
