@@ -134,6 +134,7 @@ transcript delivery; explicit cancel and unmount remain discard-only and do not 
 |---|---|---|
 | WS endpoint | `src/kiro_crew/dashboard/stt_stream.py` | One provider session per connection, plus the caps and the SEL audit pair |
 | Local recogniser | `src/kiro_crew/stt/engine.py` | One resident whisper.cpp context, serialised decodes, idle eviction |
+| Native preflight | `src/kiro_crew/stt/preflight.py` | Decides before the first native call whether this build can run on this CPU, and the load fuse that stops a crash loop |
 | Local session | `src/kiro_crew/stt/session.py` | Turns a PCM stream into partials and a final |
 | Endpointing VAD | `src/kiro_crew/stt/vad.py` | Adaptive-RMS speech detection and end-of-utterance |
 | Model catalog | `src/kiro_crew/stt/models.py` | The offered models, their sizes, and the sha256-pinned download |
@@ -219,8 +220,9 @@ After the three gates, each provider has its own precondition and failure frame:
   The model remains an explicit one-click download, and first dictation can join
   the same transfer. Source/PyPI installs can still add the `voice` extra without
   a gateway restart. What cannot be fixed by waiting arrives as an `error` frame
-  carrying `stt_extra_missing`, `stt_no_wheel_for_platform` or
-  `stt_import_failed`.
+  carrying `stt_extra_missing`, `stt_no_wheel_for_platform`, `stt_import_failed`,
+  or one of the preflight's `stt_unsupported_cpu`, `stt_load_crashed` and
+  `stt_native_probe_crashed` ([Native preflight and the load fuse](#native-preflight-and-the-load-fuse)).
 - **apple**: `apple_speech.availability()` decides, and separates "this macOS
   cannot run it" from "the Swift toolchain is missing", because only the second
   has a fix.
@@ -473,6 +475,65 @@ harm than good:
   load that timed out -- is a state the gateway is expected to run in, so its
   done-callback consumes the exception rather than re-raising the way the sweep's
   deliberately does.
+
+**"Cannot fail the gateway" has one exception the Python side cannot catch, and the
+preflight below exists for it.** `SIGILL` inside the native load is a process signal,
+not an exception: it ends the gateway from whichever thread it lands on. Before the
+preflight, a `pywhispercpp` build compiled with AVX-512 on a Broadwell Xeon that has
+none died on every boot's prewarm, the supervisor restarted it, and the loop ran every
+15-25 s until the operator changed `stt.provider` from outside the process
+(kirodotdev/KiroCrew#13179). The prewarm itself is unchanged; it asks `probe` like
+every other caller, and `probe` now refuses before anything is loaded.
+
+### Native preflight and the load fuse
+
+`src/kiro_crew/stt/preflight.py`, consulted by `stt.engine.probe` BEFORE the in-process
+`import pywhispercpp.model` (that import dlopens the extension and runs its static
+initialisers, which on an incompatible build can be the first thing that faults) and
+therefore by every surface that asks whether local recognition can run
+(the boot prewarm, a live session's `ensure_loaded`, `GET /api/stt/status`,
+`kirocrew doctor`). It imports neither numpy nor the binding.
+
+| Mechanism | What it checks | Refusal code |
+|---|---|---|
+| Subprocess probe | A child interpreter (`sys.executable -I -S -c <constant> <extension path>` -- `-S` because `-I` alone still imports `site`, which executes every `.pth` in the venv's site-packages inside a child that is unsandboxed on purpose, and the child loads by explicit path so it never needed `site`; cwd pinned to the interpreter prefix, environment reduced to a fixed allow-list, and the child zeroes its own `RLIMIT_CORE` before the load so its expected death writes no core file) loads the exact `_pywhispercpp` file the parent's `binary_identity()` resolved -- by path, because `-I` hides a user-site install from the child and the two processes must judge the same binary -- and runs its `whisper_print_system_info()`, the one call that both runs `ggml_cpu_init` (the first native code an incompatible build faults in) and reports the instruction sets the build was compiled for. A child killed by `SIGILL` (or Windows `STATUS_ILLEGAL_INSTRUCTION`) is a refusal; a surviving child's feature list is compared with the host's `/proc/cpuinfo` flags (Linux only; x86-64 through `embeddings._linux_x86_64_cpu_flags`, the one cpuinfo parser this repository keeps, AArch64 through the same intersect-across-cores read of the `Features` line; unknown elsewhere -- including 32-bit ARM, whose kernel spells `neon` where AArch64 spells `asimd` -- and an unknown host is never refused on) so a build that declares `AVX512` is refused on a host without `avx512f` even if the probe executed no such instruction. Cached per installed binary (path, size, mtime), so a reinstall is probed afresh and nothing is probed twice | `stt_unsupported_cpu`; any other fatal signal `stt_native_probe_crashed` |
+| Load marker | `_build_model_fused`, on the WORKER THREAD, writes `<models dir>/.load-in-progress.json` (via `atomic_write`, so no predictable temp name a sandboxed agent could pre-plant as a symlink; a per-process random token, the pid for a human, model path, binary identity) immediately before `_build_model` and clears it in a `finally` around it -- the marker is filesystem I/O and the loop neither writes nor clears it -- so every outcome in which the call RETURNED -- success, a Python exception, a load that outlived its timeout -- clears it, including a shutdown that has already closed the event loop (a loop done-callback would not run then, and a routine restart mid-prewarm would trip the fuse). Identity is the token, not the pid: the marker outlives the process on the models directory and a replacement container in a fresh PID namespace lands on the same low pid. A marker from another process naming the binary installed now means the last load never returned, and `probe` refuses. A marker naming a binary that is gone, or one that cannot be read, is ignored and LEFT IN PLACE: the inspector only reads, because the path is shared and an unlink here could erase another process's live fuse mid-load; the next arm's `atomic_write` replaces it whole. The read itself is bounded (`_read_marker_bounded`: `O_NOFOLLOW|O_NONBLOCK`, `fstat` must show a regular file of at most `_MARKER_MAX_BYTES` = 4 KiB, judged before a byte is read), because the name is fixed in a directory a sandboxed agent can write and the read runs on every availability check -- a planted symlink, FIFO or multi-GB file is ignored like garbage | `stt_load_crashed` |
+
+The subprocess probe answers a deterministic property of the (binary, CPU) pair and
+costs one interpreter start per binary. An import failure, a timeout, or a child that could not be started at all (interpreter gone, fork refused) is
+INCONCLUSIVE, not a refusal: the engine's own import step reports the loader's message,
+which is more use than anything the child could add, and a slow host is not a broken
+one. The feature-to-flag table is closed: a build feature the table does not name is
+reported but never refused on, because a wrong entry there would refuse a working host.
+
+The fuse is a fuse, not a retry policy. It trips once and stays tripped until the
+binary changes or the marker is removed by hand, and the refusal names the file. The
+alternative -- consuming the marker on the boot that reads it -- turns a crash loop into
+an alternating one. A gateway killed from outside mid-load (`SIGKILL`, power loss)
+trips it too; that is the false positive, and it is accepted because a load takes
+0.1-7 s and the message says exactly what to do.
+
+The fuse must arm or the load does not run. `write_load_marker` raises `OSError` when
+the models directory will not take the marker (read-only, full), and the raise happens
+BEFORE the native call, so `ensure_loaded` reports it as a failed load naming the path
+and the gateway stays up with speech unavailable. The alternative -- a best-effort
+marker that lets the load proceed unguarded -- would mean a load that kills the
+process leaves nothing behind and the next boot repeats it, which is exactly the loop
+the fuse exists to break; a directory that cannot take a small file cannot take the
+model download either, so the cost falls only on a host that already could not use
+speech.
+
+`WhisperEngine.capabilities()` is gated on the same verdict, because reading the build
+is itself a native call. On a refused host the status endpoint's acceleration block
+comes from the child's copy of the feature string, or reads `unknown`.
+
+**Deliberately not a worker process.** Running the recogniser in its own process would
+also survive a fault mid-decode, but it means shipping PCM frames, partial results and
+abort signals over IPC for every utterance and holding the model's memory in a second
+process. The fault this exists for is deterministic per (binary, CPU) pair and
+therefore answerable before the first load; the redesign is out of proportion to it.
+The three codes join the engine's availability vocabulary (`stt.engine` re-exports
+them) and the browser's `UNAVAILABLE_CODE_KEY` has a sentence for each.
 
 It also passes `stt.idle_evict_secs` and `stt.timeout_secs` when it first reaches
 `shared_engine`, because that function is a process singleton whose bounds are set by

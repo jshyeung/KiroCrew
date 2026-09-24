@@ -4113,12 +4113,15 @@ async def _stt_startup_prewarm() -> None:
         # a real session) report it against a user who is actually asking.
         logger.debug("Boot prewarm of the speech model did not complete: %s", result.detail)
         return
+    # Off the loop: `capabilities` reads the build (a native call) behind its
+    # preflight gate, which can spawn the probe child if the wheel changed.
+    backend = (await asyncio.to_thread(engine.WhisperEngine.capabilities)).backend
     logger.info(
         "Speech model %s warmed in the background %.1fs after boot (backend=%s); "
         "the first dictation skips the cold start",
         model.name,
         time.monotonic() - started,
-        engine.WhisperEngine.capabilities().backend,
+        backend,
     )
 
 

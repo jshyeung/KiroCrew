@@ -383,6 +383,25 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # it executes nothing else (the shim dlopens the already-loaded libc
         # rather than letting ctypes.util.find_library exec ldconfig/gcc).
         "sandbox.py::_probe_unshare_via_spawn",
+        # The speech-runtime preflight child: `sys.executable -I -S -c <module-level
+        # string constant> <extension path>`, no shell, a bounded timeout, cwd
+        # pinned to the interpreter prefix, `-I` keeping the working directory
+        # off `sys.path` so nothing the gateway was started from can shadow the
+        # import, `-S` keeping `site` -- and with it every `.pth` in the venv's
+        # site-packages -- from running at all in a child that is unsandboxed on
+        # purpose, and an environment reduced to a fixed allow-list (no credentials,
+        # no `PYTHON*`, no `KIROCREW_*`). The one argument is the path of the
+        # installed `_pywhispercpp` extension as the interpreter's OWN finder
+        # resolved it (`binary_identity()`, i.e. `importlib.util.find_spec`), never
+        # anything an agent supplied; it is passed so the `-I` child, which cannot
+        # see a user-site install by name, loads the same file the parent would.
+        # The child prints the build's compile-time feature string. It is a
+        # subprocess for exactly one reason: that load can SIGILL on a CPU the build
+        # was not compiled for, which kills the process it runs in, so it must not
+        # be this one (kirodotdev/KiroCrew#13179); the child zeroes its own
+        # RLIMIT_CORE first so that death writes no core file. The interpreter is
+        # the one running the gateway, like the userns probe above.
+        "stt/preflight.py::_run_probe_child",
         # _get_rss_tree_mb is deliberately NOT listed: its own spawn moved into
         # _ps_process_table below, so an entry for it would be stale and would
         # mask a future regression that put a spawn back inline.

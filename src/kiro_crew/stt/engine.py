@@ -58,7 +58,7 @@ from kiro_crew import extras
 from kiro_crew.cpu_affinity import affinity_cpu_count
 from kiro_crew.executors import stt_executor
 from kiro_crew.stt import capabilities as caps_mod
-from kiro_crew.stt import models, telemetry
+from kiro_crew.stt import models, preflight, telemetry
 from kiro_crew.stt.limits import (
     DECODE_ABORT_GRACE_SECS,
     DEFAULT_IDLE_EVICT_SECS,
@@ -151,6 +151,13 @@ CODE_MODEL_MISSING = "stt_model_missing"
 #: answered ``""``, the session read that as silence, the transport dropped the empty
 #: final, and the user's dictation disappeared with nothing on screen to say why.
 CODE_DECODE_FAILED = "stt_decode_failed"
+#: Three more come from :mod:`kiro_crew.stt.preflight`, which decides BEFORE the
+#: native library is touched whether touching it would take the process down.
+#: Re-exported here because a code is a code wherever it was minted: the browser
+#: keys its message off the string, not off the module that produced it.
+CODE_UNSUPPORTED_CPU = preflight.CODE_UNSUPPORTED_CPU
+CODE_LOAD_CRASHED = preflight.CODE_LOAD_CRASHED
+CODE_NATIVE_PROBE_CRASHED = preflight.CODE_NATIVE_PROBE_CRASHED
 
 
 class DecodeFailed(RuntimeError):
@@ -332,6 +339,26 @@ def probe() -> Availability:
             CODE_EXTRA_MISSING,
             f"speech recognition needs its voice dependencies: {extras.install_hint('voice')}",
         )
+    # BEFORE the in-process import, because that import IS a native call: it
+    # dlopens the extension and runs its static initialisers, and on a build
+    # compiled for a CPU this is not, the first instruction the CPU rejects can
+    # sit in those initialisers as easily as in `ggml_cpu_init` or the model load.
+    # A SIGILL there ends the PROCESS, not the call. So both questions the import
+    # cannot survive are answered without touching the library in this process:
+    # a child interpreter runs the build's own feature report (cached per binary,
+    # and it is the child that performs the import), and a marker left by a
+    # previous load that never returned refuses a second attempt with the same
+    # build. Both answers are `Availability` values like every other, so the boot
+    # prewarm, a live session, the status endpoint and `doctor` all say the same
+    # thing and none of them loads anything first. A child that could not import
+    # at all is an INCONCLUSIVE verdict, and the in-process import below then
+    # reports the loader's own message, which is the more useful one.
+    checked = preflight.verdict()
+    if not checked.ok:
+        return Availability(False, checked.code, checked.detail)
+    fused = preflight.previous_load_crashed(models.models_dir())
+    if not fused.ok:
+        return Availability(False, fused.code, fused.detail)
     try:
         import pywhispercpp.model  # noqa: F401
     except Exception as exc:  # pragma: no cover (host-specific loader failures)
@@ -514,11 +541,27 @@ class WhisperEngine:
                     # rather than two.
                     self._unload_locked()
                 loop = asyncio.get_running_loop()
+                # The fuse is armed and disarmed inside `_build_model_fused`, on the
+                # WORKER THREAD: written immediately before the native call and cleared
+                # in a `finally` around it, so it is cleared on success, on a Python
+                # exception and on a load that outlived its caller's timeout -- every
+                # outcome in which the call RETURNED. Not from here or from the future's
+                # done-callback: both run on the event loop, the marker is filesystem
+                # I/O the loop must not wait on, and a shutdown that cancels the boot
+                # prewarm mid-load closes the loop before the executor future can chain
+                # back into it, which would leave the marker behind after a routine
+                # restart and trip the fuse on a gateway that never crashed. The one
+                # outcome that leaves it behind is the process dying inside the call,
+                # which is the one this exists to remember: the next process finds it in
+                # `probe` and refuses to load the same build.
+                marker_dir = models.models_dir()
                 # `asyncio.wait` on a kept reference, not `wait_for`: a load has no abort
                 # hook, so a timeout cannot stop the native allocation. `wait_for` would
                 # cancel the wrapper and let this lock go while a 1.6 GB context was still
                 # being built, and the caller's retry would start a SECOND one.
-                future = loop.run_in_executor(stt_executor(), self._build_model, key)
+                future = loop.run_in_executor(
+                    stt_executor(), self._build_model_fused, key, marker_dir
+                )
                 self._load_future = future
                 load_started = time.monotonic()
                 done, _pending = await asyncio.wait({future}, timeout=self._timeout_secs)
@@ -572,13 +615,16 @@ class WhisperEngine:
                 # report that voice input is slow. Read from the build rather than
                 # requested: `whisper_context_default_params()` asks for `use_gpu`
                 # and gets it granted on a CPU-only wheel, so the request is not
-                # evidence. See `kiro_crew.stt.capabilities`.
+                # evidence. See `kiro_crew.stt.capabilities`. Off the loop: reading
+                # the build is a native call, and its preflight gate can spawn the
+                # probe child if the wheel was replaced since `probe` ran.
+                backend = (await asyncio.to_thread(self.capabilities)).backend
                 logger.info(
                     "Whisper model loaded: %s (language=%s, threads=%d, backend=%s)",
                     model.name,
                     language or "auto",
                     key.n_threads,
-                    self.capabilities().backend,
+                    backend,
                 )
         return Availability(True)
 
@@ -614,6 +660,24 @@ class WhisperEngine:
             suppress_nst=True,
         )
 
+    @classmethod
+    def _build_model_fused(cls, key: LoadedKey, marker_dir: Any) -> Any:
+        """:meth:`_build_model` with the load marker written and cleared on this thread.
+
+        A ``classmethod`` calling through ``cls`` so a test that substitutes
+        ``_build_model`` on the class substitutes what runs here too. The write is
+        the fuse's arm and the ``finally`` its disarm: the disarm runs for a return
+        and for a raise, and is skipped only when the process itself is gone. The
+        arm sits OUTSIDE the ``try`` on purpose: a marker that cannot be written
+        raises before the native call, so the load never runs unguarded and
+        ``ensure_loaded`` reports the reason like any other failed load.
+        """
+        preflight.write_load_marker(marker_dir, key.model_path)
+        try:
+            return cls._build_model(key)
+        finally:
+            preflight.clear_load_marker(marker_dir)
+
     @staticmethod
     def capabilities() -> caps_mod.Capabilities:
         """What the native build links, read from the build on every call.
@@ -623,7 +687,16 @@ class WhisperEngine:
         Uncached for the reason :func:`kiro_crew.stt.capabilities.detect` gives --
         a reinstall can replace the wheel under a running gateway, and that is the
         moment a stale answer misleads most.
+
+        Gated on the preflight verdict first, because reading the build IS a native
+        call: ``whisper_print_system_info`` runs ``ggml_cpu_init``, the first code an
+        incompatible build faults in. On a refused host the answer comes from the
+        child probe's copy of the same string, or is simply "unknown"; the process
+        never asks the library itself.
         """
+        checked = preflight.verdict()
+        if not checked.ok:
+            return caps_mod.Capabilities(raw=checked.raw, detail=checked.detail)
         return caps_mod.detect()
 
     @property
