@@ -278,6 +278,63 @@ timeout before the structured completion hook is accepted returns
 `UNAVAILABLE`; a timeout after acceptance remains `DISPATCHED`, and the durable
 completion-evidence deadline owns recovery for the correlated turn.
 
+### The empty-turn verdict
+
+`run()` returns `""` for four unlike endings: the backend closed the turn with a
+terminal and streamed no text (a reasoning-only generation, a model that
+returned an empty completion), the turn ran a tool and stopped without a closing
+reply, an `error:`-family terminal the ACP layer synthesised, and a user cancel —
+plus a stream that ended with no terminal at all. A renderer that keys only on
+"is the body empty" cannot tell a reply that was never produced from a turn
+whose text sealed in an earlier segment, and a dispatcher that files the user's
+row and skips the assistant row leaves a transcript that ends on an unanswered
+question with nothing to say why. That is how a turn that closed with nothing
+rendered as the live `…` placeholder under a `Finished in …` footer and left no
+trace.
+
+So the driver, the one layer that sees the whole stream, states the verdict ONCE
+(`messaging.driver.empty_turn_notice`) and both consumers read it: the renderer
+receives it on the `DONE` event (`OutputEvent.notice`, exposed as
+`Renderer.empty_turn_notice`) and posts it where its bare placeholder would
+otherwise go, and the dispatcher reads `TurnDriver.empty_turn_notice` after
+`run()` returns and persists the same sentence as a `notice` row
+(`msg msg-info`, the dashboard runner's own class) behind the user's row —
+mirrored into an open dashboard window first, through
+`channel_slots.project_channel_row_live`, under the same row id the disk write
+then uses. The two cannot disagree because neither derives its own. The verdict
+is taken after the redactor flush, so it reads the same final text the renderer
+was handed. The dispatcher normalizes the reply ONCE — whitespace alone (the
+steer-boundary `"\n"`) is `""` — and hands that one value to the live projection
+and the durable write, so neither files an assistant row the other skipped.
+
+| Turn ending, no text | Verdict |
+|---|---|
+| terminal `end_turn` (or absent), no tool, no reasoning | `EMPTY_TURN_NOTICE` — "returned nothing this turn… send your message again" |
+| terminal `end_turn`, after a tool call or reasoning | `EMPTY_TURN_NOTICE_AFTER_WORK` — "ended without a closing reply… completed steps will not re-run" |
+| `refusal` | `EMPTY_TURN_NOTICE_REFUSAL` — the model declined; rephrase (deterministic, so not "resend") |
+| `error:*` | `EMPTY_TURN_NOTICE_ERROR` with a label from the closed map `_ERROR_STOP_LABELS` (`tool stall`, `compaction failed`); any other `error:` value — the family is open on the wire and a backend authors it — takes the generic `backend error`, so no wire string is ever interpolated into user-facing copy |
+| stream ended without a terminal | `EMPTY_TURN_NOTICE_UNCLOSED` — recorded by the dispatcher; no `DONE` reached the renderer, whose `close` posts its own error placeholder |
+| `cancelled` | `""` — the cancel is the answer; a notice would contradict it |
+| any text at all | `""` |
+
+The wording is the dashboard runner's own empty-response copy, so a channel
+thread mirrored into the dashboard reads one story, and every sentence tells the
+user what to DO: the prompt has landed in the conversation, so the remedy is to
+send a message, never to wait. The health counter is untouched — the turn
+completed and its prompt is in the conversation, so `record_success` stands; the
+notice is the outcome, not a fault. The notice is also the turn's ENTIRE
+delivery, so it is accounted like one: the renderer counts the placeholder seal
+in `delivery_failed`, and the dispatcher's undelivered predicate admits a turn
+with a notice as it admits one with text — a notice Discord never took is
+`record_failure`, not a success with an empty body. The `notice` row itself does
+not close the turn for `is_turn_interrupted` (the shared dashboard predicate
+skips every row that is not user, assistant or error), exactly as the dashboard
+runner's own empty-turn card does not: Resume stays offered there, and Resume IS
+the recovery the sentence names; what the record adds is the reason. Only
+Discord adopts the verdict today; the shared `drive_turn` pipeline and the
+Telegram renderer still show the bare `…` and persist the user row alone, and
+adopting it there is the same two reads.
+
 ### Approval ladder
 
 Four modes (constants, mirroring the native Slack + dashboard ladder):
@@ -398,7 +455,7 @@ the operator-log-vs-agent-error security split are documented in
 
 ### `OutputEvent`
 
-Channel-neutral output event with a `kind` plus per-kind payload fields (`text`, `tool_call_id`, `title`, `tool_kind`, `tool_name`, `tool_purpose`, `options`, `request_id`, `context_usage_pct`, `stop_reason`); `to_dict()` serializes them. `title` is DISPLAY copy — what a person should read for the call (the backend's own description when it sent one, else the client-derived `List files in src` / `Git status` from `kiro_crew.tool_call_title`, else the raw command) — and is never a tool's identity; `tool_name` is the trusted programmatic identity from `_meta.kiro` (empty when the backend sent none) and is what any behaviour keyed on *which tool ran* reads. `Renderer.dispatch` exposes the current call's identity as `current_tool_name` before `on_tool_call` fires, and the Slack wait-stream rollover keys on it through `slack/format.is_wait_identity` (`wait`, `kirocrew-core___wait`, `mcp__kirocrew-core__wait`; not `wait_for_ci`) with the title equality kept only as the fallback for a transport that sends no identity. Kinds: `TEXT_CHUNK`, `THINKING`, `TOOL_CALL`, `PROMPT_CHOICE`, `COMPACTION`, `DONE` — the full set is `OUTPUT_KINDS` (a `frozenset`). `prompt_choice` is a **first-class** event, not generic "permission text": each renderer maps it to its native interactive widget.
+Channel-neutral output event with a `kind` plus per-kind payload fields (`text`, `tool_call_id`, `title`, `tool_kind`, `tool_name`, `tool_purpose`, `options`, `request_id`, `context_usage_pct`, `stop_reason`, `notice`); `to_dict()` serializes them. `title` is DISPLAY copy — what a person should read for the call (the backend's own description when it sent one, else the client-derived `List files in src` / `Git status` from `kiro_crew.tool_call_title`, else the raw command) — and is never a tool's identity; `tool_name` is the trusted programmatic identity from `_meta.kiro` (empty when the backend sent none) and is what any behaviour keyed on *which tool ran* reads. `Renderer.dispatch` exposes the current call's identity as `current_tool_name` before `on_tool_call` fires, and the Slack wait-stream rollover keys on it through `slack/format.is_wait_identity` (`wait`, `kirocrew-core___wait`, `mcp__kirocrew-core__wait`; not `wait_for_ci`) with the title equality kept only as the fallback for a transport that sends no identity. `notice` rides `DONE` alone: it is the driver's **empty-turn verdict** (see "The empty-turn verdict" under Layer 2), the sentence a renderer posts where its bare placeholder would otherwise go when the turn closed with no assistant text, and `""` for a turn that produced text or was cancelled. `Renderer.dispatch` exposes it as `empty_turn_notice` before `on_done` fires, the same way it exposes `current_tool_name`. Kinds: `TEXT_CHUNK`, `THINKING`, `TOOL_CALL`, `PROMPT_CHOICE`, `COMPACTION`, `DONE` — the full set is `OUTPUT_KINDS` (a `frozenset`). `prompt_choice` is a **first-class** event, not generic "permission text": each renderer maps it to its native interactive widget.
 
 ### `Renderer` ABC
 
@@ -2208,6 +2265,7 @@ answer is not permission: a raised evaluation and a `Decision` without
 - **An SSRF vet checks the RESOLVED address, not only the name**: a name blocklist cannot see that a public name an attacker controls points at `127.0.0.1` or `169.254.169.254`, and a wildcard-DNS host needs no zone control at all. Resolution goes through one seam, refuses if ANY answer is private/loopback/link-local/reserved, refuses on failure, and runs on every redirect hop. **And the addresses it approved are the addresses that get dialed**: the vet returns EVERY address it checked and the caller opens its session on the connector `link_unfurl.pinned_connector` builds, so the client performs no second lookup for a rebinding answer to land in. **All of them, not just the first** — a client dials a resolver's answers in turn, so a one-address pin turns a dead CDN node, or an AAAA record on a host with no IPv6 route, into a failed fetch that worked before the pin existed; every entry passed the same check, so the whole set is as safe as its first element. The pin lives in `link_unfurl.py` beside the vet whose result it serves, because every caller of the vet needs it, and `limit=1` and `family=AF_UNSPEC` live in the factory because a caller that keeps the resolver and drops the family re-opens the window. Its consumers are the link-preview handler and `wecom/media.py`. `teams/client.py` and the meetings calendar provider pin through their own resolvers, deliberately: one keeps a bounded MULTI-HOST map for a long-lived connector that re-vets each redirect hop, the other is reached per calendar host, and a factory built for one URL and one session serves neither. The residual gap is now one case and is stated rather than implied away: **a fetch through a configured operator proxy**, where aiohttp hands the proxy the hostname and resolves nothing locally, so there is no lookup for a pin to answer and the proxy's own resolution is the one that reaches a socket.
 - **A routing reference is durable, and losing it never blocks delivery**: the Bot Framework exposes no lookup for a conversation's `serviceUrl`, so `teams/service_urls.py` persists it. Loading is lazy and off-loop (never the boot path), every read failure degrades to the in-memory map, a non-`https` row does not survive a reload, and an identity row whose conversation did not survive is dropped rather than advertising a target with no route to it.
 - **A turn that produced text but landed none of it is a FAILURE**: `DiscordRenderer.delivery_failed` is "seals were attempted AND none landed", and the dispatcher records `record_failure` rather than `record_success` when the turn accumulated text and that observable is true. A revoked token or a dropped network fails every send while the turn still returns its text, so filing it as a success hides the outage behind a healthy success rate and leaves the transcript claiming a reply the channel never carried. Deliberately not "any send failed": one failed length rotation whose retry succeeded still reached the user. A muted conversation runs a `SilentRenderer`, which attempts no send and so never reports one.
+- **A turn that ends with no text never reads as a finished reply**: either the text is delivered, or an explicit notice is posted AND recorded. The driver states the verdict once (`empty_turn_notice`, see Layer 2) and the renderer and the dispatcher both read it, so the bubble and the transcript cannot tell two stories; a notice Discord never took is an undelivered turn (`record_failure`); a raised turn records its error from the `except` branch. A bare placeholder under a "Finished in" footer, or a transcript that ends on the user's row with nothing to say why, is the incident this rule exists for.
 - **A cron run notifies ONE surface**: a job belongs to the conversation that scheduled it, so when the job pins no `channel` and `_deliver_cron_to_channel` reports a DELIVERED send to the origin channel, the Slack owner-DM leg stands down. A pinned `job.channel` keeps its Slack delivery, and a Slack-origin, dashboard-origin or origin-less job keeps Slack too, which is every job an install carries today. The stand-down is gated on that send's own return value, never on a predicate answering whether it would have worked, so a governance refusal or a wire failure falls through to Slack instead of dropping the run.
 - **Transport shutdown is quiescent**: a client that fast-acks inbound work in background tasks cancels and awaits those tasks before closing their shared network session or returning from shutdown. Teams owns this ordering in `TeamsClient.close()`, and `DiscordClient.close()` cancels and gathers `_handler_tasks` before closing its `ClientSession`, so a gateway teardown cannot leave a turn unwinding against an already-closed session, which surfaces to the user as a reply that silently stops mid-stream rather than as a shutdown.
 - **An inbound file fetch is host-bound and refuses redirects**: a download whose URL comes from the platform's own event envelope is not a URL we chose, so it is validated before any credential is attached to a request for it: HTTPS, a host inside the platform's domain, the default port, `allow_redirects=False` with an explicit 3xx refusal, a bounded timeout, and off-loop writes. Redirects matter specifically because aiohttp REPLAYS an explicitly set `Authorization` header across one, so following a redirect would bounce the credential to an arbitrary host and the host check would have been true only of the hop that did not carry the bytes. Slack's `download_file` is the case where this is load-bearing (it sends the bot token); `discord/client.py::download_attachment` guards its credential-free CDN fetch the same way.
@@ -2389,9 +2447,38 @@ read at turn END from the session provider the dispatcher hands over
 (`bind_context_source`), so the chip reports the window as the user leaves it, and
 an unbound or failing provider renders no chip rather than a reassuring green one.
 It rides the last segment instead of its own message (one turn, one bubble, and
-Discord charges rate budget per message), lands on the placeholder when a turn
-produced no text, and is dropped rather than truncated when the segment leaves no
-room: a clipped answer costs the user more than a missing timing line.
+Discord charges rate budget per message), and is dropped rather than truncated
+when the segment leaves no room: a clipped answer costs the user more than a
+missing timing line. When the turn closed with no text, the footer rides the
+**placeholder** that stands in for the reply — and that placeholder is the
+driver's empty-turn verdict (`Renderer.empty_turn_notice`, see Layer 2) whenever
+the driver judged the close, so a turn that produced nothing reads as a sentence
+about what happened, never as the same `…` the live frame showed while it was
+running under a "Finished in" footer. The bare `…` survives only for a close the
+driver did not judge (a cancel), and a close after an exception (the dispatcher's
+`finally` reaching `close()` with the turn unfinished) keeps the explicit
+`⚠️ Error — please try again`. The mid-turn steer chip — the `> quoted` line of
+the USER's own words that heads the segment when no rotation happened — is kept
+apart from that body test: a turn whose only content is the chip produced no
+reply and takes the placeholder path with the chip riding on it, rather than
+closing on the chip alone under a finished footer. On that path the chip is
+bounded to the room `_limit()` leaves beside the placeholder (cut with an
+ellipsis, dropped only when no room remains): the placeholder path skips the
+length rotation and the client cuts one payload at the platform cap, so an
+unbounded chip — each steer is capped by `_neutralize_md`, a burst of them is
+not — would push the very sentence this path exists to deliver, and the footer,
+past the cut.
+
+The dispatcher's record is the other half of that contract. A completed turn
+with no text persists the driver's notice as a `notice` row behind the user's
+row (the reply is normalized once for the live projection and the disk, so a
+whitespace-only reply files no assistant row in either). A turn that RAISED before
+the post-turn persist — a backend error, a driver fault — is recorded from the
+`except` branch: the user's row and an `error` row (`msg msg-err`, the dashboard
+runner's terminal-error class) carrying the redacted, path-scrubbed exception
+text under the same 1,000-character cap the memory-store refusal takes, mirrored
+into a live dashboard window first under shared row ids like every other write.
+Skipped for a restricted (incognito/temporary) session, like the success path.
 
 Two `discord` config toggles shape what else is rendered. Both are re-read from
 the live config per turn (`_render_config`), not taken from the boot-time

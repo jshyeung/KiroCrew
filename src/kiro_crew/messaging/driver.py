@@ -33,6 +33,11 @@ from kiro_crew.acp.types import (
     EVENT_THINKING_CHUNK,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
+    STOP_CLASS_CANCELLED,
+    STOP_REASON_COMPACTION_FAILED,
+    STOP_REASON_REFUSAL,
+    STOP_REASON_TOOL_STALL,
+    classify_stop_reason,
 )
 from kiro_crew.constants import _STEERING_TAIL_PREFIX_RE
 from kiro_crew.messaging.renderer import (
@@ -83,6 +88,102 @@ AutoApprovePredicate = Callable[[Any], bool]
 #: session key (keeping the driver channel-neutral), typically
 #: ``messaging.dispatch.build_directive_consumer``.
 DirectiveConsumer = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+# ── Empty-turn verdict ─────────────────────────────────────────────────────
+#
+# A turn can close with no assistant text at all: the backend answers the
+# prompt with a bare terminal (a reasoning-only generation, a model that
+# returned an empty completion), runs a tool and stops without a closing
+# reply, or ends on an ``error:``-family terminal the ACP layer synthesised.
+# ``run()`` then returns ``""`` exactly as it does for a cancelled turn, and
+# a renderer that keys only on "is the body empty" cannot tell a reply that
+# was never produced from a turn that carried its text in an earlier segment.
+# So the driver, which sees the whole stream, states the verdict ONCE and both
+# consumers read it: the renderer receives it on the ``DONE`` event
+# (``OutputEvent.notice``) and posts it in place of its bare placeholder, and
+# the dispatcher reads ``TurnDriver.empty_turn_notice`` to persist the
+# same sentence as a ``notice`` row. The two cannot disagree because neither
+# derives its own.
+#
+# The wording is the dashboard's own empty-response copy (``chat_runner``), so
+# a user who sees a channel thread mirrored into the dashboard reads one story.
+# Each sentence tells the user what to DO: the prompt has landed in the
+# conversation, so the remedy is to send a message, never to wait.
+
+#: A closed turn that produced nothing at all -- no text, no tool, no reasoning.
+EMPTY_TURN_NOTICE = "ℹ️ The model returned nothing this turn. Send your message again to continue."
+#: A closed turn that did work (ran a tool, reasoned) but ended without a
+#: closing reply. "Returned nothing" would be false, and would invite a redo of
+#: work whose side effects already landed.
+EMPTY_TURN_NOTICE_AFTER_WORK = (
+    "ℹ️ The turn ended without a closing reply. Send a message to continue from "
+    "where it stopped — completed steps will not re-run."
+)
+#: A textless turn the model DECLINED (``STOP_REASON_REFUSAL``). Deterministic:
+#: the same prompt refuses again, so the remedy is to rephrase, not to resend.
+EMPTY_TURN_NOTICE_REFUSAL = (
+    "⚠️ The model declined this request and returned no reply. Rephrase it to continue."
+)
+#: A textless turn closed by an ``error:``-family terminal. ``{reason}`` is a
+#: label from :data:`_ERROR_STOP_LABELS` -- fixed copy for a closed protocol
+#: value, never the wire string, which a backend authors and which would
+#: otherwise reach the channel and the transcript unredacted.
+EMPTY_TURN_NOTICE_ERROR = (
+    "⚠️ The turn ended with an error before it produced a reply ({reason}). "
+    "Send your message again to continue."
+)
+#: The provider stream ended without a terminal completion event, so nothing
+#: closed the turn; the ACP layer logs that separately, and the user is owed a
+#: sentence too.
+EMPTY_TURN_NOTICE_UNCLOSED = (
+    "⚠️ The turn ended without a reply. Send your message again to continue."
+)
+
+_ERROR_STOP_PREFIX = "error:"
+#: The ``error:``-family terminals the ACP layer itself synthesises, each with
+#: the words the notice uses for it. Any other ``error:`` reason -- the family
+#: is open on the wire -- takes the generic label, so no backend prose is ever
+#: interpolated into user-facing copy.
+_ERROR_STOP_LABELS: dict[str, str] = {
+    STOP_REASON_TOOL_STALL: "tool stall",
+    STOP_REASON_COMPACTION_FAILED: "compaction failed",
+}
+_ERROR_STOP_GENERIC_LABEL = "backend error"
+
+
+def empty_turn_notice(
+    accumulated: str,
+    *,
+    completed: bool,
+    stop_reason: str,
+    productive: bool,
+) -> str:
+    """The sentence a turn that produced no assistant text owes the user, or ``""``.
+
+    ``""`` means the turn is NOT an empty reply: it produced text (a whitespace-
+    only accumulation counts as none -- the steer-boundary separator is a
+    ``"\\n"``), or the user cancelled it, in which case the cancel is the answer
+    and a notice would contradict it. Every other textless close gets one, chosen
+    by the terminal's class: refusal, the ``error:`` family (named through
+    :data:`_ERROR_STOP_LABELS`, generic for a value the map does not know), a
+    stream that never closed, and the plain end-of-turn split by whether the
+    turn did work first (see :data:`EMPTY_TURN_NOTICE_AFTER_WORK`).
+    """
+    if accumulated.strip():
+        return ""
+    if not completed:
+        return EMPTY_TURN_NOTICE_UNCLOSED
+    reason = stop_reason or ""
+    if classify_stop_reason(reason).name == STOP_CLASS_CANCELLED:
+        return ""
+    if reason == STOP_REASON_REFUSAL:
+        return EMPTY_TURN_NOTICE_REFUSAL
+    if reason.startswith(_ERROR_STOP_PREFIX):
+        return EMPTY_TURN_NOTICE_ERROR.format(
+            reason=_ERROR_STOP_LABELS.get(reason, _ERROR_STOP_GENERIC_LABEL)
+        )
+    return EMPTY_TURN_NOTICE_AFTER_WORK if productive else EMPTY_TURN_NOTICE
+
 
 # kiro-cli embeds this protocol frame in ordinary agent_message_chunk text when
 # it folds a mid-turn steer. It is transport metadata, not assistant speech.
@@ -406,6 +507,12 @@ class TurnDriver:
         # re-injection bookkeeping (no completion: the prompt never landed; an
         # empty reason: a normal end of turn), so the presence is kept apart.
         self.completion_observed: bool = False
+        # The empty-turn verdict of the last run() (see :func:`empty_turn_notice`):
+        # the sentence the dispatcher persists as a ``notice`` row when the turn
+        # closed with no assistant text, ``""`` when it produced text or the
+        # user cancelled. The same sentence rides the DONE event to the renderer,
+        # so the bubble and the transcript can never tell two stories.
+        self.empty_turn_notice: str = ""
         # Synchronous pre-registration shutdown gate, supplied by the dispatcher
         # as a zero-arg closure over its SessionManager and session key. It lives
         # HERE rather than at each call site because the only placement that is
@@ -418,6 +525,11 @@ class TurnDriver:
     async def run(self, message: str) -> str:
         """Drive one turn; return the accumulated channel-safe assistant text."""
         accumulated = ""
+        self.empty_turn_notice = ""
+        # Whether this turn did work a reply could be missing FROM: a tool call
+        # or a reasoning chunk. Decides between the two end-of-turn notices; a
+        # replayed message would re-run what these already did.
+        productive = False
         # Protocol framing runs BEFORE credential redaction. A steering marker
         # may split at any byte boundary; parsing it first ensures neither its
         # UUID nor its internal summary is ever committed to a renderer. The
@@ -516,6 +628,7 @@ class TurnDriver:
                 if filtered:
                     await dispatch_frames(steering_filter.feed(filtered))
             elif kind == EVENT_THINKING_CHUNK:
+                productive = True
                 await self.renderer.dispatch(OutputEvent(kind=THINKING, text=_redact(event.text)))
             elif kind == EVENT_STEER_CONSUMED:
                 # kiro-cli emits both a typed lifecycle event and an inline
@@ -527,6 +640,7 @@ class TurnDriver:
                 else:
                     pending_steer_events += 1
             elif kind == EVENT_TOOL_CALL:
+                productive = True
                 # Native handle_message treats every EVENT_TOOL_CALL uniformly
                 # (complete previous task + start new), regardless of tool_final;
                 # emit a single tool_call event so the renderer matches it.
@@ -809,7 +923,26 @@ class TurnDriver:
                 for _ in range(pending_steer_events):
                     await self.renderer.dispatch(OutputEvent(kind=STEER_CONSUMED))
                 pending_steer_events = 0
-                await self.renderer.dispatch(OutputEvent(kind=DONE, stop_reason=event.stop_reason))
+                # After the flushes: ``accumulated`` is final only now, and the
+                # verdict must read the same text the renderer was handed.
+                self.empty_turn_notice = empty_turn_notice(
+                    accumulated,
+                    completed=True,
+                    stop_reason=event.stop_reason or "",
+                    productive=productive,
+                )
+                await self.renderer.dispatch(
+                    OutputEvent(
+                        kind=DONE, stop_reason=event.stop_reason, notice=self.empty_turn_notice
+                    )
+                )
+        if not self.completion_observed:
+            # The stream ended without a terminal, so no DONE was dispatched and the
+            # renderer will be closed by the dispatcher's ``finally``; the verdict
+            # is still owed to the transcript.
+            self.empty_turn_notice = empty_turn_notice(
+                accumulated, completed=False, stop_reason="", productive=productive
+            )
         return accumulated
 
     async def _consume_directive(
