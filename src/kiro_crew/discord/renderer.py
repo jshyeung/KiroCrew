@@ -64,7 +64,11 @@ from kiro_crew.discord.client import (
     DISCORD_MAX_TOTAL_UPLOAD_BYTES,
 )
 from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
-from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.display_safety import (
+    redact_for_display,
+    safe_split_offset,
+    sealable_piece_count,
+)
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
     OutboundFile,
@@ -75,6 +79,7 @@ from kiro_crew.messaging.outbound_files import (
 )
 from kiro_crew.messaging.renderer import (
     Renderer,
+    _default_redactor,
     apply_options_cap,
     chunk_text,
     count_redaction_tags,
@@ -792,6 +797,17 @@ class DiscordRenderer(Renderer):
                 if await asyncio.to_thread(protected_ref_spans, candidate):
                     return
             chunks = await asyncio.to_thread(split_markdown_safe, candidate, limit)
+            # Card text is model text, and this branch cuts it on the same length
+            # budget, so its boundaries carry the same hazard as the source path's.
+            keep = sealable_piece_count(chunks, _default_redactor)
+            if keep < len(chunks) - 1:
+                if keep:
+                    chunks = [*chunks[:keep], "".join(chunks[keep:])]
+                else:
+                    offset = safe_split_offset(candidate, limit, _default_redactor)
+                    if not offset:
+                        return
+                    chunks = [candidate[:offset], candidate[offset:]]
             for chunk in chunks[:-1]:
                 self._buf = []
                 self._delivery_text = chunk
@@ -825,6 +841,30 @@ class DiscordRenderer(Renderer):
             dirty_cut = any(len(line) > limit for line in split_source.splitlines(True))
             if dirty_cut or lost:
                 self._segment_uploads_safe = False
+        # The splitter cuts the RAW buffer on a length budget and each chunk is
+        # redacted alone, so a key written with markup through the cut matches
+        # nothing in either chunk while the reader's client renders the markup away
+        # and reads the halves as one key down the screen.
+        pieces = [*sealed, tail]
+        keep = sealable_piece_count(pieces, _default_redactor)
+        if keep < len(pieces) - 1:
+            if keep:
+                sealed, tail = pieces[:keep], "".join(pieces[keep:])
+            else:
+                # No boundary the splitter chose is safe. Cut where the reader cannot
+                # rejoin instead, and deliver NOTHING when no sampled offset is safe
+                # either: withheld text rides the next rotation, and the final seal
+                # redacts the whole segment as one string. The regrade is not the
+                # offset search repeated -- the retained tail can carry held text
+                # that search never saw.
+                offset = safe_split_offset(split_source, limit, _default_redactor)
+                head = split_source[:offset]
+                rest = split_source[offset:] + raw[len(split_source) :]
+                if not offset or not sealable_piece_count([head, rest], _default_redactor):
+                    self._buf = [raw + protocol_suffix]
+                    self._delivery_text = None
+                    return
+                sealed, tail = [head], rest
         for ch in sealed:
             self._buf = [ch]
             self._delivery_text = None

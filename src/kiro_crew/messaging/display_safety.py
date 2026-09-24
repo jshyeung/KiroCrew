@@ -23,7 +23,7 @@ keeps its own (possibly session-scoped) redactor.
 from __future__ import annotations
 
 import re
-from typing import Callable
+from typing import Callable, Sequence
 
 from kiro_crew.preview_text import drop_format_chars
 
@@ -206,6 +206,38 @@ def safe_split_offset(text: str, limit: int, redactor: Callable[[str], str]) -> 
         step = 1 if step == 0 else step * 2
         offset = limit - step
     return 0
+
+
+def sealable_piece_count(pieces: Sequence[str], redactor: Callable[[str], str]) -> int:
+    """How many leading *pieces* may go out as messages of their own.
+
+    A renderer that has split one buffer into ordered *pieces* ships all but the
+    last and keeps the last one live. Each shipped piece is redacted ALONE, so a
+    credential the split severed matches nothing in either half -- and the reader's
+    client puts the halves back together on screen, one message under the other.
+
+    Every boundary between neighbouring pieces is graded with
+    :func:`joins_to_a_credential`, and the count stops at the FIRST boundary that
+    fails. The caller ships only that many pieces and rejoins the rest into its live
+    buffer, which holds no boundary at all: the next delivery grades it again over
+    more text, and whatever is still whole when the turn ends is redacted as one
+    string by the final seal. So a refused boundary withholds text; it never
+    releases it uninspected.
+
+    Grading is PAIRWISE because a credential straddling a boundary has its head at
+    the end of one piece and its tail at the start of the next, which is exactly the
+    pair. A pattern spanning a whole piece would escape that, and needs a piece
+    shorter than the credential -- these pieces are message-sized, with a floor in
+    the hundreds of characters, so the two sizes do not meet.
+
+    Returns a count in ``0..len(pieces) - 1``: never the last piece, which is the
+    retained tail rather than a delivery. ``0`` means the first boundary was refused
+    and nothing from this split may be shipped.
+    """
+    for index in range(len(pieces) - 1):
+        if joins_to_a_credential(pieces[index], pieces[index + 1], redactor):
+            return index
+    return max(0, len(pieces) - 1)
 
 
 def redact_for_display(text: str, redactor: Callable[[str], str]) -> tuple[str, bool]:

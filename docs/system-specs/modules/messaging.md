@@ -62,7 +62,7 @@ legacy metadata do not override a canonical execution.
 | `messaging/renderer.py` | **Layer 2b** — `Renderer` ABC, `OutputEvent`, output-kind constants + `OUTPUT_KINDS`, `chunk_text` helper, `session_provenance_tag` (stable callback affinity without exposing session keys), `apply_options_cap`/`cap_choices`/`format_overflow` (`max_buttons` enforcement), `split_options_trailer` (the ONE `[OPTIONS:]` parse — see below), and `render_options_as_text` — the whole-trailer path for a channel with no widget, which reaches the same cap with zero slots so every choice becomes a numbered line (WeCom, Weixin, iMessage and Feishu call it; WhatsApp declares `max_buttons=0` and strips the trailer instead, so a `0` alone does not promise the list survives). Also `credential_redaction_notice(count)` — the one sentence a channel sends when credential redaction rewrote text it already delivered, so the reader learns a pasted command will not run. Shared so the wording cannot fork per channel and each spelling need its own audit for leaked bytes; it carries only the count, never secret bytes, and is plain text with no markup or emoji because one string ships to platforms that render different dialects (or none). `redaction_notice(cred_count, url_count)` is the by-kind superset every channel delivery surface now posts through: it delegates to `credential_redaction_notice` byte-for-byte when `url_count` is zero, and otherwise names the suspicious-URL rewrite (`security.EXFILTRATION_REDACTION_TAG_PREFIX`, counted by prefix because the tag interpolates the domain) with the URL remedy — re-check the link against a trusted source — because telling a reader whose URL was rewritten to "supply the secret" names a remedy that cannot help them. Zero/zero is a `ValueError`, never an empty message. `count_redaction_tags(text)` is the shared two-kind tally beside it — exact-match over `CREDENTIAL_REDACTION_TAGS`, prefix-match for the URL tag — so a surface cannot adopt half the count and post a notice worded for the wrong remedy; every counting site routes through it. The notice itself is posted IN-RENDERER at every channel delivery surface, one best-effort follow-up message per turn: each renderer counts the text IT actually delivered — which can differ from the driver's accumulated view, because several renderers run a second display-form redaction pass at their own egress (Slack, Telegram, Teams and Discord re-redact against what the platform RENDERS, so their delivered form can carry placeholders the driver's byte-level stream scan never wrote) — and a failed notice send is logged, never raised, because the answer is already out. It is never folded into the answer text: renderers refuse text once finalized, and prose after an `[OPTIONS:]` trailer breaks the trailer parsers, which require it to END the text. Discord and Telegram tally per LANDED message across seals, recovery re-posts and the posted reasoning (streaming edits supersede each other, so only sealed forms count); Slack counts the final display-safe body plus the posted 💭 reasoning in one tally; WeCom tallies at `on_done` but posts from `close()`, where its deferred-overflow delivery finally settles, consumed on the first call so a second `close()` cannot post twice; `SilentRenderer` posts nothing because it delivers nothing |
 | `messaging/approval.py` | Two channel-neutral approval styles behind one INTERACTIVE `decider`, both deny-by-default on timeout and keyed `session_key`+`request_id`. **Typed reply** (`TEXT_APPROVAL_TIMEOUT_S`, the verdict vocabulary, `TextReplyApprovalDecider`) for a `max_buttons=0` channel, with Trust recorded as the session's own approval policy rather than a second trust store. **Widget awaiter** (`PendingApprovals` + `SessionApprovalDecider`) for a press whose correlation id and per-prompt nonce travel a round trip this module cannot see (a Webex Adaptive Card over the device websocket); a typed answer has no nonce, a press has no free text |
 | `messaging/driver.py` `deny_all_tools` | Rejects EVERY permission request ahead of every approve path. The approval ladder cannot express "this sender is not the operator" on its own: the PreToolUse hook may answer `auto_approve` and the Trust/YOLO predicates approve and short-circuit, both BEFORE the ladder is consulted, so setting the mode to `interactive` without a decider is not sufficient. Defaults False |
-| `messaging/display_safety.py` | `strip_ansi` / `canonicalize_display` / `redact_for_display` — credential redaction against the form a platform RENDERS, not the bytes sent. Hoisted out of `slack/format.py` when the shared overflow sink began writing choice text into the parsed body on every widget channel |
+| `messaging/display_safety.py` | `strip_ansi` / `canonicalize_display` / `redact_for_display` -- credential redaction against the form a platform RENDERS, not the bytes sent. Hoisted out of `slack/format.py` when the shared overflow sink began writing choice text into the parsed body on every widget channel. `joins_to_a_credential` / `safe_split_offset` / `sealable_piece_count` answer the cut question a cap forces: would the reader rejoin a key across this boundary |
 | `messaging/markup.py` | `strip_thinking_tags` / `flatten_pipe_tables` / `flatten_mermaid_body`: Markdown reductions for a surface that renders none of the source form (a `<thinking>` block, a pipe table needing a monospace grid, a `mermaid` fence needing an image). Emits Markdown, never a channel dialect, so each channel's own inline converter finishes the job. Stdlib-only leaf |
 | `messaging/split.py` | `split_markdown_safe` — the shared fence-safe markdown splitter (stdlib-only, pure). Prefix-stable so streaming callers can send sealed chunks and keep only the last as a live buffer. `split_markdown_bytes` wraps it for a byte-capped platform, measuring the produced chunks and shrinking the character budget until they fit, with the `chunk_utf8_bytes` primitive as the floor. Also exports `iter_fence_spans`, the same fence machine viewed as character spans over a whole message |
 | `messaging/outbound_files.py` | `extract_local_refs` (+ `extract_local_refs_off_loop`) — pulls local markdown image references out of an outbound reply into `OutboundFile` payloads carrying the validated bytes, with `Rejection` reasons for everything refused. Also `iter_local_refs` / `hide_local_refs`, the text-only scan a streaming channel uses to keep the markup off live frames. Channel-neutral; the upload stays per-transport |
@@ -1763,6 +1763,41 @@ before the split. Discord gets that from the shared `split_markdown_safe`, whose
 final chunk is deliberately left open as the live buffer; Telegram still carries
 its own splitter. Raw markers never reach posted text; each renderer keeps a
 defensive raw-marker parser only for callers that bypass `TurnDriver`.
+
+**A length rotation may not sever a credential the reader's client will rejoin.**
+The cut is chosen on the RAW buffer's budget while each rotated message is redacted
+ALONE, so a key the model wrote with markup through the cut matches nothing in either
+message -- and the reader's client renders the markup away and reads the halves as one
+key, one message under the other. It needs no markup at all on either channel: a
+plain unmarked key crossing the cut leaks the same way, because the halves are only
+ever scanned apart. This is the same hazard WeCom's `_push` answers with
+`safe_split_offset`, at the other shape a cap takes.
+
+So every boundary a rotation would create is graded before anything is sent.
+`display_safety.sealable_piece_count` walks the ordered pieces -- the splitter's
+chunks, plus the held image tail where one is retained -- grades each neighbouring
+pair with `joins_to_a_credential`, and returns the count up to the FIRST boundary
+that fails. Both renderers ship only that many and rejoin the rest into the live
+buffer, which holds no boundary at all: the next rotation grades it again over more
+text, and whatever is still whole when the turn ends is redacted as one string by the
+final seal. Grading is pairwise because a straddling key has its head at the end of
+one piece and its tail at the start of the next; a key spanning a whole piece would
+need a piece shorter than the key, and these are message-sized.
+
+When the FIRST boundary fails there is nothing to ship, so the cut moves instead of
+the budget: `safe_split_offset` picks an offset that severs nothing and that head
+goes out alone. Two answers mean **deliver nothing this rotation** -- an offset of `0`
+(every sampled candidate unsafe), and, on Telegram, a safe head that renders past the
+HTML cap. Withholding is always available and is the safe direction: the text rides
+the next rotation, and the final seal redacts the whole segment intact. Discord
+regrades the chosen boundary because its retained tail can carry held image text the
+offset search never saw. Discord's table-card branch is graded on the same footing --
+card text is model text, cut on the same budget.
+
+The grading covers the boundaries a rotation itself makes. A later writer that
+replaces the LIVE head -- a converted table body, an options-cap expansion -- reopens a
+boundary already graded safe, and that writer sits outside the rotation; it is pinned
+as a strict `xfail` in `test_discord.py` and tracked on its own.
 
 ## Session privacy modes (`privacy_mode.py`)
 

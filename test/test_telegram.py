@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import html
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -20,11 +22,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from conftest import assert_rejected_without_backtracking
+from conftest import CREDENTIAL_STRADDLE_SHAPES, assert_rejected_without_backtracking
 from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.dashboard.token_auth import parse_duration
 from kiro_crew.messaging.commands import parse_dashboard_ttl
+from kiro_crew.messaging.display_safety import canonicalize_display
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -36,6 +39,7 @@ from kiro_crew.messaging.renderer import (
     TEXT_CHUNK,
     TOOL_CALL,
     OutputEvent,
+    _default_redactor,
     session_provenance_tag,
 )
 from kiro_crew.messaging.session_resume import RoutingDecision
@@ -5823,3 +5827,119 @@ class TestRedactionNotice:
         asyncio.run(_go())
         delivered = [t for t, _kb in cli.sent] + [t for _mid, t, _kb in cli.edits]
         assert any("[REDACTED: credential]" in t for t in delivered)
+
+
+class TestRotationSeamCredentialSafety:
+    """A rotation must not hand the reader a key by putting two bubbles in a row.
+
+    The length cut lands on the RAW buffer and every bubble is redacted ALONE, so a
+    credential the model wrote with markup across the cut matches nothing in either
+    bubble -- and the reader's client renders the markup away and reads the halves
+    as one key, one bubble under the other.
+
+    Telegram budgets the cut against the RENDERED HTML, not the source, so the cut
+    offset is MEASURED here rather than assumed: a fixture that places the key at
+    the source cap sees the splitter cut on its own budget somewhere else, the key
+    lands whole inside one bubble, and the test passes without ever exercising the
+    hazard.
+    """
+
+    _CAP = 400
+
+    def _renderer(self, monkeypatch: pytest.MonkeyPatch) -> tuple[TelegramRenderer, FakeClient]:
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: self._CAP)
+        monkeypatch.setattr(r, "_rendered_limit", lambda: self._CAP)
+        return r, cli
+
+    def _straddling_source(self, head: str, tail: str) -> str:
+        """A source whose first splitter boundary falls strictly inside the key.
+
+        One unbroken run of letters, so the splitter has no newline to prefer and
+        cuts on the budget. The placement is corrected against the boundary the
+        splitter actually chooses, which differs from the source offset by each
+        shape's own escape and link inflation.
+        """
+        key = head + tail
+        at = self._CAP - len(head)
+        for _ in range(4):
+            src = "a" * at + key + "a" * (self._CAP // 2)
+            boundary = len(_split_markdown_bounded(src, self._CAP)[0])
+            if at < boundary < at + len(key):
+                return src
+            at -= boundary - at - len(head)
+            assert at > 0, "the boundary cannot be placed inside this shape"
+        raise AssertionError(f"boundary never landed inside {key!r}")
+
+    @staticmethod
+    def _on_screen(frame: str) -> str:
+        """What the reader sees of one bubble: Telegram's HTML, rendered.
+
+        The seal ships HTML, so the raw frame keeps a key apart with the very tags
+        that vanish on screen -- ``AKIA</a>IOSFODNN7EXAMPLE`` matches nothing while
+        the reader reads one key straight through it.
+        """
+        return html.unescape(re.sub(r"<[^>]+>", "", frame))
+
+    def _assert_no_key_on_screen(self, frames: list[str]) -> None:
+        shown = [self._on_screen(f) for f in frames]
+        for reading in (
+            canonicalize_display("".join(shown)),
+            "".join(canonicalize_display(f) for f in shown),
+        ):
+            assert _default_redactor(reading) == reading, f"key readable across frames: {shown}"
+
+    @pytest.mark.parametrize(("head", "tail"), CREDENTIAL_STRADDLE_SHAPES)
+    def test_a_straddled_credential_never_reaches_two_bubbles(
+        self, monkeypatch: pytest.MonkeyPatch, head: str, tail: str
+    ) -> None:
+        rejoined = (
+            canonicalize_display(head + tail),
+            canonicalize_display(head) + canonicalize_display(tail),
+        )
+        assert any(_default_redactor(r) != r for r in rejoined), "fixture is not a straddle"
+
+        r, cli = self._renderer(monkeypatch)
+        r._buf = [self._straddling_source(head, tail)]
+
+        async def _go() -> None:
+            await r._rotate_on_length()
+            await r._seal_current(extract_uploads=False)
+
+        asyncio.run(_go())
+        frames = [text for text, _kb in cli.sent]
+        assert frames, "nothing was delivered at all"
+        self._assert_no_key_on_screen(frames)
+
+    def test_an_innocent_body_still_rotates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control: the grading refuses boundaries, it does not stop rotating."""
+        r, cli = self._renderer(monkeypatch)
+        r._buf = ["word " * 400]
+        asyncio.run(r._rotate_on_length())
+        assert cli.sent, "an innocent body was withheld"
+
+    def test_no_safe_offset_withholds_the_text_instead_of_sending_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure direction: nothing safe to cut means nothing goes out.
+
+        With no sampled offset safe, the rotation must not fall back on the cut it
+        already refused. It delivers NOTHING, keeps the buffer whole, and the final
+        seal then redacts that buffer as one string -- where the key is intact and
+        matches, so it is replaced rather than shown.
+        """
+        head, tail = "AKIAIOSF", "ODNN7EXAMPLE"
+        src = self._straddling_source(head, tail)
+        monkeypatch.setattr("kiro_crew.telegram.renderer.safe_split_offset", lambda *a, **k: 0)
+        r, cli = self._renderer(monkeypatch)
+        r._buf = [src]
+
+        asyncio.run(r._rotate_on_length())
+
+        assert cli.sent == [], "text went out on a cut the grading had refused"
+        assert "".join(r._buf) == src, "the withheld text was not kept whole"
+
+        asyncio.run(r._seal_current(extract_uploads=False))
+        delivered = "".join(text for text, _kb in cli.sent)
+        assert head + tail not in delivered, "the final seal shipped the key"

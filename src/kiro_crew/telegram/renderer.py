@@ -39,7 +39,11 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.constants import split_trailing_protocol_suffix, strip_control_comments
 from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
-from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.display_safety import (
+    redact_for_display,
+    safe_split_offset,
+    sealable_piece_count,
+)
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
     OutboundFile,
@@ -1214,11 +1218,17 @@ class TelegramRenderer(Renderer):
                 if spans[0][0] == 0:
                     return  # the whole buffer is protected — do not rotate at all
                 held = raw[spans[0][0] :]
-                for chunk in _split_markdown_bounded(raw[: spans[0][0]], rendered_cap):
+                # Each sealed chunk is redacted alone, so a key written with markup
+                # through a cut matches nothing in either chunk and the reader's
+                # client rejoins the halves on screen. Ship only as far as a
+                # boundary a reader cannot rejoin across and keep the rest live.
+                pieces = [*_split_markdown_bounded(raw[: spans[0][0]], rendered_cap), held]
+                keep = sealable_piece_count(pieces, _default_redactor)
+                for chunk in pieces[:keep]:
                     self._buf = [chunk]
                     await self._seal_current(extract_uploads=False)
                     self._open_new_message()
-                self._buf = [held]
+                self._buf = ["".join(pieces[keep:])]
                 return
         raw, protocol_suffix = split_trailing_protocol_suffix(raw)
         if _has_table(raw):
@@ -1261,6 +1271,26 @@ class TelegramRenderer(Renderer):
             tail = chunks[-1].rstrip()
             if tail.endswith("```"):
                 chunks[-1] = tail[:-3].rstrip("\n")
+        # The cut lands on the RAW buffer's budget and each sealed chunk is redacted
+        # on its own, so a key written with markup through the cut matches nothing in
+        # either chunk while the reader's client renders the markup away and reads
+        # the halves as one key down the screen. Grade the boundaries this rotation
+        # would create and ship only as far as one a reader cannot rejoin across.
+        keep = sealable_piece_count(chunks, _default_redactor)
+        if keep < len(chunks) - 1:
+            if keep:
+                chunks = [*chunks[:keep], "".join(chunks[keep:])]
+            else:
+                # Not one boundary the splitter chose is safe. Cut where the reader
+                # cannot rejoin instead, and deliver NOTHING when no sampled offset
+                # is safe or the safe head renders past the cap: the withheld text
+                # rides the next rotation, and the final seal redacts the whole
+                # segment as a single string.
+                offset = safe_split_offset(raw, limit, _default_redactor)
+                if not offset or _rendered_len(raw[:offset]) > rendered_cap:
+                    self._buf = [raw + protocol_suffix]
+                    return
+                chunks = [raw[:offset], raw[offset:]]
         for ch in chunks[:-1]:
             self._buf = [ch]
             # A length rotation never extracts: only a SEMANTIC seal (steer
