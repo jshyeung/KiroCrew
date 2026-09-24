@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import model_scope
+from kiro_crew.acp.chat_runtime_pool import (
+    CHAT_RUNTIME_POOL,
+    ChatRuntimeKey,
+    eligible_for_chat_sharing,
+)
 from kiro_crew.acp.client import (
     DEFAULT_MODEL,
     AcpAuthRequired,
@@ -1089,51 +1094,124 @@ class AcpProvider(LLMProvider):
             if isinstance(previous_tree, Path):
                 self._shared_scratch = previous_tree
 
-        runtime = AcpRuntime(
-            work_dir=work_dir,
-            agent=agent or "kirocrew",
-            sandbox_mode=sandbox_mode,
-            extra_env=extra_env,
-            mcp_gateway_overlay=mcp_gateway_overlay,
-            mcp_gateway_socket=mcp_gateway_socket,
-            acp_backend=self._client.backend,
-            crew_agent=self._crew_agent,
-            tool_search=self._tool_search_settings(),
-            member_context=self.member_context,
-            memory_mode=self.memory_mode,
-            # A dedicated subagent's inherited work directory (agent_scratch):
-            # this runtime, not the placeholder client, is the process the
-            # subagent runs in, so the second window has to be mounted HERE.
-            shared_scratch=self._shared_scratch,
-        )
-        _t_spawn = time.monotonic()
+        # Whether this session may share one kiro-cli process with other chat
+        # slots, and the key that decides WHICH process. Resolved before the
+        # spawn because the pool either hands back a live runtime or runs the
+        # spawn below as its own miss path.
+        _chat_sharing = False
+        _chat_pool_cap = 10
         try:
-            await runtime.spawn()
-        except AcpRuntimeError as exc:
-            # An OS sandbox that refused to build this child is checked FIRST and
-            # on all three of this module's startup paths: it is the narrower
-            # fact, it is deterministic (so the pool replacing the worker only
-            # reproduces it), and a child the sandbox would not start never got
-            # far enough to report a credential problem. The verdict comes from
-            # the shared translation so these paths cannot disagree with the
-            # per-turn one in session_provider.
-            sandbox_failure = await sandbox_init_failure_for_runtime(runtime)
-            if sandbox_failure is not None:
-                raise sandbox_failure from exc
-            # kiro-cli can exit during initialize when not authenticated —
-            # surface an actionable login prompt (parity with AcpClient) rather
-            # than a generic runtime-death error.
-            if runtime.saw_not_logged_in():
-                # ``self._client`` is still the placeholder AcpClient at this
-                # point, and it carries the backend this runtime was spawned for
-                # (it is the value passed as ``acp_backend`` above) — so the
-                # sign-in advice names the harness that actually failed to
-                # authenticate rather than assuming kiro-cli.
-                raise AcpAuthRequired(
-                    host_auth.signed_out_message(self._client.backend),
-                    backend=self._client.backend,
-                ) from exc
-            raise
+            # Deferred: the config loader imports this provider module, so a
+            # module-scope import here would close that cycle.
+            from kiro_crew.config.loader import KiroCrewConfig
+
+            _chat_agent_cfg = KiroCrewConfig.load().agent
+            _chat_sharing = bool(getattr(_chat_agent_cfg, "chat_runtime_sharing", False))
+            _chat_pool_cap = int(getattr(_chat_agent_cfg, "chat_runtime_sharing_max_sessions", 10))
+        except Exception:
+            logger.debug("chat runtime sharing: config unreadable", exc_info=True)
+        _chat_session_key = self._owning_session_key()
+
+        def _build_chat_pool_key() -> ChatRuntimeKey:
+            """This session's process-level compatibility key, from current state.
+
+            Rebuilt rather than cached because one field can legitimately move
+            during startup: a replacement process joins the dead one's scratch
+            tree, and ``shared_scratch`` is part of the key.
+            """
+            return ChatRuntimeKey.build(
+                work_dir=work_dir,
+                agent=agent or "kirocrew",
+                sandbox_mode=sandbox_mode,
+                extra_env=extra_env,
+                acp_backend=self._client.backend,
+                tool_search=self._tool_search_settings(),
+                member_context=self.member_context,
+                memory_mode=self.memory_mode,
+                shared_scratch=self._shared_scratch,
+                mcp_gateway_overlay=mcp_gateway_overlay,
+                mcp_gateway_socket=mcp_gateway_socket,
+            )
+
+        _chat_pool_key: ChatRuntimeKey | None = None
+        if eligible_for_chat_sharing(
+            session_key=_chat_session_key,
+            memory_mode=self.memory_mode,
+            member_context=self.member_context,
+            sharing_enabled=_chat_sharing,
+        ):
+            _chat_pool_key = _build_chat_pool_key()
+
+        async def _spawn_chat_runtime() -> AcpRuntime:
+            """Start one process for this session's own spawn inputs.
+
+            The pool's miss path, and the whole path when sharing is off — so
+            the spawn inputs and every startup refusal below are identical in
+            both cases.
+            """
+            fresh = AcpRuntime(
+                work_dir=work_dir,
+                agent=agent or "kirocrew",
+                sandbox_mode=sandbox_mode,
+                extra_env=extra_env,
+                mcp_gateway_overlay=mcp_gateway_overlay,
+                mcp_gateway_socket=mcp_gateway_socket,
+                acp_backend=self._client.backend,
+                crew_agent=self._crew_agent,
+                tool_search=self._tool_search_settings(),
+                member_context=self.member_context,
+                memory_mode=self.memory_mode,
+                # A dedicated subagent's inherited work directory (agent_scratch):
+                # this runtime, not the placeholder client, is the process the
+                # subagent runs in, so the second window has to be mounted HERE.
+                shared_scratch=self._shared_scratch,
+            )
+            try:
+                await fresh.spawn()
+            except AcpRuntimeError as exc:
+                # An OS sandbox that refused to build this child is checked FIRST and
+                # on all three of this module's startup paths: it is the narrower
+                # fact, it is deterministic (so the pool replacing the worker only
+                # reproduces it), and a child the sandbox would not start never got
+                # far enough to report a credential problem. The verdict comes from
+                # the shared translation so these paths cannot disagree with the
+                # per-turn one in session_provider.
+                sandbox_failure = await sandbox_init_failure_for_runtime(fresh)
+                if sandbox_failure is not None:
+                    raise sandbox_failure from exc
+                # kiro-cli can exit during initialize when not authenticated —
+                # surface an actionable login prompt (parity with AcpClient) rather
+                # than a generic runtime-death error.
+                if fresh.saw_not_logged_in():
+                    # ``self._client`` is still the placeholder AcpClient at this
+                    # point, and it carries the backend this runtime was spawned for
+                    # (it is the value passed as ``acp_backend`` above) — so the
+                    # sign-in advice names the harness that actually failed to
+                    # authenticate rather than assuming kiro-cli.
+                    raise AcpAuthRequired(
+                        host_auth.signed_out_message(self._client.backend),
+                        backend=self._client.backend,
+                    ) from exc
+                raise
+            return fresh
+
+        _t_spawn = time.monotonic()
+        joined_shared_runtime = False
+        try:
+            if _chat_pool_key is not None:
+                acquisition = await CHAT_RUNTIME_POOL.acquire(
+                    _chat_pool_key,
+                    _chat_session_key,
+                    _spawn_chat_runtime,
+                    cap=_chat_pool_cap,
+                )
+                runtime = acquisition.runtime
+                joined_shared_runtime = acquisition.joined
+                meta["chat_runtime_shared"] = True
+                meta["chat_runtime_joined"] = joined_shared_runtime
+                meta["chat_runtime_sessions"] = acquisition.sessions_on_runtime
+            else:
+                runtime = await _spawn_chat_runtime()
         finally:
             # subprocess launch + ACP `initialize` handshake
             phases["spawn_init"] = (time.monotonic() - _t_spawn) * 1000.0
@@ -1225,44 +1303,39 @@ class AcpProvider(LLMProvider):
                         "runtime died during resume; respawning for fresh start " "(PID was %s)",
                         runtime.pid,
                     )
+                    dead_runtime = runtime
+                    # Unbind EVERY session the dead process served, not just this
+                    # one: a shared process's death orphans all of them, and each
+                    # recovers through this same start path on its own next turn.
+                    # A no-op when this runtime was never pooled.
+                    await CHAT_RUNTIME_POOL.forget(dead_runtime)
                     try:
                         # Reap of an already-dead runtime: _mark_dead refuses
                         # the expected-downgrade when the child exited on its
                         # own, so this only labels the genuinely-deliberate case.
-                        await runtime.kill(expected=True, reason="reap before resume respawn")
+                        await dead_runtime.kill(expected=True, reason="reap before resume respawn")
                     except Exception:
                         pass
-                    runtime = AcpRuntime(
-                        work_dir=work_dir,
-                        agent=agent or "kirocrew",
-                        sandbox_mode=sandbox_mode,
-                        extra_env=extra_env,
-                        mcp_gateway_overlay=mcp_gateway_overlay,
-                        mcp_gateway_socket=mcp_gateway_socket,
-                        acp_backend=self._client.backend,
-                        crew_agent=self._crew_agent,
-                        # Same wire settings as the first spawn: on a host that
-                        # takes Tool Search at initialize, a respawn without them
-                        # would run the replayed session with it silently off.
-                        tool_search=self._tool_search_settings(),
-                        member_context=self.member_context,
-                        memory_mode=self.memory_mode,
-                        # The dead runtime's tree, for the same reason a restart
-                        # joins it (above): its sessions' work is there.
-                        shared_scratch=self._shared_scratch or runtime.work_scratch_dir,
-                    )
-                    try:
-                        await runtime.spawn()
-                    except AcpRuntimeError as exc:
-                        sandbox_failure = await sandbox_init_failure_for_runtime(runtime)
-                        if sandbox_failure is not None:
-                            raise sandbox_failure from exc
-                        if runtime.saw_not_logged_in():
-                            raise AcpAuthRequired(
-                                host_auth.signed_out_message(self._client.backend),
-                                backend=self._client.backend,
-                            ) from exc
-                        raise
+                    # The dead runtime's tree, for the same reason a restart
+                    # joins it: its sessions' work is there. Recorded on self so
+                    # the replacement's spawn inputs — and the pool key built
+                    # from them — name the tree being joined.
+                    self._shared_scratch = self._shared_scratch or dead_runtime.work_scratch_dir
+                    if _chat_pool_key is not None:
+                        _chat_pool_key = _build_chat_pool_key()
+                        acquisition = await CHAT_RUNTIME_POOL.acquire(
+                            _chat_pool_key,
+                            _chat_session_key,
+                            _spawn_chat_runtime,
+                            cap=_chat_pool_cap,
+                        )
+                        runtime = acquisition.runtime
+                        joined_shared_runtime = acquisition.joined
+                        meta["chat_runtime_recovered"] = True
+                        meta["chat_runtime_joined"] = joined_shared_runtime
+                        meta["chat_runtime_sessions"] = acquisition.sessions_on_runtime
+                    else:
+                        runtime = await _spawn_chat_runtime()
                 try:
                     handle = await runtime.create_session(
                         cwd=work_dir,
@@ -1271,6 +1344,12 @@ class AcpProvider(LLMProvider):
                         memory_mode=self.memory_mode,
                         session_key=self._owning_session_key(),
                         channel_id=self._owning_channel_id() or "",
+                        # Joining a process another session already runs on: its
+                        # projection is live and its co-tenants depend on it, so
+                        # this session must not take the work-dir settings lock
+                        # and rewrite it, nor replace the process-wide projection
+                        # object from a per-session path.
+                        skip_projection_refresh=joined_shared_runtime,
                     )
                 except AcpRuntimeError as exc:
                     sandbox_failure = await sandbox_init_failure_for_runtime(runtime)
@@ -1354,7 +1433,16 @@ class AcpProvider(LLMProvider):
             provider = AcpSessionProvider(
                 handle,
                 runtime,
-                owns_runtime=True,
+                # A pooled runtime is refcounted, so ownership is the pool's
+                # answer rather than this session's: the release callback returns
+                # the runtime only to the LAST session to leave. Sharing off
+                # leaves this the sole owner, exactly as an unpooled start is.
+                owns_runtime=_chat_pool_key is None,
+                runtime_release=(
+                    (lambda: CHAT_RUNTIME_POOL.release(_chat_session_key))
+                    if _chat_pool_key is not None
+                    else None
+                ),
                 # This path is the COLD start, which never rekeys — so the
                 # correlation keys have to arrive here or the per-turn re-claim
                 # pushes a keyless claim gatewayd throws away.
@@ -1386,8 +1474,21 @@ class AcpProvider(LLMProvider):
             # No provider owns the runtime yet — kill it so a failed session
             # setup doesn't leak an orphaned kiro-cli process. Best-effort:
             # the cleanup kill must not mask the original exception.
+            #
+            # A POOLED runtime is released rather than killed: co-tenant sessions
+            # may be mid-turn on this process, and this session's setup failing
+            # is no reason to end theirs. The release hands the runtime back only
+            # when this session was its last holder, which is the case where the
+            # leak this arm exists to prevent is real.
             try:
-                await runtime.kill(expected=True, reason="failed session setup cleanup")
+                if _chat_pool_key is not None:
+                    last = await CHAT_RUNTIME_POOL.release(_chat_session_key)
+                    if last is not None:
+                        await last.kill(
+                            expected=True, reason="failed session setup cleanup (last holder)"
+                        )
+                else:
+                    await runtime.kill(expected=True, reason="failed session setup cleanup")
             except Exception:
                 logger.debug(
                     "Cleanup kill of runtime after failed session setup failed",

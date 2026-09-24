@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
 from pathlib import Path
 from typing import Any
@@ -81,12 +81,21 @@ class AcpSessionProvider(LLMProvider):
         owns_runtime: bool = False,
         session_key: str = "",
         channel_id: str | None = None,
+        runtime_release: "Callable[[], Awaitable[AcpRuntime | None]] | None" = None,
     ) -> None:
         self._handle = handle
         self._runtime = runtime
         # When True, shutdown() kills the runtime (parent session owns it).
         # When False, shutdown() only destroys the session handle (subagent).
         self._owns_runtime = owns_runtime
+        # Set when this session's runtime is REFCOUNTED by a pool, which is the
+        # case ``owns_runtime`` alone cannot express: the session that founded a
+        # shared process must not kill it while co-tenants are mid-turn, and the
+        # session that happens to leave LAST must kill it or the process leaks.
+        # Neither is a property of this provider, so the answer is asked of the
+        # pool at teardown: it returns the runtime when this was the last holder,
+        # and None while any other session still holds it.
+        self._runtime_release = runtime_release
         self._resumed_flag: bool = False
         self._resume_session_id: str = ""
         # The session this provider serves. ``rekey()`` sets it on a warm-pool
@@ -253,6 +262,30 @@ class AcpSessionProvider(LLMProvider):
         - Subagent sessions (owns_runtime=False): cancel any in-flight turn,
           then destroy the handle only.
         """
+        if self._runtime_release is not None:
+            # A pooled runtime: this session drops its reference and kills the
+            # process only if it was the last holder. The handle is destroyed
+            # either way, which is what evicts this session from a process that
+            # keeps running for its co-tenants.
+            last: AcpRuntime | None = None
+            try:
+                last = await self._runtime_release()
+            except Exception:
+                logger.debug("AcpSessionProvider.shutdown: pooled release failed", exc_info=True)
+            try:
+                await self._handle.destroy()
+            except Exception:
+                logger.debug(
+                    "AcpSessionProvider.shutdown: pooled handle destroy failed", exc_info=True
+                )
+            if last is not None:
+                try:
+                    await last.kill(expected=True, reason="provider shutdown (last pooled session)")
+                except Exception:
+                    logger.debug(
+                        "AcpSessionProvider.shutdown: pooled runtime kill failed", exc_info=True
+                    )
+            return
         if self._owns_runtime:
             try:
                 if self.memory_mode != "persistent":
