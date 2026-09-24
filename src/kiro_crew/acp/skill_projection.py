@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import stat
 import threading
 import time
@@ -58,17 +59,22 @@ _PROJECTION_LEASE_MAX_BYTES = 65536
 # here rather than recomputed from the writer, because widening the writer must
 # not silently widen what the reclaim is willing to delete.
 _LEGACY_ALIAS_NAME_RE = re.compile(re.escape(NATIVE_SKILL_ALIAS_PREFIX) + r"[0-9a-f]{24}")
-# Reclaims PER RUN, not candidates examined. The first prune after an upgrade
-# faces the whole accumulated backlog -- thousands of files on the hosts that
-# motivated this -- and it runs while the publication lock is held, whose own
-# acquisition ceiling is 2s. Draining it in one sweep would make a concurrent
-# spawn in a worktree-per-task pipeline fail to acquire and fall back to authored
-# agents. The backlog is bounded and shrinking, so spreading it over successive
-# spawns reclaims it just as completely without ever holding the lock long.
-# This is the headroom the per-run cap keeps over the aliases one run publishes,
-# so an accumulated backlog drains by at least this many per spawn while the
-# steady-state orphan rate is covered (see _prune_stale_managed_aliases).
+# Reclaims PER RUN, and reclaims ONLY -- this is the headroom the cap keeps over
+# the aliases one run publishes, so a backlog drains by at least this many per
+# spawn while the steady-state orphan rate is covered. It is NOT a bound on the
+# critical section: a candidate that is kept, active or leased costs a full
+# classification and never increments it, so the two budgets below are what keep
+# the section short (see _prune_stale_managed_aliases).
 _PRUNE_MAX_RECLAIMS_PER_RUN = 64
+# The section's real bound, because per-candidate cost is not flat: the lease
+# probe rescans the lease directory for every candidate. It shares the publication
+# lock's fixed acquisition ceiling with the publication writes in the same section
+# -- two atomic writes per alias plus the settings commit -- so this slice has to
+# leave room for those, not merely fit under the ceiling itself.
+_PRUNE_MAX_SECONDS_PER_RUN = 0.4
+# A companion to the deadline, not a second guarantee: it makes one call's I/O
+# predictable on a host whose candidates are cheap enough to walk for 0.4s.
+_PRUNE_MAX_CANDIDATES_PER_RUN = 512
 # The ONE window the re-preparation contract does not cover, and the only thing
 # this age excludes. A publisher from a build that predates the lease holds no
 # lease, so between its write and kiro-cli reading `--agent` its alias looks
@@ -617,15 +623,33 @@ def _managed_metadata_for_alias(
     return None
 
 
+def _prune_start_offset(count: int) -> int:
+    """Where this call begins its bounded walk over *count* candidates.
+
+    A bounded walk over a stable directory order examines the same prefix every
+    call, so a prefix of entries that are kept, active or leased hides the whole
+    reclaimable remainder behind it -- permanently, because the walk never gets
+    past its own budget to see it. Moving the start makes every entry reachable
+    across calls. It cannot be a cursor in memory: the workload this bound exists
+    for spawns a fresh process per cron run, so a process-local cursor restarts at
+    zero every time and rotates nothing.
+    """
+    if count <= 0:
+        return 0
+    return secrets.randbelow(count)
+
+
 def _prune_stale_managed_aliases(directory: Path, crew_home_id: str, *, keep: set[str]) -> None:
     """Remove aliases owned by this Kiro Crew data home that no projection uses.
 
-    Runs while the publication lock is held. An alias is kept when this run
-    publishes it, a projection in this process holds it, or a held lease in any
-    process names it. Everything else this data home recorded is a cache entry
-    for a projection that has ended: every consumer re-prepares before it sends
-    an alias, so removing one costs the next spawn for that work directory one
-    rewrite and nothing else. Whether the recorded work directory still exists
+    Runs while the publication lock is held, so a deletion can never land on an
+    alias a publisher is writing -- and bounded by a deadline and a candidate cap
+    so holding that lock costs a concurrent spawn a slice, never a backlog. An
+    alias is kept when this run publishes it, a projection in this process holds
+    it, or a held lease in any process names it. Everything else this data home
+    recorded is a cache entry for a projection that has ended: every consumer
+    re-prepares before it sends an alias, so removing one costs the next spawn
+    for that work directory one rewrite and nothing else. Whether the recorded work directory still exists
     is not consulted: a per-run work directory outlives its run, so keying on
     it keeps one alias per agent for every run ever spawned.
     """
@@ -638,7 +662,11 @@ def _prune_stale_managed_aliases(directory: Path, crew_home_id: str, *, keep: se
     # Each run publishes len(keep) aliases and leaves that many behind when it
     # ends, so the cap covers that steady-state rate plus bounded backlog drain.
     cap = _PRUNE_MAX_RECLAIMS_PER_RUN + len(keep)
+    offset = _prune_start_offset(len(candidates))
+    candidates = candidates[offset:] + candidates[:offset]
+    deadline = time.monotonic() + _PRUNE_MAX_SECONDS_PER_RUN
     reclaimed = 0
+    examined = 0
     for path in candidates:
         if reclaimed >= cap:
             logger.info(
@@ -646,6 +674,15 @@ def _prune_stale_managed_aliases(directory: Path, crew_home_id: str, *, keep: se
                 cap,
             )
             break
+        if examined >= _PRUNE_MAX_CANDIDATES_PER_RUN or time.monotonic() >= deadline:
+            logger.info(
+                "skill projection: prune budget spent after %d candidate(s); the rest drains on later spawns",
+                examined,
+            )
+            break
+        # Counted for EVERY candidate inspected, not only the ones reclaimed: the
+        # cost this bounds is the classification, which a skip pays in full.
+        examined += 1
         if (
             path.stem in keep
             or path.stem in active
