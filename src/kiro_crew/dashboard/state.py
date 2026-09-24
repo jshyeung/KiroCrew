@@ -706,6 +706,26 @@ NATIVE_SUBAGENT_DONE_TRUNC_MARKER = "…(earlier output truncated)\n"
 NATIVE_SUBAGENT_TERMINAL_KEEP = 50
 NATIVE_SUBAGENT_TERMINAL_TTL_SECS = 3600.0
 
+# Bounds on the persisted-record fallback the subagent panel rebuilds from when
+# the in-memory manager does not know a run. Two numbers rather than one
+# retention knob, because each defends a different failure:
+#
+# ``PERSISTED_SUBAGENT_REPLAY_KEEP`` bounds the BURST. Run folders accumulate
+# faster than they are reclaimed, so an unbounded rebuild delivers one frame per
+# folder the instant a client connects -- the cost
+# ``SUBAGENT_REPLAY_BATCH_THRESHOLD`` absorbs downstream, met here at the source.
+#
+# ``PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS`` bounds RELEVANCE, and is
+# deliberately wider than the native terminal TTL above rather than sharing it.
+# That TTL bounds cards inside one live session, where an hour is generous. This
+# bound has to answer after the gateway process is replaced, and the gap between
+# that restart and someone opening the tab is routinely longer than an hour --
+# an hour here would leave the panel empty in the exact case the fallback exists
+# to serve. Run folders survive a week, so a day stays well inside what is on
+# disk while keeping a rebuild to one working day of runs.
+PERSISTED_SUBAGENT_REPLAY_KEEP = 50
+PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS = 86_400.0
+
 # Cap on a slot's queued-completion delivery ledger (see
 # ``_ChatSlot.note_pending_subagent_delivery``). Well above any legitimate
 # in-flight set — the slot queue itself is capped at 50 rows — so it only ever

@@ -59,6 +59,7 @@ from kiro_crew.dashboard.chat_utils import (
     remember_slack_options,
     run_to_completion,
     slack_options_owner_key,
+    subagent_event_slot,
 )
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
@@ -73,10 +74,13 @@ from kiro_crew.dashboard.origin import is_direct_local_request, is_proxied_reque
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_END,
     CRON_NOTIFY_PREFIX,
+    PERSISTED_SUBAGENT_REPLAY_KEEP,
+    PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
     DashboardState,
     stage_boundary_for,
 )
 from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot
+from kiro_crew.dashboard.ws import persisted_replay_app_matches
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink
 from kiro_crew.messaging.renderer import (
@@ -108,7 +112,12 @@ from kiro_crew.subagent import (
     effort_drop_reason,
     stage_boundary_owner_for_run,
 )
-from kiro_crew.subagent_persistence import _agent_dir, read_state
+from kiro_crew.subagent_persistence import (
+    _agent_dir,
+    classify_persisted_ending,
+    read_panel_records,
+    read_state,
+)
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
     CHANNEL_ID_RE,
@@ -1206,7 +1215,8 @@ async def api_spawn_status(request: web.Request) -> web.Response:
                     "done": True,
                     "started": disk_state.get("started"),
                 }
-                result_path = _agent_dir(agent_id) / "result.txt"
+                agent_dir = _agent_dir(agent_id)
+                result_path = agent_dir / "result.txt"
                 result = ""
                 if result_path.exists() and not is_sensitive_path(str(result_path)):
                     try:
@@ -1221,17 +1231,16 @@ async def api_spawn_status(request: web.Request) -> web.Response:
                 if view_meta:
                     disk_data["result_meta"] = view_meta
                 disk_data["result"] = _redact(view) if view else "_No result._"
-                # Check for tombstone
-                tombstone_path = _agent_dir(agent_id) / "tombstone.json"
-                if tombstone_path.exists() and not is_sensitive_path(str(tombstone_path)):
-                    try:
-                        raw = await asyncio.to_thread(tombstone_path.read_text, encoding="utf-8")
-                        ts = json.loads(raw)
-                        disk_data["error"] = _redact(f"Orphaned: {ts.get('cause', 'unknown')}")
-                    except (OSError, ValueError):
-                        disk_data["error"] = "Orphaned (unknown cause)"
-                else:
-                    disk_data["error"] = ""
+                # One classifier, shared with the panel list. Reading the
+                # tombstone here as well let the same folder answer "completed"
+                # in a list and "Orphaned: delivered" when opened, and flattened
+                # a recorded user stop into a failure.
+                outcome, error, stopped = await asyncio.to_thread(
+                    classify_persisted_ending, agent_dir
+                )
+                disk_data["outcome"] = outcome
+                disk_data["stopped"] = stopped
+                disk_data["error"] = _redact(error) if error else ""
                 return web.json_response(disk_data)
         except Exception:
             logger.debug("Persistence fallback failed for %s", agent_id, exc_info=True)
@@ -1358,6 +1367,53 @@ async def api_spawn_list(request: web.Request) -> web.Response:
         if withheld:
             entry["context_withheld"] = withheld
         agents.append(entry)
+    # Durable half of the inventory: the runs this process never tracked, which
+    # a memory-only listing cannot name at all. Live entries win -- an id listed
+    # above is excluded rather than merged -- and the caller's own scope gate is
+    # re-applied here on the record's parent, the same field the live branch
+    # compares.
+    listed = {str(entry["id"]) for entry in agents}
+    try:
+        persisted = await asyncio.to_thread(
+            read_panel_records,
+            keep=PERSISTED_SUBAGENT_REPLAY_KEEP,
+            max_age_secs=PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
+            exclude_ids=listed,
+            include_result=True,
+        )
+    except Exception:
+        logger.debug("Persisted spawn listing failed", exc_info=True)
+        persisted = []
+    for record in persisted:
+        parent = str(record["parent_session"])
+        agent_id = str(record["id"])
+        if scope is not None and parent != caller and caller != f"subagent:{agent_id}":
+            continue
+        # Same reused-slot-key exposure the replay guards, reached here through
+        # the parent session rather than a frame: a scoped caller may hold the
+        # key a previous owner's run was recorded under, so the run's own app has
+        # to agree with the slot's current owner.
+        if scope is not None and not persisted_replay_app_matches(
+            state, subagent_event_slot(parent), record
+        ):
+            continue
+        error = str(record["error"])
+        agents.append(
+            {
+                "id": agent_id,
+                "task": _redact(str(record["task"])),
+                "done": True,
+                "parent": parent,
+                "agent": _redact(str(record["agent"])),
+                "started": record["started"],
+                "result": _redact(str(record.get("result") or "")),
+                "error": _redact(error) if error else "",
+                # The tombstone records the run's own outcome, so a user stop
+                # stays a stop here rather than being flattened into a failure.
+                "stopped": bool(record.get("stopped")),
+                "outcome": record["outcome"],
+            }
+        )
     return web.json_response({"agents": agents})
 
 

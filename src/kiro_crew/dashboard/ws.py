@@ -7,7 +7,7 @@ import json
 import logging
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
@@ -16,6 +16,8 @@ from kiro_crew import shutdown_event
 from kiro_crew.dashboard.chat_utils import effective_session_key, subagent_event_slot
 from kiro_crew.dashboard.origin import check_origin
 from kiro_crew.dashboard.state import (
+    PERSISTED_SUBAGENT_REPLAY_KEEP,
+    PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
     DashboardState,
     _safe_folder_tree,
     _slots_serialization_note,
@@ -30,6 +32,7 @@ from kiro_crew.dashboard.ws_event_scope import (
     slots_envelope_extras,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.subagent_persistence import read_panel_records
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +86,61 @@ def _subagent_replay_has_owner(frame: object) -> bool:
         return False
     slot = data.get("slot")
     return isinstance(slot, str) and bool(slot.strip())
+
+
+def persisted_replay_app_matches(state: Any, slot_key: str, record: dict) -> bool:
+    """Whether a persisted run may be replayed into *slot_key* as it stands now.
+
+    Slot keys are caller-supplied and are not namespaced by app, so the key an
+    app's run was recorded under can later be created by a DIFFERENT app. The
+    per-frame scope gate authorizes a subagent frame against the slot's CURRENT
+    owner, which for a reused key is not the owner the run belonged to -- so the
+    run's own recorded app has to be compared here, while it is still known.
+    Without this, a reconnect hands the new owner the previous owner's task,
+    agent name and error text, and the frame is delivered once with no recall.
+
+    Equality both ways, and fail closed. A run no app owns carries ``""``, which
+    matches only a slot no app owns, so an app never receives a person's run and
+    a person never receives an app's. A slot that does not exist denies: there is
+    no current owner to compare against.
+    """
+    if not slot_key:
+        return False
+    slot = getattr(state, "_slots", {}).get(slot_key)
+    if slot is None:
+        return False
+    return str(getattr(slot, "_app", "") or "") == str(record.get("app") or "")
+
+
+def build_persisted_subagent_frame(record: dict, *, redact: Callable[[str], str]) -> dict:
+    """Build the ``subagent_done`` replay frame for one persisted run record.
+
+    Separate from the reconnect handler for the same reason
+    :func:`build_subagent_snapshot` is: the handler around it needs a live
+    aiohttp WebSocket, so a field that goes missing in here is hard to catch
+    from the outside.
+
+    The caller's own redactor is passed in rather than imported, so these frames
+    carry exactly the treatment the live frames beside them get.
+    """
+    error = str(record.get("error") or "")
+    return {
+        "type": "subagent_done",
+        "data": {
+            "id": str(record.get("id") or ""),
+            # Same mapping the live frames use; a raw prefix-strip tags a card
+            # with a slot no tab reads.
+            "slot": subagent_event_slot(str(record.get("parent_session") or "")),
+            "elapsed": float(record.get("elapsed") or 0.0),
+            "error": redact(error) if error else None,
+            # The tombstone records the run's own outcome, so a user stop stays a
+            # stop here rather than being flattened into a failure.
+            "stopped": bool(record.get("stopped")),
+            "outcome": str(record.get("outcome") or ""),
+            "task": redact(str(record.get("task") or "")),
+            "agent": redact(str(record.get("agent") or "")),
+        },
+    }
 
 
 def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
@@ -963,6 +1021,45 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                     )
                                 except Exception:
                                     pass
+                        # Durable rebuild source. Every frame above comes from
+                        # gateway memory, so a replacement process has none to
+                        # replay and the tab stays empty until something new
+                        # spawns. The persisted run folders answer for the runs
+                        # this process never tracked. Ids already collected are
+                        # excluded, so a live frame is never displaced by a disk
+                        # record, and the disk frames join THIS list rather than
+                        # a parallel send: the owner check, the per-socket scope
+                        # gate and the batch packaging below then apply to them
+                        # on exactly the same terms.
+                        try:
+                            _seen = {
+                                str(_f["data"]["id"])
+                                for _f in _replay
+                                if isinstance(_f.get("data"), dict) and _f["data"].get("id")
+                            }
+                            _persisted = await asyncio.to_thread(
+                                read_panel_records,
+                                keep=PERSISTED_SUBAGENT_REPLAY_KEEP,
+                                max_age_secs=PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
+                                exclude_ids=_seen,
+                            )
+                        except Exception:
+                            logger.debug("Persisted subagent replay failed", exc_info=True)
+                            _persisted = []
+                        for _rec in _persisted:
+                            try:
+                                _frame = build_persisted_subagent_frame(_rec, redact=_r)
+                                # The scope gate below reads the slot's CURRENT
+                                # owner, which a reused key does not tie to the
+                                # run's owner, so the recorded app is compared
+                                # while it is still on hand.
+                                if not persisted_replay_app_matches(
+                                    state, str(_frame["data"]["slot"]), _rec
+                                ):
+                                    continue
+                                _replay.append(_frame)
+                            except Exception:
+                                pass
                         # Per-slot scope gate on the reconnect replay. The
                         # broadcast chokepoint covers live events, but this
                         # replay writes to the socket directly, so it must

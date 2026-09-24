@@ -9,6 +9,7 @@ Each subagent gets a folder at ``~/.kiro/crew/subagents/{id}/`` containing:
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import tempfile
 import threading
 import time
 import weakref
+from collections.abc import Collection
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -27,6 +29,7 @@ from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.execution_context import ExecutionContext
 from kiro_crew.jsonl_util import rotate_jsonl_at
 from kiro_crew.providers.cleanup import _is_safe_path
+from kiro_crew.security import is_sensitive_path
 
 logger = logging.getLogger(__name__)
 
@@ -583,14 +586,29 @@ def read_state(agent_id: str) -> dict | None:
     return state if isinstance(state, dict) else None
 
 
+def _read_tombstone_at(path: Path) -> tuple[dict | None, bool]:
+    """Parsed tombstone at *path*, plus whether a tombstone file is PRESENT.
+
+    The two answers are separate because their meanings are: nothing recorded an
+    ending, versus an ending was recorded and cannot be read.
+    """
+    try:
+        tombstone = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        try:
+            return None, path.exists()
+        except OSError:
+            return None, False
+    return (tombstone, True) if isinstance(tombstone, dict) else (None, True)
+
+
 def read_tombstone(agent_id: str) -> dict | None:
     """Read tombstone.json as an object. Return None on missing/invalid data."""
     try:
-        p = _agent_dir(agent_id) / "tombstone.json"
-        tombstone = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
+        path = _agent_dir(agent_id) / "tombstone.json"
+    except ValueError:
         return None
-    return tombstone if isinstance(tombstone, dict) else None
+    return _read_tombstone_at(path)[0]
 
 
 # ── per-agent write serialization ────────────────────────────────────
@@ -1053,6 +1071,264 @@ def list_orphans() -> list[dict]:
             continue
         results.append(state)
     return results
+
+
+#: The one tombstone cause that marks a run whose result reached its parent.
+_DELIVERED_CAUSE = "delivered"
+
+#: Named caps on every string a panel record RETAINS. ``keep`` bounds the ROW
+#: count only, and a bounded number of unbounded rows is unbounded, so each
+#: retained field carries its own limit and a cut field says that it was cut.
+_PANEL_TASK_CAP = 2000
+_PANEL_AGENT_CAP = 200
+_PANEL_ERROR_CAP = 500
+_PANEL_RESULT_CAP = 3000
+_PANEL_TRUNC_MARKER = " ...(truncated)"
+
+#: Ceiling on the recorded app id. This one DROPS the record instead of clamping
+#: it: the id is compared for equality against a slot's current owner, and a
+#: truncated id would compare unequal while looking like a value, so a record
+#: carrying an implausible id is refused rather than silently made to mismatch.
+_PANEL_APP_CAP = 200
+
+#: Ceiling on the scan's own working set, as a multiple of ``keep``. The walk
+#: retains at most this many folder candidates at a time, so a registry holding
+#: hundreds of thousands of folders costs what one holding a hundred costs.
+#: Above ``keep`` so a run of skipped folders still leaves depth to fill a page.
+_PANEL_CANDIDATE_MULTIPLE = 4
+
+#: Terminal values a tombstone may record, and which of them is a user stop.
+_PANEL_OUTCOMES = ("completed", "failed", "stopped")
+
+
+def _clamp(text: str, cap: int) -> str:
+    """Return *text* within *cap*, ending in the marker when it had to be cut.
+
+    The marker IS the truncation report: it travels inside the value to every
+    reader, so no separate flag has to be carried and kept in step.
+    """
+    if len(text) <= cap:
+        return text
+    return text[:cap] + _PANEL_TRUNC_MARKER
+
+
+def _record_memory_mode(state: dict) -> str:
+    """The run's memory mode, from the top-level field or the execution record.
+
+    Answers ``""`` when neither spells one, which every caller treats as "not
+    persistent". Failing closed here costs at most one card; failing open would
+    put an incognito run's task text on screen.
+    """
+    mode = state.get("memory_mode")
+    if isinstance(mode, str) and mode:
+        return mode
+    execution = state.get("execution_context")
+    if isinstance(execution, dict):
+        nested = execution.get("memory_mode")
+        if isinstance(nested, str) and nested:
+            return nested
+    return ""
+
+
+def _record_app(state: dict) -> str:
+    """The app that executed the run, from the top level or the execution record.
+
+    Answers ``""`` for a run no app owns, which is a real value and not a
+    fallback: a slot a person created has no app owner either, so the two compare
+    equal and a human run replays to a human slot.
+    """
+    app = state.get("app")
+    if isinstance(app, str) and app:
+        return app
+    execution = state.get("execution_context")
+    if isinstance(execution, dict):
+        nested = execution.get("app")
+        if isinstance(nested, str) and nested:
+            return nested
+    return ""
+
+
+def _finite_time(value: object) -> float:
+    """A finite, non-negative timestamp, or ``0.0`` for anything unusable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")) or number < 0:
+        return 0.0
+    return number
+
+
+def classify_persisted_ending(agent_dir: Path) -> tuple[str, str, bool]:
+    """How a run on disk ended, as ``(outcome, error, stopped)``.
+
+    The ONE classification site for a persisted run, shared by the panel list
+    and the single-card read, so one folder cannot read "completed" in a list
+    and "Orphaned: delivered" when it is opened.
+
+    Takes the run's resolved folder rather than its id, so a caller that already
+    resolved it -- every caller does, to reach ``result.txt`` -- resolves it once
+    for the whole response instead of once per field.
+
+    The tombstone's own ``outcome`` is preferred over its ``cause``, because the
+    writer records the outcome directly: a user stop is ``stopped`` there, while
+    deriving from ``cause`` alone reports that routine stop as a failure.
+    ``detail`` carries the specific reason where ``cause`` is a coarse bucket.
+
+    An absent tombstone means nothing recorded an ending. The orphan reconciler
+    writes one at startup, so that is a narrow window rather than a terminal
+    state, and it is reported without an error rather than as a failure. A
+    tombstone that is PRESENT but unreadable is the opposite case: an ending was
+    recorded and cannot be read, which is reported as an unknown cause.
+    """
+    tombstone, present = _read_tombstone_at(agent_dir / "tombstone.json")
+    if tombstone is None:
+        if present:
+            return "failed", "Orphaned (unknown cause)", False
+        return "completed", "", False
+    recorded = tombstone.get("outcome")
+    cause = str(tombstone.get("cause") or "")
+    if recorded in _PANEL_OUTCOMES:
+        outcome = str(recorded)
+    elif cause == _DELIVERED_CAUSE:
+        outcome = "completed"
+    else:
+        outcome = "failed"
+    if outcome == "stopped":
+        # A stop is not an error, and the consumers drop error text for it.
+        return outcome, "", True
+    if outcome == "completed":
+        return outcome, "", False
+    detail = str(tombstone.get("detail") or "")
+    return outcome, detail or f"Orphaned: {cause or 'unknown'}", False
+
+
+def _panel_result_text(agent_dir: Path) -> str:
+    """Capped result text for a panel record, or ``""`` when unreadable."""
+    path = agent_dir / "result.txt"
+    if is_sensitive_path(str(path)):
+        return ""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            # One byte past the cap distinguishes "exactly at the cap" from
+            # "longer", so a value at the cap is not marked as cut.
+            text = handle.read(_PANEL_RESULT_CAP + 1)
+    except OSError:
+        return ""
+    return _clamp(text, _PANEL_RESULT_CAP)
+
+
+def _panel_record(agent_id: str, *, cutoff: float, include_result: bool) -> dict | None:
+    """One panel record, or ``None`` when the folder supplies no usable one."""
+    state = read_state(agent_id)
+    if state is None:
+        return None
+    if _record_memory_mode(state) != "persistent":
+        return None
+    parent_session = str(state.get("parent_session") or "")
+    if not parent_session:
+        # Without an owning conversation there is no slot to route a frame to,
+        # and an empty slot is read by older clients as the active one.
+        return None
+    try:
+        agent_dir = _agent_dir(agent_id)
+    except ValueError:
+        return None
+    app = _record_app(state)
+    if len(app) > _PANEL_APP_CAP:
+        # The id is an equality key against a slot's current owner, so a value
+        # this size is refused outright rather than clamped into a mismatch.
+        return None
+    started = _finite_time(state.get("started"))
+    tombstone, _present = _read_tombstone_at(agent_dir / "tombstone.json")
+    ended = _finite_time((tombstone or {}).get("died")) or _finite_time(state.get("updated_at"))
+    if max(started, ended) < cutoff:
+        return None
+    outcome, error, stopped = classify_persisted_ending(agent_dir)
+    record: dict = {
+        "id": agent_id,
+        "task": _clamp(str(state.get("task") or ""), _PANEL_TASK_CAP),
+        "agent": _clamp(str(state.get("agent") or ""), _PANEL_AGENT_CAP),
+        "app": app,
+        "parent_session": parent_session,
+        "started": started,
+        "elapsed": ended - started if ended > started else 0.0,
+        "outcome": outcome,
+        "error": _clamp(error, _PANEL_ERROR_CAP),
+        "stopped": stopped,
+    }
+    if include_result:
+        record["result"] = _panel_result_text(agent_dir)
+    return record
+
+
+def read_panel_records(
+    *,
+    keep: int,
+    max_age_secs: float,
+    exclude_ids: Collection[str] = (),
+    include_result: bool = False,
+) -> list[dict]:
+    """Bounded, newest-first run records for rebuilding a subagent panel.
+
+    A panel's live source is gateway memory, so a replacement gateway process
+    has nothing to show for the runs it never tracked. These records are the
+    durable half of that answer: one entry per run folder, carrying the fields a
+    terminal panel frame needs.
+
+    ``exclude_ids`` carries the ids the caller's live manager already holds.
+    Those folders are skipped, never merged: a live entry is the authority on its
+    own run, and a record here describes only a run nobody is tracking.
+
+    ``keep`` and ``max_age_secs`` bound different things -- the size of the burst
+    a caller must deliver at once, and how far back a rebuild reaches. Ages are
+    measured against the times the run itself recorded. Because a row count is
+    not a memory bound, every retained string is clamped to its own named cap and
+    a record whose text was cut carries ``truncated``.
+
+    A run whose memory mode is not ``persistent`` keeps its state in memory and
+    writes no folder, so it cannot be discovered here; a folder whose record
+    spells a non-persistent mode is skipped explicitly too, so the exclusion
+    holds whichever way the folder came to exist.
+
+    Blocking. A caller on the event loop must wrap this in
+    :func:`asyncio.to_thread`.
+    """
+    if keep <= 0:
+        return []
+    cutoff = time.time() - max_age_secs if max_age_secs > 0 else float("-inf")
+    skip = set(exclude_ids)
+    candidate_cap = max(keep, keep * _PANEL_CANDIDATE_MULTIPLE)
+    # A bounded min-heap on mtime, so the walk's own working set is capped
+    # whatever the registry holds. Folders outside the age window and ids the
+    # caller already knows are dropped HERE, before they can occupy the heap or
+    # cost a state read.
+    newest: list[tuple[float, str]] = []
+    try:
+        scan = os.scandir(_subagents_dir())
+    except OSError:
+        return []
+    with scan:
+        for entry in scan:
+            try:
+                if not entry.is_dir():
+                    continue
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff or entry.name in skip:
+                continue
+            if len(newest) < candidate_cap:
+                heapq.heappush(newest, (mtime, entry.name))
+            elif mtime > newest[0][0]:
+                heapq.heapreplace(newest, (mtime, entry.name))
+    records: list[dict] = []
+    for _mtime, agent_id in sorted(newest, reverse=True):
+        if len(records) >= keep:
+            break
+        record = _panel_record(agent_id, cutoff=cutoff, include_result=include_result)
+        if record is not None:
+            records.append(record)
+    return records
 
 
 # ── prune ────────────────────────────────────────────────────────────
