@@ -130,6 +130,7 @@ from .argv_floor import (
     _own_host_names,
     _own_host_seed,
     _own_interface_addresses,
+    _perm_verb_mention_only,
     _process_substitution_word_is_opaque,
     _proxyjump_value_targets_self,
     _push_segment_targets_protected,
@@ -179,6 +180,7 @@ from .denied_rules import (
     _LEGACY_RULE_ID_BY_PATTERN,
     _LINEARIZED_AWS_FLAG_RUN,
     _LITERAL_CONCAT_RE,
+    _PERM_VERB_MENTION_PATTERNS,
     _PRINTENV_AWS_SECRET_PATTERN,
     _RULE_ID_BY_PATTERN,
     _RULES_BY_ID,
@@ -1866,6 +1868,10 @@ def is_denied(
                 component="argv-floor",
             )
 
+    # Memoizes the argv-structural mention walk per view: the same view is asked
+    # about once per matching pattern, and there are 12 patterns that can match.
+    mention_cache: dict[str, bool] = {}
+
     # ── Pass 1: whole-string deny ──
     # If any pattern matches the full input AND no exception matches the
     # full input, deny outright.  A whole-string match that IS covered by an
@@ -1884,6 +1890,17 @@ def is_denied(
                 and _exception_eligible(lower)
                 and any(fnmatch.fnmatch(lower, e.lower()) for e in exceptions)
             )
+            if not whole_string_exception_match and _perm_verb_mention_narrows(
+                pattern, lower, mention_cache
+            ):
+                # Same shape as the glob exception above: a whole-string carve-out
+                # only DEFERS to Pass 2, which re-judges each segment on its own,
+                # so an embedded real invocation is still denied there.  The audit
+                # is emitted here (and GATES the carve-out) because for a search
+                # whose verb and path land in different segments Pass 2 never
+                # matches, so this is the only place the decision is recorded.
+                if _emit_deny_exception_event(tool_name, pattern):
+                    whole_string_exception_match = True
             if not whole_string_exception_match:
                 _emit_deny_event(tool_name, pattern, lower)
                 return _reason(pattern)
@@ -1946,7 +1963,26 @@ def is_denied(
                         exceptions
                         and _exception_eligible(view)
                         and any(fnmatch.fnmatch(view, e.lower()) for e in exceptions)
-                    ):
+                    ) or _perm_verb_mention_narrows(pattern, lower, mention_cache):
+                        # ``lower``, not ``view``: the mention reading is a
+                        # WHOLE-COMMAND judgement and a Pass 2 segment is not
+                        # always a command.  ``_split_segments`` is deliberately
+                        # quote-unaware, so a quoted alternation is severed
+                        # mid-literal and the tail arrives looking like an
+                        # invocation -- ``rg -n 'chmod|chown' /etc/profile.d``
+                        # yields the fragment ``chown' /etc/profile.d``, whose
+                        # first word IS the verb.  Judging that fragment refuses
+                        # a search that runs nothing.  Nothing is lost by asking
+                        # about the whole command instead: the predicate demands
+                        # that EVERY occurrence, in the command and in every
+                        # nested payload, sit at an argument position, and a
+                        # chained real invocation is exactly an occurrence in
+                        # program position -- ``_ends_argv`` cuts the argv at
+                        # ``;`` ``&&`` ``||`` ``|`` and at a subshell or brace
+                        # opener, so the embedded command's own verb leads its
+                        # own argv and refuses the whole exemption.  A newline
+                        # separator, which ``shlex`` would swallow as
+                        # whitespace, is refused outright by the predicate.
                         if not _emit_deny_exception_event(tool_name, pattern):
                             _emit_deny_event(tool_name, pattern, view, raw_segment=seg_lower)
                             return _reason(pattern)
@@ -2124,6 +2160,32 @@ def _emit_deny_event(
             tool_name,
             exc_info=True,
         )
+
+
+def _perm_verb_mention_narrows(
+    pattern: str,
+    view: str,
+    cache: dict[str, bool],
+) -> bool:
+    """Whether *pattern* is narrowed away on *view* by an inert-mention reading.
+
+    A thin adapter over :func:`~.argv_floor._perm_verb_mention_only`: it confines
+    the narrowing to the 13 catalog patterns that opt into it, and memoizes the
+    argv walk per view.  The walk descends every nested payload, so it is the
+    expensive half of this check while the membership test is a set lookup --
+    and ``is_denied`` asks the same question once per matching pattern, up to 13
+    times for the same text.
+
+    Returns False for every other pattern, which is what keeps this from
+    touching any rule but those 12.
+    """
+    if pattern not in _PERM_VERB_MENTION_PATTERNS:
+        return False
+    verdict = cache.get(view)
+    if verdict is None:
+        verdict = _perm_verb_mention_only(view)
+        cache[view] = verdict
+    return verdict
 
 
 def _emit_deny_exception_event(tool_name: str, deny_pattern: str) -> bool:

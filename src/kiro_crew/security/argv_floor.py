@@ -46,6 +46,7 @@ import fnmatch
 import ipaddress
 import os
 import re
+import shlex
 import socket
 import sys
 import threading
@@ -69,7 +70,7 @@ except ImportError:  # pragma: no cover - non-Linux platforms lack fcntl
 # onto the owning module's namespace, so a name bound into THIS namespace would
 # keep resolving the unpatched object and the instrument would count nothing.
 from . import shell_normalizer as _shell_normalizer
-from .denied_rules import _GIT_PUBLISH_UNGATED
+from .denied_rules import _GIT_PUBLISH_UNGATED, _PERM_VERB_MENTION_VERBS
 from .host_addresses import (  # noqa: F401  (parser re-imported as a test entry point)
     _darwin_interface_addresses,
     _linux_netlink_addresses,
@@ -83,6 +84,8 @@ from .inline_payload import (
 )
 from .shell_normalizer import (
     _AMBIGUOUS_EXPANSION_RE,
+    _CONTROL_OPERATOR_RE,
+    _DATA_CONSUMER_PROGRAMS,
     _PROCESS_SUBSTITUTION_OPENERS,
     _PYTHON_INLINE_PROGRAM_FLAGS,
     _PYTHON_OPERAND_FLAGS,
@@ -92,6 +95,7 @@ from .shell_normalizer import (
     _argv_programs,
     _backtick_closer,
     _cut_at_operator,
+    _data_consumer_command_disqualified,
     _data_consumer_exempt,
     _debracket,
     _decode_printf_escapes,
@@ -320,6 +324,282 @@ def _self_token_frames(text_lower: str) -> "list[list[str]]":
 def _shell_payload_sources(text_lower: str) -> "list[str]":
     """*text_lower* plus the source text of every nested shell payload in it."""
     return [source for source, _tokens in _shell_payload_walk(text_lower)]
+
+
+# ── Inert MENTION of a permission verb (narrows 12 chmod/chown rules only) ──
+#
+# The catalog's path-scoped ``chmod``/``chown`` rows are ``re.search`` patterns
+# over the whole command text, so they cannot tell a verb that RUNS from the
+# same word handed to a search tool as a pattern.  ``_perm_verb_mention_only``
+# supplies the missing question -- "is every occurrence of this verb an ARGUMENT
+# of a command that treats arguments as data?" -- and ``is_denied`` consults it
+# for those 12 patterns and nothing else (see ``_PERM_VERB_MENTION_PATTERNS``).
+#
+# It reuses the primitives the self-protection floor already relies on rather
+# than adding a parser: ``_shell_payload_sources`` for the frame walk (which
+# descends ``bash -c``, ``eval``, heredocs and command/process substitution to
+# any depth), ``_argv_programs`` for "which command is this token an argument
+# of", and ``_data_consumer_exempt`` for the per-token data judgement.
+#
+# Every gate below is a REFUSAL, so the predicate fails closed: a construct it
+# cannot read keeps the deny.  The ones that were reachable bypasses while this
+# was being written, each now closed:
+#
+#   * ``X=1 chmod 777 /etc/shadow`` -- ``_argv_programs`` skips the leading
+#     assignment, so the verb becomes its own command's PROGRAM and
+#     ``_data_consumer_exempt`` then reads ``programs[i] == "chmod"``, which IS
+#     in ``_DATA_CONSUMER_PROGRAMS`` (it is listed there as a filesystem mover
+#     whose own arguments are paths).  ``_PERM_VERB_MENTION_PROGRAMS`` removes
+#     the permission verbs from the accepted set, so the verb can never
+#     exonerate itself.
+#   * ``echo 'chmod 777 /etc/x' > /tmp/s.sh`` -- ``echo``/``printf`` emit their
+#     argument AS the file's content, and ``>`` is not a command separator, so
+#     exonerating them would exonerate writing the command to a script.  This is
+#     the same case ``_INERT_SEARCH_VERBS`` declined to open; the emitters and
+#     the filesystem mutators are both removed from the accepted set, and any
+#     redirect other than to ``/dev/null`` refuses outright.
+#   * ``grep -h 'chmod 777 /etc/x' f | python`` -- a downstream stage can EXECUTE
+#     what the search emitted.  ``_pipes_into_evaluator`` covers the shells;
+#     the downstream-program gate below covers the rest by requiring every
+#     program AFTER the mention to be an accepted data consumer too.
+#   * ``echo "$(bash -c 'chmod 777 /etc/x')"`` -- frame 0 reads as pure data
+#     (``echo``'s argument opens with a quote, not with the substitution), so the
+#     mention is only caught in the NESTED frame.  That is why the walk must be
+#     over every frame and why one bad frame refuses the whole exemption.
+#
+# Quoting is load-bearing in one place.  ``grep -nE 'chmod|chown|/etc/'`` hands
+# ``shlex`` a token carrying ``|``, which ``_data_consumer_exempt`` reads as a
+# control operator introducing a new program -- correct for a BARE
+# ``grep -nE chmod|chown /etc/passwd``, where bash really does run
+# ``chown /etc/passwd``.  The two are indistinguishable after POSIX quote
+# removal, so this walk tokenizes in NON-POSIX mode (quotes retained) and masks
+# operators only inside a token that is provably one SINGLE-quoted literal.
+# Single quotes are absolute in POSIX shell -- no substitution, no escape, no
+# operator -- so the mask states a fact about the shell rather than trusting the
+# spelling.  A double-quoted token gets no mask: ``"x|$(chmod 777 /etc/y)"``
+# still expands, and the mask would hide the ``|`` while the substitution ran.
+# The mask is also kept OUT of the command-level disqualification, which is
+# computed on the unmasked argv: ``awk '{print | "sh"}'`` must stay
+# disqualified, and that reading depends on the ``|`` the mask would remove.
+
+_PERM_VERB_WORD_RE = re.compile(r"\b(?:" + "|".join(sorted(_PERM_VERB_MENTION_VERBS)) + r")\b")
+
+#: Data consumers that may NOT exonerate a permission-verb mention.  Subtracted
+#: from ``_DATA_CONSUMER_PROGRAMS`` rather than replacing it, so a consumer added
+#: there in future is inherited here and a mistake in this list costs a false
+#: positive (the safe direction), never a bypass.
+#:
+#: Three reasons to be on it: the program MUTATES the filesystem (so its own
+#: arguments are a destination, and a permission verb among them is not merely
+#: text), it EMITS its argument as output (so a redirect turns the mention into
+#: a script on disk), or it SPAWNS a helper named by an option or script operand
+#: (so that operand can run code instead of remaining text).
+_PERM_VERB_MENTION_EXCLUDED_PROGRAMS: frozenset[str] = frozenset(
+    {
+        # permission verbs themselves -- a verb must never exonerate itself
+        "chmod",
+        "chown",
+        "chgrp",
+        # filesystem mutators
+        "cp",
+        "mv",
+        "ln",
+        "rm",
+        "mkdir",
+        "rmdir",
+        "touch",
+        "tee",
+        # argument emitters -- the mention becomes the output verbatim
+        "echo",
+        "printf",
+        "print",
+        # helper spawners -- an option or script operand can run another command
+        "ack",
+        "ag",
+        "awk",
+        "less",
+        "more",
+        "rg",
+        "sed",
+        "sort",
+    }
+)
+
+_PERM_VERB_MENTION_PROGRAMS: frozenset[str] = (
+    _DATA_CONSUMER_PROGRAMS - _PERM_VERB_MENTION_EXCLUDED_PROGRAMS
+)
+
+#: Longest command the mention walk will read.  This is a COST bound, not a
+#: correctness one, and it can only refuse: over the bound the deny stands, so
+#: there is nothing to bypass by padding.  It exists because the walk descends
+#: every nested payload, and the self-protection floor that shares that descent
+#: skips it for text carrying no expansion machinery (``_self_floor_can_fire``) --
+#: so without a bound a 20k command of plain words would pay a descent today's
+#: gate never pays.  A search command a human actually types is two orders of
+#: magnitude under this.
+_PERM_VERB_MENTION_MAX_CHARS = 4096
+
+#: The redirects an exonerated frame may carry.  Anything else can persist the
+#: mention (``> /tmp/s.sh``) or feed it somewhere this walk cannot see.  Matched
+#: as glued text so the spaced spelling (``> /dev/null``) is refused too --
+#: over-strict, which is the direction that cannot lose a denial.
+#:
+#: The second alternative is file-descriptor DUPLICATION (``2>&1``, ``>&2``): it
+#: points one stream at where another already goes and names no new destination,
+#: so it cannot persist the mention.  A real sink alongside it is a token of its
+#: own and is still judged on its own -- ``... > /tmp/s.sh 2>&1`` stays refused
+#: because of the first token, not the second.
+_PERM_VERB_MENTION_SINK_RE = re.compile(r">>?/dev/null|\d*>&\d+")
+
+#: File-descriptor redirection spellings that carry an ``&`` the shell does not
+#: read as a command boundary -- the asymmetry ``_ends_argv`` encodes on purpose.
+#: Stripped before the uncut-operator question so an audit may end in ``2>&1``.
+_REDIRECT_AMP_RE = re.compile(r"\d*>&\d+|&>>?")
+
+
+def _single_quoted_literal(token: str) -> bool:
+    """True if *token* is provably ONE single-quoted literal.
+
+    Requires the quote at both ends and NO single quote between them: without
+    that last condition ``'a'|'b'`` (two literals glued around a real pipe)
+    reads as one literal and its operator would be masked away.
+    """
+    return len(token) >= 2 and token[0] == "'" == token[-1] and "'" not in token[1:-1]
+
+
+def _double_quoted_literal(token: str) -> bool:
+    """True if *token* is provably ONE double-quoted literal with NO expansion.
+
+    Inside double quotes the shell reads ``;``, ``&`` and ``|`` as ordinary text,
+    so a fully double-quoted word carries no control operator -- which makes the
+    far more common spelling of an audit (``grep -rnE "<verb>|/etc/" src/``)
+    exempt for the same reason the single-quoted spelling already is.
+
+    Two conditions narrow it, and both are load-bearing:
+
+    * no ``"`` between the ends, so ``"a"|"b"`` (two literals glued around a REAL
+      pipe) cannot read as one literal -- the same trap ``_single_quoted_literal``
+      guards against;
+    * no ``$`` and no backtick anywhere inside.  Double quotes do NOT suppress
+      expansion, so ``"$(ls /etc/x& <verb> -R g+w /etc/x)"`` holds an operator the
+      shell really does act on.  Rather than parse the substitution, refuse the
+      mask whenever the machinery that could carry one is present.
+    """
+    if len(token) < 2 or token[0] != '"' or token[-1] != '"':
+        return False
+    inner = token[1:-1]
+    return '"' not in inner and "$" not in inner and "`" not in inner
+
+
+def _mask_quoted_operators(token: str) -> str:
+    """*token* with control operators neutralized inside a quoted literal.
+
+    The replacement is a word character, so it cannot introduce a boundary
+    ``_ends_argv`` or ``_data_consumer_exempt`` would read.  Any other token is
+    returned unchanged, which keeps a REAL operator visible.
+    """
+    if _single_quoted_literal(token):
+        return "'" + _CONTROL_OPERATOR_RE.sub("_", token[1:-1]) + "'"
+    if _double_quoted_literal(token):
+        return '"' + _CONTROL_OPERATOR_RE.sub("_", token[1:-1]) + '"'
+    return token
+
+
+def _uncut_control_operator(token: str) -> bool:
+    """True if *token* carries a control operator ``_ends_argv`` does not cut.
+
+    ``_ends_argv`` ends an argv on a glued ``|`` or ``;``, but on ``&`` only as a
+    token of its OWN -- deliberately, so a ``2>&1`` redirection does not read as a
+    command boundary.  That asymmetry is safe for the callers that ask "where does
+    this argv end"; it is NOT safe for this walk, which asks the opposite question
+    ("is every occurrence merely an argument").  A glued ``&`` really does start a
+    new command in bash, so ``ls /etc/x& <verb> -R g+w /etc/x`` would have every
+    later token attributed to ``ls`` and the real invocation read as inert data.
+
+    Asked on the MASKED argv, so an operator proven to sit inside a quoted literal
+    has already been neutralized and a quoted alternation keeps its exemption.
+    Phrased against the whole operator class rather than ``&`` alone: the invariant
+    this walk needs is "no operator survives unread", and pinning it to today's one
+    divergence would re-open the hole if that boundary set moves.
+
+    A REDIRECTION spelling of ``&`` is stripped before the question is asked.
+    ``2>&1``, ``>&2`` and ``&>/dev/null`` duplicate a file descriptor; none of them
+    starts a command, which is exactly why ``_ends_argv`` declines to cut there.
+    Stripping only these fixed shapes keeps the refusal on every ``&`` that is not
+    one of them, so ``ls /etc/x&2>&1 <verb> ...`` still refuses -- the bare ``&``
+    survives the strip.
+    """
+    return bool(_CONTROL_OPERATOR_RE.search(_REDIRECT_AMP_RE.sub("", token))) and not _ends_argv(
+        token
+    )
+
+
+def _perm_verb_mention_only(text_lower: str) -> bool:
+    """True if every permission-verb occurrence in *text_lower* is inert data.
+
+    "Inert" means the word sits at an ARGUMENT position of a command that
+    treats arguments as data, in the command itself AND in every nested shell
+    payload.  One occurrence in program position, one unreadable construct, or
+    one frame that fails to tokenize refuses the whole thing.
+
+    Refuses outright past ``_PERM_VERB_MENTION_MAX_CHARS``, which bounds the
+    descent's cost without weakening anything -- see that constant.
+
+    Returns False when the verb appears nowhere as a WORD.  The deny pattern can
+    match a substring (``foochmodbar /etc/x``), and answering "no occurrence, so
+    all occurrences are inert" would silently widen those inputs; refusing keeps
+    them exactly as they are today.
+    """
+    if len(text_lower) > _PERM_VERB_MENTION_MAX_CHARS:
+        return False
+    if not _PERM_VERB_WORD_RE.search(text_lower):
+        return False
+    # A newline is a command separator that ``shlex`` consumes as whitespace, so
+    # a second command on a second line would be read as arguments of the first.
+    # Pass 2 of ``is_denied`` splits on newlines, so a multi-line search is still
+    # judged line by line -- this only refuses to judge the joined text.
+    if "\n" in text_lower or "\r" in text_lower:
+        return False
+    found = False
+    for source in _shell_payload_sources(text_lower):
+        if ">" in _PERM_VERB_MENTION_SINK_RE.sub("", source):
+            return False
+        try:
+            tokens = shlex.split(source, posix=False)
+        except ValueError:
+            # Unbalanced quotes -- the argv this would produce is a guess.
+            return False
+        if not tokens:
+            continue
+        masked = [_mask_quoted_operators(token) for token in tokens]
+        # An operator this frame's argv reader cannot see is a command this walk
+        # cannot judge, so the deny stands -- see ``_uncut_control_operator``.
+        if any(_uncut_control_operator(token) for token in masked):
+            return False
+        programs = _argv_programs(masked)
+        # Computed on the UNMASKED argv on purpose -- see the block comment.
+        disqualified = _data_consumer_command_disqualified(tokens)
+        for index, token in enumerate(tokens):
+            if not _PERM_VERB_WORD_RE.search(token):
+                continue
+            found = True
+            if programs[index] not in _PERM_VERB_MENTION_PROGRAMS:
+                return False
+            if not _data_consumer_exempt(
+                index,
+                masked[index],
+                programs,
+                masked,
+                command_disqualified=disqualified,
+            ):
+                return False
+            # Nothing DOWNSTREAM of the mention may be able to execute it.
+            # Upstream stages only feed data in, so they are not checked -- that
+            # is what keeps ``git show … | grep -nE 'chmod|/etc/'`` readable.
+            for program in programs[index + 1 :]:
+                if program and program not in _PERM_VERB_MENTION_PROGRAMS:
+                    return False
+    return found
 
 
 # ── Self-protection floor short-circuit (perf) ──
