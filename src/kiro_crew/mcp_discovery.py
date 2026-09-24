@@ -387,6 +387,12 @@ class _ProbeResult:
     # MCP 2025-03-26 or later can send these, so an empty list is "not
     # available", never "declared nothing".
     tool_annotations: list[dict[str, Any]] = field(default_factory=list)
+    # The same ``readOnlyHint`` claims KEYED BY TOOL NAME, which is what a
+    # per-tool consumer needs and what ``tool_annotations`` structurally cannot
+    # give: that list throws the names away, so entry N is not provably tool N.
+    # An absent key means "no claim", never ``False``. Both fields stay —
+    # ``mcp_gateway.shareability`` deliberately compares the claims unpaired.
+    tool_read_only: dict[str, bool] = field(default_factory=dict)
     # Wall-clock companion to the monotonic ``probed_at``: monotonic drives the
     # TTL (immune to clock changes), wall-clock is what the API reports so the
     # UI can render "as of <time>". Two clocks, one write, no drift.
@@ -436,6 +442,52 @@ def probe_metadata(name: str) -> _ProbeResult | None:
     return _probe_cache.get(name)
 
 
+def _read_only_hints(tools_data: list[Any]) -> dict[str, bool]:
+    """``readOnlyHint`` per tool NAME, from one ``tools/list`` result.
+
+    Shared by both probe transports, so a server's hint does not depend on
+    whether it is spoken to over stdio or HTTP. Only a real boolean counts: a
+    string, a number or null is not a claim and coercing it would invent one,
+    and a tool with no name cannot be keyed. Neither appears in the result.
+    """
+    return {
+        name: hint
+        for t in tools_data
+        if isinstance(t, dict)
+        and (name := t.get("name", ""))
+        and isinstance(ann := t.get("annotations"), dict)
+        and isinstance(hint := ann.get("readOnlyHint"), bool)
+    }
+
+
+def probed_tool_read_only(server_name: str, tool_name: str) -> bool | None:
+    """The server's own ``readOnlyHint`` for one tool, or ``None`` for no claim.
+
+    The single host-side reader of the keyed map, so "the server said nothing"
+    can never arrive as ``False``: ``None`` covers never probed, probed and
+    failed, probed too long ago, and probed fine but silent about this tool.
+
+    Only a probe that SUCCEEDED and is still inside the status badge's own TTL
+    is read. A failed probe preserves the previous handshake's shape
+    (``_cache_probe``) — right for showing a tool list, wrong for granting
+    anything — and a claim older than the TTL describes a server spawn since
+    replaced, which may declare differently. Neither is a reason to call a tool
+    a writer; both are reasons to have no answer.
+
+    The identity passed in must be host-stamped: the answer is only as
+    trustworthy as the name it is looked up by.
+    """
+    if not server_name or not tool_name:
+        return None
+    cached = _probe_cache.get(server_name)
+    if cached is None or cached.status != "ok":
+        return None
+    if time.monotonic() - cached.probed_at > _PROBE_TTL_SECS:
+        return None
+    hint = cached.tool_read_only.get(tool_name)
+    return hint if isinstance(hint, bool) else None
+
+
 def _cache_probe(server: McpServerInfo) -> None:
     """Store probe result in cache.
 
@@ -469,6 +521,7 @@ def _cache_probe(server: McpServerInfo) -> None:
     if probe_failed and prior is not None:
         tools = list(prior.tools)
         tool_annotations = [dict(a) for a in prior.tool_annotations]
+        tool_read_only = dict(prior.tool_read_only)
         capabilities = dict(prior.capabilities) if isinstance(prior.capabilities, dict) else None
         protocol_version = prior.protocol_version
         server_info = dict(prior.server_info)
@@ -476,6 +529,7 @@ def _cache_probe(server: McpServerInfo) -> None:
     else:
         tools = list(server.tools)
         tool_annotations = [dict(a) for a in server.tool_annotations]
+        tool_read_only = dict(server.tool_read_only)
         capabilities = dict(server.capabilities) if isinstance(server.capabilities, dict) else None
         protocol_version = server.protocol_version
         server_info = dict(server.server_info)
@@ -491,6 +545,7 @@ def _cache_probe(server: McpServerInfo) -> None:
         protocol_version=protocol_version,
         server_info=server_info,
         tool_annotations=tool_annotations,
+        tool_read_only=tool_read_only,
         probed_at_wall=probed_at_wall,
         probe_mode=server.probe_mode,
         auth_challenge=server.auth_challenge,
@@ -701,6 +756,9 @@ class McpServerInfo:
     protocol_version: str = ""
     server_info: dict[str, Any] = field(default_factory=dict)
     tool_annotations: list[dict[str, Any]] = field(default_factory=list)
+    # ``readOnlyHint`` per tool NAME (see ``_ProbeResult.tool_read_only``). Only
+    # tools the server made the claim for appear; an absent key is "no claim".
+    tool_read_only: dict[str, bool] = field(default_factory=dict)
     # How the current ``status``/``tools`` were established. "handshake" is a
     # real spawn + initialize + tools/list round trip; "declared" is the
     # in-process fallback for a managed server whose probe could not spawn —
@@ -1801,6 +1859,7 @@ async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
                 server.tools = [
                     name for t in tools_data if isinstance(t, dict) and (name := t.get("name", ""))
                 ]
+                server.tool_read_only = _read_only_hints(tools_data)
 
         server.status = "ok"
     except asyncio.TimeoutError:
@@ -2385,6 +2444,7 @@ async def probe_server(
             for t in tools_data
             if isinstance(t, dict) and isinstance(ann := t.get("annotations"), dict)
         ]
+        server.tool_read_only = _read_only_hints(tools_data)
 
         server.status = "ok"
 
