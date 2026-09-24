@@ -1351,10 +1351,10 @@ the four where `rewind` does not yet, so nobody reads them as already shared:
   something else has taken `slot.task`, committing would run this handler's turn
   alongside whatever now owns the slot — two concurrent turns writing one
   window). Any of the three refuses with a retryable 503.
-- **The durable write is NOT covered by that predicate, and the gap is open.**
-  Every call to the commit predicate above happens AFTER the save has settled, so
-  for the file it is a post-mortem: it can refuse the live commit and the
-  dispatch, and it cannot un-truncate a transcript that has already been
+- **The commit predicate does not cover the durable write; the CLOSE path orders
+  it instead.** Every call to the commit predicate above happens AFTER the save
+  has settled, so for the file it is a post-mortem: it can refuse the live commit
+  and the dispatch, and it cannot un-truncate a transcript that has already been
   replaced. The truncated window is frozen against ONE slot incarnation, and a
   same-name close-and-recreate can be published inside the executor wait, after
   every check the handler can run on the loop. Such a recreate resuming the same
@@ -1367,9 +1367,72 @@ the four where `rewind` does not yet, so nobody reads them as already shared:
   not need the replacement published before the check, only that it READS the
   file after the write commits. The save holds the per-session lock across its
   whole read-modify-write, so a replacement published during the write waits and
-  then hydrates from the truncated content. Closing it needs slot publication to
-  be ordered against the persistence commit, and no such contract exists between
-  the registry and the persistence layer today. Tracked in issue #12090.
+  then hydrates from the truncated content.
+  Closing it needs slot publication ordered against the persistence commit, and
+  that ordering exists at the retraction that hands a reused name to a
+  replacement: **`close_slot`**. It fences the slot with `begin_close`, waits for
+  the slot's registered **guarded writes** — a truncating save, meaning one
+  carrying an authorized `expected_history_key` — and only then pops the name.
+  The registry `slot._guarded_history_writes` holds the writes' executor FUTURES,
+  not a count, because a count released in an awaiter's `finally` reads zero the
+  moment that awaiter is cancelled while its worker thread runs on to the rename.
+  `save_slot_off_loop` registers every guarded write it dispatches;
+  `chat_rewind.api_chat_slot_rewind` calls `register_guarded_history_write` on
+  its own `asyncio.to_thread` save, which is the one truncating write that does
+  not go through that helper.
+  A registered write must never be cancelled by its own handler. Cancelling it
+  makes the task DONE, the done callback drops it from the registry, and the
+  worker thread runs on to the rename with nothing left to order against it --
+  the same hole, reached from the cancellation path instead of the dispatch one.
+  So every await on a registered task is shielded, including the awaits in a
+  cancellation drain, and each drain is bounded (`_SAVE_DRAIN_ATTEMPTS`) so a
+  cancel storm cannot spin. A task that never settles stays pending and stays
+  registered, which is what the close needs.
+  The pair is decidable in BOTH directions because each dispatch seam re-reads
+  the fence with no suspension between the read and the registration: either the
+  fence is up and the write refuses, or the write is registered and the close
+  waits for it. A write that outlasts the 5-second ceiling **refuses the close**
+  (`SlotCloseError` code `history_write_running`); the tab stays open and
+  retryable rather than having its name retracted with a thread still writing.
+  `close_slot` is the only retraction that WAITS, because it is the only one
+  obliged to finish — the person asked for it.
+  The fence itself is a DEPTH, not a flag, because two retractions can overlap
+  on one slot: the close suspends inside its wait and the sweep can reach the
+  same slot meanwhile. With a shared flag, whichever finished first cleared the
+  fence for both, and the other's remaining awaits ran unfenced — which is the
+  window the fence exists to close, since the dispatch-seam re-reads read
+  exactly this value. Counting means each holder releases only its own
+  acquisition; `cancel_close` floors at zero so an unmatched release cannot make
+  a later `begin_close` read as not-closing. The sweep additionally skips a slot
+  that is already closing, BEFORE raising its own fence, since after that it
+  could not tell its acquisition from the other holder's.
+  The bulk stale-slot sweep pops each slot itself and is fenced too, but it
+  DEFERS instead of waiting. Staleness is judged from last recorded activity,
+  and a truncating save's HANDLER can be in flight far longer than its worker
+  thread — a rewind on a conversation nobody has touched for days is admitted,
+  awaits its native teardown, and only then dispatches — so a stale slot can
+  carry a guarded write. A pending guarded write is itself proof the tab is not
+  idle, whatever its timestamps say, so the sweep reads the registry
+  SYNCHRONOUSLY behind the fence and leaves such a slot for the next sweep,
+  reporting it in `failed`. Waiting there would be worse than useless: the
+  handlers that produce a guarded write publish a task on the same slot in the
+  same breath, so a wait would hold the sweep open exactly while the tab is
+  being edited and the pop after it would cancel that turn. Deferring removes
+  that window by construction, and the fence is what makes the synchronous
+  read sound: with it up no new guarded write can be dispatched, so an empty
+  reading stays empty through the pop. There is deliberately NO await between
+  that fence and that pop. The sweep also releases the fence itself where a
+  failed archive restores the slot, since it has no `close_slot` wrapper to do
+  that for it.
+  Residuals, deliberately: `_materialise_slot_from_history` publishes a slot
+  rebuilt from disk rather than retracting a live one, so it keeps only the
+  narrower in-lock `expected_slot_name` re-read. The history-delete pop in
+  `handlers/sessions.py` needs no wait for a different reason: `delete_session`
+  unlinks under the SAME `_locked` region the save takes, so the **delete-won
+  guard** refuses the write outright instead of resurrecting the transcript.
+  Making registration automatic at the `_save_slot_to_history` layer, so a new
+  truncating caller cannot opt out, and making `pop_slot` an enforced chokepoint
+  rather than a facade, are tracked in issue #12090.
 - **The periodic dirty-slot flush is excluded for the whole rewrite.** Because
   the live slot keeps the full window until the commit, a flush tick can snapshot
   that stale window, block behind the rewrite on the per-session history lock,
@@ -1384,6 +1447,12 @@ the four where `rewind` does not yet, so nobody reads them as already shared:
   *wrapper* rather than the inner future is what keeps the exclusion held: a
   cancellation reaching the shield leaves the coroutine running, so its `finally`
   cannot release the flag early.
+  That counter and `_guarded_history_writes` are different mechanisms with
+  different consumers and are not interchangeable: the counter answers
+  `flush_slot_now`, whose question is whether the periodic writer may start, and
+  an awaiter's cancellation lowering it early is the correct answer there. The
+  close's question is whether the worker THREAD has returned, which only the
+  future can answer.
 - **The cancellation drain survives REPEATED cancellation.** The worker thread
   cannot be interrupted, so once the rewrite starts it lands whether the handler
   lives or not; the handler therefore has to learn the outcome and commit to
