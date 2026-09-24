@@ -8425,7 +8425,11 @@
       "ask_agent_history": "Agent zum Verlauf fragen"
     },
     "workspaceTree": {
-      "status_failed": "Der Repository-Status konnte nicht gelesen werden."
+      "status_failed": "Der Repository-Status konnte nicht gelesen werden.",
+      "row_empty": "Leerer Ordner",
+      "row_hidden_only": "Keine sichtbaren Dateien",
+      "row_truncated": "Dateien nicht angezeigt: Dateilimit erreicht",
+      "row_unreadable": "Ordner nicht lesbar"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",

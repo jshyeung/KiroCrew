@@ -8540,7 +8540,11 @@
       "ask_agent_history": "Interroger l’agent sur l’historique"
     },
     "workspaceTree": {
-      "status_failed": "Impossible de lire l’état du dépôt."
+      "status_failed": "Impossible de lire l’état du dépôt.",
+      "row_empty": "Dossier vide",
+      "row_hidden_only": "Aucun fichier visible",
+      "row_truncated": "Fichiers non affichés : limite de fichiers atteinte",
+      "row_unreadable": "Impossible de lire le dossier"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",

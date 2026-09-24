@@ -35,13 +35,19 @@ import {
 } from '../utils/gitStatusError'
 import { normalizeWindowsPath } from '../utils/fileTokens'
 import { errMessage } from '../utils/thunkError'
+import { PIERRE_TREE_STATE_ROW_CSS } from './config'
 import { recallExpandedPaths, rememberExpandedPaths } from './treeExpansionMemory'
+import { planTreeStateRows, type TreeStateRowKind, type TreeStateRowLabels } from './treeStateRows'
 import { TreeSkeleton } from './tree'
 
 /** The kind vocabulary the composer's `@`-mention plumbing speaks: a file is
  *  staged + tokenized, a folder becomes a bare `@rel/` reference. Narrower than
  *  Pierre's `'directory' | 'file'`, so map at the boundary. */
 type TreeEntryKind = 'file' | 'dir'
+
+/** What the state-row guards read while a mode has no state rows (changed
+ *  mode, or the listing not yet answered). */
+const NO_STATE_ROWS: ReadonlyMap<string, TreeStateRowKind> = new Map()
 
 /** Row-level right-click menu for Pierre's `context-menu` slot -- rendered via a
  *  `document.body` PORTAL rather than into the slot itself. Pierre owns the
@@ -348,6 +354,29 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   truncatedDirectoriesRef.current = new Set(tree?.truncatedDirectories ?? [])
   const truncatedDirectoriesKey = (tree?.truncatedDirectories ?? []).join('\n')
 
+  // The state row under a childless folder (see `./treeStateRows`). A language
+  // switch re-renders this component without remounting it (LanguageProvider
+  // repaints with `cloneElement`), so the labels are read every render and the
+  // memo is keyed on the strings: a new object only when a label changes, which
+  // is what re-plans the rows -- and nothing else, since the `paths` memo below
+  // feeds `resetPaths`. The stylesheet does not depend on them (`./config`).
+  const rowEmpty = i18nT('components.workspaceTree.row_empty')
+  const rowHiddenOnly = i18nT('components.workspaceTree.row_hidden_only')
+  const rowUnreadable = i18nT('components.workspaceTree.row_unreadable')
+  const rowTruncated = i18nT('components.workspaceTree.row_truncated')
+  const stateRowLabels = useMemo<TreeStateRowLabels>(
+    () => ({
+      empty: rowEmpty,
+      'hidden-only': rowHiddenOnly,
+      unreadable: rowUnreadable,
+      truncated: rowTruncated,
+    }),
+    [rowEmpty, rowHiddenOnly, rowUnreadable, rowTruncated],
+  )
+  // Which model paths are state rows, for the selection and context-menu
+  // guards. A ref because both read it from callbacks Pierre holds.
+  const stateRowsRef = useRef<ReadonlyMap<string, TreeStateRowKind>>(NO_STATE_ROWS)
+
   const { model } = useFileTree({
     paths: [],
     // Changed mode holds a handful of paths — show them all; the full
@@ -364,6 +393,8 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     // for keyboards), the affordance shown only when the row is hovered/focused
     // so a narrow rail stays uncluttered.
     composition: { contextMenu: { triggerMode: 'both', buttonVisibility: 'when-needed' } },
+    // State rows read as a status line, not a file (see `./config`).
+    unsafeCSS: PIERRE_TREE_STATE_ROW_CSS,
     renderRowDecoration: ({ item }) => {
       const path = item.path.replace(/\/$/, '')
       if (item.kind !== 'directory' || !truncatedDirectoriesRef.current.has(path)) return null
@@ -400,27 +431,35 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   // The rendered path set: the whole workspace, or just the changed files —
   // the SAME tree component either way, so both modes share look, keyboard
   // model, search, and git-status lanes.
-  const paths = useMemo<string[]>(
-    () =>
-      mode === 'changed'
-        ? statusEntries.map(e => e.path)
-        : // The full-workspace list can still carry a duplicate — e.g. two
-          // genuinely different paths that collapse to the same string once
-          // egress redaction flattens a differing segment. @pierre/trees
-          // `appendPresortedPaths` throws 'Duplicate path' on adjacent
-          // identical entries, and that throw is uncaught inside the
-          // resetPaths useLayoutEffect below, taking down the whole route.
-          // De-dup here (preserving order + first occurrence, mirroring the
-          // `changed` branch's statusEntries seen-Set) so a duplicate degrades
-          // to a single (missing) row instead of a render crash. Explicit
-          // trailing-slash paths keep directory rows even when every direct
-          // file in that directory fell beyond the file budget.
-          Array.from(new Set([
-            ...(tree?.paths ?? []),
-            ...(tree?.directories ?? []).map(path => `${path.replace(/\/$/, '')}/`),
-          ])),
-    [mode, statusEntries, tree],
+  //
+  // In `all` mode a folder with nothing beneath it gets ONE state row
+  // (`./treeStateRows`): expanding it must never show a down-chevron over
+  // nothing, and the row must say which kind of nothing it is. Changed mode
+  // needs none — every folder there is the parent of a changed file.
+  const stateRows = useMemo(
+    () => (mode === 'changed' || !tree ? null : planTreeStateRows(tree, stateRowLabels)),
+    [mode, tree, stateRowLabels],
   )
+  stateRowsRef.current = stateRows?.kinds ?? NO_STATE_ROWS
+  const paths = useMemo<string[]>(() => {
+    if (mode === 'changed') return statusEntries.map(e => e.path)
+    // The full-workspace list can still carry a duplicate — e.g. two
+    // genuinely different paths that collapse to the same string once
+    // egress redaction flattens a differing segment. @pierre/trees
+    // `appendPresortedPaths` throws 'Duplicate path' on adjacent
+    // identical entries, and that throw is uncaught inside the
+    // resetPaths useLayoutEffect below, taking down the whole route.
+    // De-dup here (preserving order + first occurrence, mirroring the
+    // `changed` branch's statusEntries seen-Set) so a duplicate degrades
+    // to a single (missing) row instead of a render crash. Explicit
+    // trailing-slash paths keep directory rows even when every direct
+    // file in that directory fell beyond the file budget.
+    const listed = Array.from(new Set([
+      ...(tree?.paths ?? []),
+      ...(tree?.directories ?? []).map(path => `${path.replace(/\/$/, '')}/`),
+    ]))
+    return stateRows ? [...listed, ...stateRows.paths] : listed
+  }, [mode, statusEntries, tree, stateRows])
   const ready = mode === 'changed' ? status != null : tree != null
 
   // The row-decoration callback reads a ref because Pierre creates the model
@@ -586,6 +625,14 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
       if (!focused || focused.isDirectory()) return
       const selected = model.getSelectedPaths()
       if (selected.length !== 1 || selected[0] !== focused.getPath()) return
+      // A state row is a status line the model holds as a file: nothing to
+      // open, and it must not keep the selected wash of a row that reads as
+      // chosen. Deselecting notifies again; that turn finds no selection and
+      // returns above.
+      if (stateRowsRef.current.has(focused.getPath())) {
+        focused.deselect()
+        return
+      }
       const abs = `${root}/${focused.getPath()}`
       // The host's own open file: this selection is the echo effect above (or
       // a click on the file already open) — not a new open.
@@ -609,16 +656,34 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   const treeItemsRef = useRef(treeItems)
   treeItemsRef.current = treeItems
   const renderContextMenu = useCallback(
-    (item: FileTreeContextMenuItem, ctx: FileTreeContextMenuOpenContext) => (
-      <TreeContextMenu
-        item={item}
-        context={ctx}
-        root={rootRef.current}
-        onAddToContext={onAddToContextRef.current}
-        contribItems={treeItemsRef.current}
-        onError={setActionError}
-      />
-    ),
+    (item: FileTreeContextMenuItem, ctx: FileTreeContextMenuOpenContext) => {
+      // A state row has no path to act on: render nothing, the same way a
+      // directory with no action renders none (see the FileTree prop below).
+      // Reached from the keyboard trigger only -- the stylesheet already keeps
+      // the pointer off the row. Rendering nothing is not enough on its own:
+      // Pierre enters its menu-open state BEFORE it asks for the content, and
+      // while that state holds it swallows every key but Escape, so a null
+      // render alone would strand a Shift+F10 user behind an invisible menu.
+      // Close the request too -- deferred, because the React `<FileTree>`
+      // binding calls this renderer while rendering its own slotted children
+      // (it strips Pierre's `composition.render` and hands the result over as a
+      // child), and `close` sets state on Pierre's tree view, a different
+      // component: synchronous, that is a setState during another render.
+      if (stateRowsRef.current.has(item.path)) {
+        queueMicrotask(() => ctx.close())
+        return null
+      }
+      return (
+        <TreeContextMenu
+          item={item}
+          context={ctx}
+          root={rootRef.current}
+          onAddToContext={onAddToContextRef.current}
+          contribItems={treeItemsRef.current}
+          onError={setActionError}
+        />
+      )
+    },
     [],
   )
 
@@ -652,6 +717,9 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
 
   // Data still in flight: an empty tree is indistinguishable from an empty
   // workspace, so show shimmer rows until the first payload decides which.
+  // A FAILED listing never reaches this component: every host gates it on
+  // `useTreeState` (FileBrowserRail), which reads the same query and renders
+  // its own "Couldn't load the file tree" + Refresh in the tree's place.
   if (!ready) {
     return <TreeSkeleton />
   }

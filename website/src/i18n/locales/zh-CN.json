@@ -8310,7 +8310,11 @@
       "ask_agent_history": "就历史询问代理"
     },
     "workspaceTree": {
-      "status_failed": "无法读取仓库状态。"
+      "status_failed": "无法读取仓库状态。",
+      "row_empty": "空文件夹",
+      "row_hidden_only": "没有可见文件",
+      "row_truncated": "未显示文件：已达到文件数量上限",
+      "row_unreadable": "无法读取文件夹"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",

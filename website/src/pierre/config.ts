@@ -12,6 +12,8 @@
  */
 import type { BaseCodeOptions, BaseDiffOptions, HunkSeparators, ThemesType, ThemeTypes } from '@pierre/diffs'
 
+import { STATE_ROW_MARKER } from './treeStateRows'
+
 /** Diff options as our surfaces use them: the deprecated `custom` hunk
  *  separator (a function renderer) is excluded so the shape stays assignable
  *  to Pierre's component-level `FileDiffOptions`. */
@@ -92,6 +94,29 @@ export const PIERRE_WRAP_NO_HSCROLL_CSS = `
  *  (`scripts/capture-pierre-caret-align.mjs` prints both). */
 export const PIERRE_EDIT_CARET_ALIGN_CSS = `
 [data-code]{padding-top:0}
+`
+
+/** Styles the workspace tree's STATE rows -- the one row the tree puts under a
+ *  childless expanded folder (see `./treeStateRows`). Pierre has no slot for
+ *  such a row, so the tree feeds each one to the model as a synthetic child
+ *  whose basename is the label followed by `STATE_ROW_MARKER`; this selects
+ *  those rows by that marker -- never by the label, which a real file can share
+ *  and which follows the active language while this sheet is fixed at model
+ *  construction -- and makes them read as a status line rather than a file:
+ *  muted text, no file glyph (the lane stays, so the label keeps the child
+ *  indentation), and no pointer response -- no hover wash, no click, no "..."
+ *  menu affordance. Keyboard focus still reaches the row like any treeitem;
+ *  the wrapper's selection guard keeps Enter from opening it. Applied through
+ *  `unsafeCSS` (`@layer unsafe`, outranking the library's `@layer base`).
+ *
+ *  Deliberately NOT italic: Pierre paints a label as two `overflow: hidden`
+ *  spans around its middle-truncation point, and an oblique glyph's overhang is
+ *  clipped at each span's edge -- "file" rendered as "tile" in the capture. */
+const STATE_ROW = `[data-type="item"][data-item-path$="${STATE_ROW_MARKER}"]`
+export const PIERRE_TREE_STATE_ROW_CSS = `
+${STATE_ROW}{pointer-events:none;color:var(--trees-fg-muted)}
+${STATE_ROW} [data-item-section="icon"]{visibility:hidden}
+${STATE_ROW} [data-item-section="action"]{display:none}
 `
 
 /** Highlighting worker pool size. Each worker is spawned eagerly at pool

@@ -8540,7 +8540,11 @@
       "ask_agent_history": "Preguntar al agente sobre el historial"
     },
     "workspaceTree": {
-      "status_failed": "No se pudo leer el estado del repositorio."
+      "status_failed": "No se pudo leer el estado del repositorio.",
+      "row_empty": "Carpeta vacía",
+      "row_hidden_only": "No hay archivos visibles",
+      "row_truncated": "Archivos no mostrados: límite de archivos alcanzado",
+      "row_unreadable": "No se puede leer la carpeta"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",

@@ -8425,7 +8425,11 @@
       "ask_agent_history": "इतिहास के बारे में एजेंट से पूछें"
     },
     "workspaceTree": {
-      "status_failed": "रिपॉज़िटरी की स्थिति पढ़ी नहीं जा सकी।"
+      "status_failed": "रिपॉज़िटरी की स्थिति पढ़ी नहीं जा सकी।",
+      "row_empty": "खाली फ़ोल्डर",
+      "row_hidden_only": "कोई दृश्यमान फ़ाइल नहीं",
+      "row_truncated": "फ़ाइलें नहीं दिखाई गईं: फ़ाइल सीमा पूरी हो गई",
+      "row_unreadable": "फ़ोल्डर पढ़ा नहीं जा सकता"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",

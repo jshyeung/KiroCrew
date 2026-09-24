@@ -8655,7 +8655,11 @@
       "ask_agent_history": "Спросить агента об истории"
     },
     "workspaceTree": {
-      "status_failed": "Не удалось прочитать состояние репозитория."
+      "status_failed": "Не удалось прочитать состояние репозитория.",
+      "row_empty": "Пустая папка",
+      "row_hidden_only": "Нет видимых файлов",
+      "row_truncated": "Файлы не показаны: достигнут лимит файлов",
+      "row_unreadable": "Папка недоступна для чтения"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",

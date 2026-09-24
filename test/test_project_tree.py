@@ -11,8 +11,41 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from conftest import requires_symlinks
 from kiro_crew.dashboard.handlers import api_project_tree
 from kiro_crew.security.redaction import _PATH_SEGMENT_DISCRIMINATOR_SEP, _path_segment_label
+
+
+def _can_deny_directory_read() -> bool:
+    """PROBE, never a platform guess: does mode 000 stop this process listing a directory?
+
+    It does not for root (DAC is bypassed), on Windows (``chmod`` touches only the
+    read-only attribute, which does not govern listing) or on a filesystem that
+    ignores POSIX mode bits -- and each of those hosts would see the unreadable
+    directory read fine and the test fail for a reason unrelated to the handler.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        locked = os.path.join(tmp, "locked")
+        os.mkdir(locked)
+        try:
+            os.chmod(locked, 0)
+            try:
+                with os.scandir(locked):
+                    return False
+            except PermissionError:
+                return True
+            except OSError:
+                return False
+        finally:
+            os.chmod(locked, 0o700)
+
+
+requires_unreadable_directories = pytest.mark.skipif(
+    not _can_deny_directory_read(),
+    reason="mode 000 does not deny a directory listing here (root, Windows, or a lax filesystem)",
+)
 
 
 class _Slot:
@@ -370,6 +403,117 @@ class TestProjectTree:
         assert data["directories"] == ["docs", "empty"]
         assert data["truncated"] is False
         assert data["truncatedDirectories"] == []
+
+    @pytest.mark.asyncio
+    async def test_walk_reports_directories_left_childless_by_its_own_filter(
+        self, plain_project, mock_sel
+    ):
+        """A folder holding ONLY entries the walk drops (dot-directories, tooling
+        caches) comes back as a directory row with nothing beneath it, exactly
+        like a folder that is empty on disk. The tree draws a state row under a
+        childless folder, and that row may only call the folder empty when it
+        is: ``hiddenOnlyDirectories`` names the ones that are not.
+        """
+        plain = plain_project
+        (plain / "_bg" / ".kiro").mkdir(parents=True)
+        (plain / "_bg" / ".kiro" / "agent.json").write_text("{}")
+        (plain / "caches" / "node_modules").mkdir(parents=True)
+        (plain / "empty").mkdir()
+        # A hidden entry beside a listed file or a kept subfolder is not the
+        # reported case: that folder has rows beneath it.
+        (plain / "mixed" / ".hidden").mkdir(parents=True)
+        (plain / "mixed" / "kept.txt").write_text("x")
+        (plain / "nested" / ".hidden").mkdir(parents=True)
+        (plain / "nested" / "sub").mkdir()
+
+        async with TestClient(TestServer(_make_app(str(plain)))) as client:
+            resp = await client.get(f"/api/project/tree?path={plain}")
+            data = await resp.json()
+
+        assert data["hiddenOnlyDirectories"] == ["_bg", "caches"]
+        # Every one of them is still a directory row -- the folder is shown,
+        # only its emptiness is qualified.
+        assert set(data["hiddenOnlyDirectories"]) <= set(data["directories"])
+        assert "empty" in data["directories"]
+        assert data["paths"] == ["mixed/kept.txt"]
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_walk_reports_a_folder_holding_only_a_directory_symlink_as_hidden_only(
+        self, plain_project, mock_sel
+    ):
+        """A symlink to a directory is listed among the walk's subdirectories but
+        never descended (``followlinks`` is off), so it becomes neither a row nor
+        a parent: one more entry the listing hides, not an empty folder.
+        """
+        plain = plain_project
+        (plain / "releases").mkdir(parents=True)
+        (plain / "releases" / "kept.txt").write_text("x")
+        (plain / "linked").mkdir()
+        os.symlink(plain / "releases", plain / "linked" / "current", target_is_directory=True)
+
+        async with TestClient(TestServer(_make_app(str(plain)))) as client:
+            resp = await client.get(f"/api/project/tree?path={plain}")
+            data = await resp.json()
+
+        assert data["hiddenOnlyDirectories"] == ["linked"]
+        assert "linked" in data["directories"]
+        assert "linked/current" not in data["directories"]
+        assert data["paths"] == ["releases/kept.txt"]
+
+    @requires_unreadable_directories
+    @pytest.mark.asyncio
+    async def test_walk_lists_a_kept_directory_it_could_not_read(self, plain_project, mock_sel):
+        """``os.walk`` skips a subdirectory whose ``scandir`` fails (permission
+        denied) WITHOUT yielding it, so a kept, non-symlink child that cannot be
+        read would leave no trace: its parent has no row beneath it, is not
+        hidden-only (the child is no symlink), and the tree would call the parent
+        an empty folder -- a lie, ``ls`` shows the child. The unreadable directory
+        is instead a row of its own, named in ``unreadableDirectories`` so the
+        state row beneath IT says why nothing shows, and the parent is not
+        childless at all. Its files are never listed: nothing read them.
+        """
+        plain = plain_project
+        locked = plain / "vault" / "locked"
+        locked.mkdir(parents=True)
+        (locked / "inside.txt").write_text("x")
+        (plain / "open").mkdir()
+        (plain / "open" / "kept.txt").write_text("x")
+        os.chmod(locked, 0)
+        try:
+            async with TestClient(TestServer(_make_app(str(plain)))) as client:
+                resp = await client.get(f"/api/project/tree?path={plain}")
+                data = await resp.json()
+        finally:
+            os.chmod(locked, 0o700)
+
+        # The folder is shown, in walk order; without it ``vault`` is a directory
+        # row with nothing beneath it and no qualifier -- the "Empty folder" lie.
+        assert data["directories"] == ["open", "vault", "vault/locked"]
+        assert data["unreadableDirectories"] == ["vault/locked"]
+        assert data["hiddenOnlyDirectories"] == []
+        assert data["paths"] == ["open/kept.txt"]
+        assert data["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_git_listing_reports_no_hidden_only_directories(self, repo, mock_sel):
+        """Inside a repository a directory row exists only as the parent of a
+        listed file, so an ignored-only folder is absent rather than childless
+        -- the list is empty by construction, and present so the payload shape
+        does not depend on which branch answered. ``unreadableDirectories`` is
+        empty for the same reason: ``--others`` cannot scan a directory git
+        cannot read, so it contributes no untracked file and, with no indexed
+        file beneath it, is absent rather than childless; an indexed path
+        beneath it still comes from the index and makes it a populated row."""
+        (repo / "logs").mkdir()
+        (repo / "logs" / "ignored.log").write_text("nope\n")
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/tree?path={repo}")
+            data = await resp.json()
+        assert data["repo"] is True
+        assert data["hiddenOnlyDirectories"] == []
+        assert data["unreadableDirectories"] == []
+        assert "logs" not in data["directories"]
 
     @pytest.mark.asyncio
     async def test_cap_does_not_drop_the_whole_tracked_block(self, tmp_path, mock_sel, monkeypatch):

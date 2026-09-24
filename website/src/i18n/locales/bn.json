@@ -8425,7 +8425,11 @@
       "ask_agent_history": "ইতিহাস সম্পর্কে এজেন্টকে জিজ্ঞাসা করো"
     },
     "workspaceTree": {
-      "status_failed": "রিপোজিটরির অবস্থা পড়া যায়নি।"
+      "status_failed": "রিপোজিটরির অবস্থা পড়া যায়নি।",
+      "row_empty": "খালি ফোল্ডার",
+      "row_hidden_only": "কোনো দৃশ্যমান ফাইল নেই",
+      "row_truncated": "ফাইল দেখানো হয়নি: ফাইল সীমা পূর্ণ হয়েছে",
+      "row_unreadable": "ফোল্ডার পড়া যায় না"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",

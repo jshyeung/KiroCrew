@@ -8540,7 +8540,11 @@
       "ask_agent_history": "Perguntar ao agente sobre o histórico"
     },
     "workspaceTree": {
-      "status_failed": "Não foi possível ler o estado do repositório."
+      "status_failed": "Não foi possível ler o estado do repositório.",
+      "row_empty": "Pasta vazia",
+      "row_hidden_only": "Nenhum arquivo visível",
+      "row_truncated": "Arquivos não exibidos: limite de arquivos atingido",
+      "row_unreadable": "Não é possível ler a pasta"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",

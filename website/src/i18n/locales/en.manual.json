@@ -3179,7 +3179,11 @@
       "ask_agent_history": "Ask the agent about the history"
     },
     "workspaceTree": {
-      "status_failed": "Couldn’t read the repository status."
+      "status_failed": "Couldn’t read the repository status.",
+      "row_empty": "Empty folder",
+      "row_hidden_only": "No visible files",
+      "row_truncated": "Files not shown: file limit reached",
+      "row_unreadable": "Folder not readable"
     },
     "logEntry": {
       "trace_load_failed": "Couldn’t load this run’s trace."
