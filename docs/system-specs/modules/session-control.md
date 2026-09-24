@@ -148,7 +148,42 @@ NOT seed a first message: that would be delivery.
 `session_create` also takes an optional `folder` — a folder id or `/`-separated
 human path, resolved with `chat_folder_create`'s `parent` semantics (missing
 segments created, behind the same tree-shaping gate) — and files the slot as
-part of creation (#6118). The caller's OWN slot is filed the same way with
+part of creation (#6118). A folder's project binding is agent-settable too —
+`chat_folder_create`'s `project_dir`, or `chat_folder_update` on an existing
+folder (#10432), both running the folder endpoint's own validator, never a copy —
+and a chat the person opens in a bound folder (`POST /api/chat/slots`) inherits
+the nearest ancestor's `project_dir` at creation, before its context is built.
+`chat_folder_update` clears a binding with `project_dir: ""`, and reads a JSON
+`null` as that same clear (never as the string `"None"`). A session already
+filed in the folder is not re-scoped by the change itself: it picks up the
+folder's current binding on its next agent switch — `api_chat_slot_agent`
+re-resolves the slot's folder chain through the create path's helper on every
+switch to a non-project-scope agent — and immediately through `set_project`.
+That reach is why the PATCH refuses an app's or member's `project_dir` change on
+an EXISTING folder outright (403 `folder_project_dir_forbidden`, before the
+path is validated), even on a folder it created that holds only its own folders:
+the sessions a binding reaches live in the slot table and the session archive,
+neither sharing a lock with the folder store, the archive's index carries no
+owner, and a session revives with its `folder_id` intact — so "every session
+under this folder is the caller's own" cannot be established atomically with
+the write (the same seam that refuses an app's folder delete). An agent
+principal binds a folder at CREATE, when nothing is filed in it; changing an
+existing binding is the person's. The reparent path is bound by the same rule:
+an unbound folder's subtree inherits its nearest bound ancestor, so an agent
+principal's `parent_id` change is refused (same 403, decided under the store
+lock) when the stored binding the moved folder inherits at its current place
+differs from the one at its destination — moving under a folder it bound at
+create, or out from under a binding, would rebind the person's chats filed
+inside it; a folder with a binding of its own moves freely, and so does a move
+between places with the same inherited binding. A Channels agent
+(`channel:<channel_id>:<agent_id>`) is refused a binding on both paths with the
+same 403 — `project_dir` on the create and set-or-clear on the PATCH — because
+its key names no slot and no app, so `folder_principal` would otherwise read it
+as the person; the fence is keyed on the key itself, before the path is looked
+at.
+`session_create` itself still resolves the child's project from the caller's
+workspace (`default_project_dir`), not from the folder it files into; #11680
+adds that inheritance. The caller's OWN slot is filed the same way with
 `chat_folder_file_self` (folder tools, same server): it takes no `session`
 argument, resolves the target from the verified caller key, and so can be
 granted where `chat_folder_move_session` is withheld — a conductor files itself

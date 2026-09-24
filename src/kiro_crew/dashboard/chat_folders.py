@@ -629,7 +629,11 @@ def _subtree_holds_foreign_folder(
     would otherwise relocate a folder the person nested inside it, which is the
     same violation as editing that folder directly, reached one level down.
 
-    Used by the reparent path only. Delete asks a stricter question instead --
+    Used by the reparent path. A ``project_dir`` change is not gated by this
+    test: an agent principal may not change an existing folder's binding at
+    all (see ``api_chat_folder_update``), because the sessions that binding
+    reaches live outside the folder store.
+    Delete asks a stricter question instead --
     whether the folder is EMPTY -- because a delete has more kinds of content to
     account for (sessions, and archived sessions a live scan cannot see), and
     emptiness answers all of them without an ownership test per content type.
@@ -649,6 +653,84 @@ def _subtree_holds_foreign_folder(
         if _is_descendant(folders, ancestor_id=root_id, folder_id=fid):
             return True
     return False
+
+
+def _inherited_project_dir(folders: list[dict[str, Any]], folder_id: str) -> str:
+    """The STORED ``project_dir`` a folder placed under *folder_id* would inherit.
+
+    The same nearest-ancestor walk as :func:`_resolve_folder_project_dir`, minus
+    the path validation: this is called inside the folder store's mutate
+    callback, on the event loop and under the store lock, where the validator's
+    realpath/isdir would block every other request. Stored values are compared
+    verbatim -- both sides of the comparison were written by the same validator,
+    so equal strings are the same binding and different strings are not.
+    ``""`` for the top level (an empty *folder_id*) and for a chain with no
+    binding. Cycle-guarded like every walk over ``parent_id``.
+    """
+    by_id = {str(f.get("id") or ""): f for f in folders}
+    seen: set[str] = set()
+    current = folder_id
+    while current and current not in seen:
+        seen.add(current)
+        node = by_id.get(current)
+        if node is None:
+            break
+        bound = str(node.get("project_dir") or "").strip()
+        if bound:
+            return bound
+        current = str(node.get("parent_id") or "")
+    return ""
+
+
+def _is_channel_agent_key(session_key: str) -> bool:
+    """True for a Channels agent -- a ``channel:<channel_id>:<agent_id>`` key.
+
+    A channel agent (``channel.py``) acts on words from a thread other people
+    are in, which is why ``CHANNEL_AGENT_BLOCKED_TOOLS`` keeps it from the
+    session-control verbs. Its key names no dashboard slot and no app, so
+    :func:`token_auth.folder_principal` reads it as the PERSON -- the one
+    identity the project-directory fence below does not confine. The two
+    binding paths test the key directly, mirroring ``mcp_core``'s
+    ``_deny_channel_agent_messaging``: this is the ``channel:`` namespace of
+    the Channels feature, not the messaging-transport namespaces
+    ``messaging.link.is_channel_session_key`` classifies.
+    """
+    return session_key.startswith("channel:")
+
+
+def _channel_agent_binding_refusal(
+    request: web.Request, *, operation: str, resources: str
+) -> web.Response | None:
+    """403 when a channel agent tries to set or clear a folder's binding, else None.
+
+    A folder's ``project_dir`` decides the project, cwd and steering of every
+    chat opened in it and of every filed session on its next agent switch. The
+    app/member fence on both binding paths is keyed on ``folder_principal``,
+    which is ``""`` for a channel agent -- so without this the agent would bind
+    with the person's full authority. Same status and code as that fence, so a
+    client branches on one refusal; the audit names the channel key.
+    """
+    caller_key = request.headers.get("X-Session-Key", "").strip()
+    if not _is_channel_agent_key(caller_key):
+        return None
+    sel().log_api_access(
+        caller=caller_key,
+        operation=operation,
+        outcome="denied",
+        source="channel",
+        resources=resources,
+        error="channel agent cannot set or clear a folder's project directory",
+    )
+    return web.json_response(
+        {
+            "error": (
+                "a channel agent cannot set or clear a folder's project directory - "
+                "ask the person"
+            ),
+            "code": "folder_project_dir_forbidden",
+        },
+        status=403,
+    )
 
 
 def _is_descendant(folders: list[dict], *, ancestor_id: str, folder_id: str) -> bool:
@@ -970,6 +1052,17 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
     # the person" stays the one representation (see _folder_owner_app).
     request_app = folder_principal(state, request)
     parent_id = str(body.get("parent_id") or "")
+    # A binding is the one field a channel agent may not write, at create as
+    # at update (``_channel_agent_binding_refusal``): the principal above reads
+    # a channel key as the person, so nothing downstream would refuse it. An
+    # unbound create by the same key is not this fence's concern.
+    if str(body.get("project_dir") or "").strip():
+        if (
+            refusal := _channel_agent_binding_refusal(
+                request, operation="chat.folder_create", resources=f"parent={parent_id}"
+            )
+        ) is not None:
+            return refusal
     try:
         folder = await create_folder_record(
             state,
@@ -1099,7 +1192,59 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
                 )
         changes["parent_id"] = new_parent
     if "project_dir" in body:
-        pd, err = _validate_project_dir(str(body["project_dir"] or "").strip())
+        # A channel agent first: ``request_app`` is "" for it, so the fence
+        # below would read it as the person. Same 403, refused before the path
+        # is looked at (``_channel_agent_binding_refusal``).
+        if (
+            refusal := _channel_agent_binding_refusal(
+                request, operation="chat.folder_update", resources=fid
+            )
+        ) is not None:
+            return refusal
+        if request_app:
+            # An app or crew member may not set or clear the project directory
+            # of an EXISTING folder -- not even one it owns and, by the folder
+            # test, holds only its own folders. A folder's binding is what every
+            # session filed in its subtree picks up on its next agent switch
+            # (``api_chat_slot_agent`` re-resolves the folder chain), and those
+            # sessions live in stores the folder store shares no lock with:
+            # the slot table, where the person may have filed one of their own
+            # chats into the app's folder, and the session archive, whose
+            # index carries no owner and whose sessions revive with their
+            # ``folder_id`` intact. So "every session under this folder is the
+            # caller's own" cannot be established atomically with the write --
+            # the same seam that makes an app's delete refused outright below
+            # (``api_chat_folder_delete``), and every narrower rule (a
+            # subtree-of-own-folders test, a live-slot scan) leaks through it.
+            # Refused before the path is validated: no outcome of validating it
+            # could be used. A binding is set by the person, or by an agent
+            # principal at CREATE, when the folder has no sessions yet -- and
+            # ``_apply`` below refuses the reparent that would reach the same
+            # sessions through inheritance (``binding_crossed``).
+            sel().log_api_access(
+                caller=request_app,
+                operation="chat.folder_update",
+                outcome="denied",
+                source="app_isolation",
+                resources=fid,
+                error="app cannot change an existing folder's project directory",
+            )
+            return web.json_response(
+                {
+                    "error": (
+                        "an app or crew member cannot change an existing folder's "
+                        "project directory - bind it when creating the folder, or ask "
+                        "the person"
+                    ),
+                    "code": "folder_project_dir_forbidden",
+                },
+                status=403,
+            )
+        # Off-loop, as create's call is: realpath/isdir on a stalled network
+        # path would otherwise hold every gateway task.
+        pd, err = await asyncio.to_thread(
+            _validate_project_dir, str(body["project_dir"] or "").strip()
+        )
         if err:
             return web.json_response({"error": err}, status=400)
         if pd:
@@ -1206,6 +1351,32 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
             # renders exactly as a reparent does. Checked for a move to the top
             # level too -- "" is still a move.
             return False, "foreign_descendant"
+        if (
+            request_app
+            and reparenting
+            and not str(target.get("project_dir") or "").strip()
+            and _inherited_project_dir(folders, str(target.get("parent_id") or ""))
+            != _inherited_project_dir(folders, new_parent)
+        ):
+            # The binding axis of the same rule. An agent principal may not
+            # change an EXISTING folder's ``project_dir`` (refused above the
+            # lock), because every session filed in its subtree -- live, or in
+            # the archive the folder store cannot see -- picks the binding up on
+            # its next agent switch. A reparent reaches the same sessions the
+            # same way: an UNBOUND folder's subtree resolves the nearest bound
+            # ANCESTOR, so moving it under a folder the principal bound at
+            # create (allowed -- nothing is filed in a new folder) would rebind
+            # the person's chat filed inside it, and moving it out from under a
+            # binding would clear that chat's project. So a move may not change
+            # what the moved subtree inherits: compared as the stored strings
+            # both places resolve to, under this lock. A folder with a binding
+            # of its own is exempt -- nearest wins in ``_resolve_folder_project_dir``,
+            # so its subtree resolves to it wherever it sits -- and so is a move
+            # between two places that inherit the same binding. Decided here,
+            # not above the lock, because a concurrent reparent or a person's
+            # PATCH can change what either place inherits between validation
+            # and the write. The person is not confined.
+            return False, "binding_crossed"
         target.update(changes)
         if not target.get("color"):
             target.pop("color", None)
@@ -1254,8 +1425,8 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         # Deleted between the validation above and acquiring the store lock.
         return web.json_response({"error": "not found", "code": "folder_not_found"}, status=404)
     if err in ("not_owned", "forbidden_parent", "foreign_descendant"):
-        # Distinguished in the audit, not to the caller: one code for all three
-        # keeps the response from reporting which folder was foreign.
+        # Distinguished in the audit, not to the caller: one code for all of
+        # them keeps the response from reporting which folder was foreign.
         _reason = {
             "not_owned": "app cannot change a folder it does not own",
             "forbidden_parent": "app cannot move a folder into one it does not own",
@@ -1281,6 +1452,29 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "parent folder not found", "code": "folder_parent_not_found"},
             status=400,
+        )
+    if err == "binding_crossed":
+        # The folder IS the caller's; what it may not do is move it across a
+        # binding boundary (``_apply``), so this is the binding fence's code,
+        # not the ownership one -- a client branches on the rule that refused it.
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.folder_update",
+            outcome="denied",
+            source="app_isolation",
+            resources=fid,
+            error="app cannot move a folder across what its subtree would inherit",
+        )
+        return web.json_response(
+            {
+                "error": (
+                    "an app or crew member cannot move a folder where its sessions would "
+                    "inherit a different project directory - move it between places with "
+                    "the same binding, or ask the person"
+                ),
+                "code": "folder_project_dir_forbidden",
+            },
+            status=403,
         )
     if err == "cycle":
         # A concurrent reparent moved the target under this folder while this
