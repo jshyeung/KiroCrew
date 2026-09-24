@@ -5077,6 +5077,7 @@
         "backup_kind_sessions": "Sitzungsarchiv",
         "backup_last_run": "Zuletzt gesichert {{when}} · {{size}}",
         "backup_never": "Noch nicht gesichert",
+        "backup_remembered": "Von dieser Installation erfasste Archive: {{count}} · Liste anzeigen",
         "backup_sessions_scope": "Enthält die CLI-Wiedergabeprotokolle jeder Sitzung unter diesem Kiro-Home, nicht nur der in {{productName}} gestarteten Chats.",
         "backup_run_now": "Jetzt sichern",
         "backup_running": "Wird gesichert…",

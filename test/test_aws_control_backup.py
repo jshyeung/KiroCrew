@@ -5337,3 +5337,143 @@ class TestRecordedVersionRecovery:
         assert asked == [""]
         assert result["origin"] == backup.ORIGIN_UNVERIFIED
         assert Path(result["path"]).read_bytes() == b"somebody elses archive"
+
+
+class TestRememberedArchives:
+    """The count that keeps a one-slot run record from reading as a one-archive drive.
+
+    ``runs`` holds one record per kind, so a second nightly overwrites the first
+    while both archives stay in the bucket. ``uploads`` keeps both, and
+    ``remembered_archives`` is what lets a surface say so without a paid listing.
+
+    It is a COUNT OF RECORDS and these cases pin that too: the record map is
+    bounded, it covers this install alone, and only a listing knows what the
+    drive holds.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_state(self, tmp_path, monkeypatch):
+        self.state_file = tmp_path / "backup.json"
+        monkeypatch.setattr(backup, "_state_path", lambda: self.state_file)
+        yield
+
+    def _on_disk(self) -> dict:
+        return json.loads(self.state_file.read_text(encoding="utf-8"))
+
+    def test_a_second_run_of_one_kind_is_counted_though_the_record_is_overwritten(self):
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/i1/a.tar.gz", 1, "a")
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/i1/b.tar.gz", 2, "b")
+
+        # The ledger keeps the newer run ALONE, which is the design, not the defect.
+        assert self._on_disk()["accounts"][ACCOUNT]["runs"][backup.KIND_SNAPSHOT]["key"] == (
+            "snapshots/i1/b.tar.gz"
+        )
+        # Both archives are recorded, so the count is the one reading that says so.
+        assert backup.remembered_archives(ACCOUNT)[backup.KIND_SNAPSHOT] == 2
+
+    def test_each_kind_counts_only_its_own_archives(self):
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/i1/a.tar.gz", 1, "a")
+        backup._record_run(ACCOUNT, backup.KIND_SESSIONS, "sessions/i1/s.tar.gz", 2, "s")
+
+        counts = backup.remembered_archives(ACCOUNT)
+        assert counts[backup.KIND_SNAPSHOT] == 1
+        assert counts[backup.KIND_SESSIONS] == 1
+
+    def test_every_kind_is_reported_and_an_unrecorded_kind_reads_zero(self):
+        # Unlike the sweep-stored counts beside it, this one is derived on every
+        # call: there is no "never measured" state, so absence must not be the
+        # answer for a kind that simply has nothing recorded.
+        assert backup.remembered_archives(ACCOUNT) == {
+            backup.KIND_SNAPSHOT: 0,
+            backup.KIND_SESSIONS: 0,
+        }
+        assert set(backup.remembered_archives(ACCOUNT)) == set(backup.KIND_SUBPATHS)
+
+    def test_a_legacy_key_without_an_install_segment_still_counts_for_its_kind(self):
+        # A key written before the install-id namespace carries the kind subpath
+        # and nothing else. Its archive is in the drive, so dropping it would
+        # under-report exactly the install that upgraded.
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/old.tar.gz", 1, "o")
+        assert backup.remembered_archives(ACCOUNT)[backup.KIND_SNAPSHOT] == 1
+
+    def test_a_key_under_no_known_subpath_is_counted_for_no_kind(self):
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "recovery/c.tar.gz", 1, "c")
+        assert backup.remembered_archives(ACCOUNT) == {
+            backup.KIND_SNAPSHOT: 0,
+            backup.KIND_SESSIONS: 0,
+        }
+
+    def test_a_subpath_that_only_starts_with_a_kinds_text_is_not_absorbed(self):
+        # Attribution reads the first SEGMENT, so a sibling folder whose name
+        # begins with a kind's subpath cannot be counted as that kind.
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots-old/i1/a.tar.gz", 1, "a")
+        assert backup.remembered_archives(ACCOUNT)[backup.KIND_SNAPSHOT] == 0
+
+    def test_a_push_whose_state_write_failed_is_counted(self):
+        # The archive is in the bucket whether or not the record landed, and the
+        # in-process overlay is what the ownership read already trusts for that.
+        def raiser(_state):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/i1/a.tar.gz", 1, "a")
+        with mock.patch.object(backup, "write_state", raiser):
+            backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/i1/b.tar.gz", 2, "b")
+
+        assert "snapshots/i1/b.tar.gz" not in self._on_disk()["accounts"][ACCOUNT]["uploads"]
+        assert backup.remembered_archives(ACCOUNT)[backup.KIND_SNAPSHOT] == 2
+
+    def test_the_count_reads_low_when_the_record_map_is_full(self, monkeypatch):
+        # The oldest record is dropped once the map is full, so an install that
+        # keeps pushing reports fewer archives than the drive holds. A reader
+        # cannot treat this number as an inventory.
+        monkeypatch.setattr(backup, "MAX_REMEMBERED_UPLOADS", 2)
+        for seq, name in enumerate(("a", "b", "c"), start=1):
+            backup._record_run(
+                ACCOUNT, backup.KIND_SNAPSHOT, f"snapshots/i1/{name}.tar.gz", seq, name
+            )
+
+        assert backup.remembered_archives(ACCOUNT)[backup.KIND_SNAPSHOT] == 2
+
+    def test_the_count_reads_high_once_retention_deleted_an_archive(self):
+        # The other direction, and the one a "floor" reading would get wrong.
+        # `_prune_recorded_versions` clears the version record a trusted listing
+        # proves is gone, and clears ONLY that: the `uploads` key stays, so this
+        # count keeps naming an archive the drive does not hold. The row is
+        # worded for this, and it is why only a listing can answer the question.
+        for seq, name in enumerate(("a", "b"), start=1):
+            backup._record_run(
+                ACCOUNT, backup.KIND_SNAPSHOT, f"snapshots/i1/{name}.tar.gz", seq, name
+            )
+        assert backup.remembered_archives(ACCOUNT)[backup.KIND_SNAPSHOT] == 2
+
+        keys = {"snapshots/i1/a.tar.gz", "snapshots/i1/b.tar.gz"}
+        backup._prune_recorded_versions(
+            ACCOUNT,
+            backup.KIND_SNAPSHOT,
+            "i1",
+            {"snapshots/i1/b.tar.gz"},
+            eligible=keys,
+        )
+
+        entry = self._on_disk()["accounts"][ACCOUNT]
+        # The version record for the deleted archive is gone ...
+        assert "snapshots/i1/a.tar.gz" not in entry.get("upload_versions", {})
+        # ... while its upload record survives, which is what this counts.
+        assert "snapshots/i1/a.tar.gz" in entry["uploads"]
+        assert backup.remembered_archives(ACCOUNT)[backup.KIND_SNAPSHOT] == 2
+
+    def test_a_hand_edited_record_map_reads_as_nothing_recorded_rather_than_raising(self):
+        # This value is served on a polled endpoint, so a corrupted document must
+        # not raise. A list is the pre-fingerprint shape and its keys still count.
+        backup.set_nightly(ACCOUNT, True)
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        state["accounts"][ACCOUNT]["uploads"] = ["snapshots/i1/a.tar.gz"]
+        self.state_file.write_text(json.dumps(state), encoding="utf-8")
+        assert backup.remembered_archives(ACCOUNT)[backup.KIND_SNAPSHOT] == 1
+
+        state["accounts"][ACCOUNT]["uploads"] = "not a map"
+        self.state_file.write_text(json.dumps(state), encoding="utf-8")
+        assert backup.remembered_archives(ACCOUNT) == {
+            backup.KIND_SNAPSHOT: 0,
+            backup.KIND_SESSIONS: 0,
+        }

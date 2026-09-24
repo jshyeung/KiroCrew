@@ -3829,13 +3829,20 @@ function BackupRow({
   account,
   kind,
   run,
+  remembered,
   job,
   unsupported,
   onStarted,
+  onShowArchives,
 }: {
   account: string
   kind: BackupKind
   run: BackupRun | undefined
+  /* How many archives of this kind the install still holds a record of, or
+     undefined from a backend that does not report it. A record count, not the
+     drive's contents in either direction, so the row sends the reader to the
+     list for what is actually there. */
+  remembered: number | undefined
   job: BackupJobState | undefined
   /* This host cannot produce this kind's payload at all. The manual run answers
      the same capability question and refuses with 501, so a pressable button here
@@ -3843,6 +3850,10 @@ function BackupRow({
      says why, which is the sentence a disabled button sends the reader to. */
   unsupported: boolean
   onStarted: () => void
+  /* Opens the stored-archive disclosure below, which is the only surface that
+     lists what the drive actually holds. The count line is a shortcut to it,
+     placed where the reader is already looking at a number. */
+  onShowArchives: () => void
 }) {
   const runMut = useMutation({
     mutationFn: () => awsControlApi.backupRun(account, kind),
@@ -3890,6 +3901,26 @@ function BackupRow({
             ? i18nT('apps.awsControl.console.backup_last_run', { when: fmtRelative(run.at), size: fmtBytes(run.bytes) })
             : i18nT('apps.awsControl.console.backup_never')}
         </div>
+        {/* The line above reports ONE run, because the ledger keeps one record per
+            kind: a second nightly overwrites the first while both archives stay in
+            the drive. Alone it therefore reads as a drive holding one archive. This
+            count is what the install has a record of -- not the drive's contents --
+            and it opens the list that can say more.
+
+            Rendered only when the count EXCEEDS what the line above implies: a run
+            line already accounts for one archive, so `> 1` there and `> 0` on a row
+            that shows no run at all. A row whose two lines would agree says nothing
+            the first line did not, and permanent furniture on every backed-up row
+            is not a discrepancy signal. */}
+        {remembered != null && remembered > (run ? 1 : 0) && (
+          <button
+            onClick={onShowArchives}
+            className="text-[12px] text-muted hover:text-text cursor-pointer bg-transparent border-none p-0 text-left"
+            data-testid={`backup-remembered-${kind}`}
+          >
+            {i18nT('apps.awsControl.console.backup_remembered', { count: remembered })}
+          </button>
+        )}
         {/* Two different failures share one line: a START the route refused
             (its thrown error rides along) and a RUN the server reports as its
             last outcome, whose reason arrives as text inside a 200 — so that
@@ -4125,6 +4156,9 @@ export function BackupSection({ account }: { account: string }) {
               account={account}
               kind={kind}
               run={data.runs[kind]}
+              // A floor on this kind's recorded archives, so the row can say the
+              // single run line above it is not the whole list.
+              remembered={data.rememberedArchives?.[kind]}
               // Account-scoped: this payload answers "is a backup running for THIS
               // account", which the app-scoped `_jobs/active` surface cannot.
               job={data.jobs?.[kind]}
@@ -4135,6 +4169,9 @@ export function BackupSection({ account }: { account: string }) {
               // Re-read immediately after a start, rather than waiting out the
               // poll gap and looking like the click did nothing.
               onStarted={invalidate}
+              // The same act as clicking the disclosure below: the reader asks for
+              // the listing, which is why the paid remote half stays opt-in.
+              onShowArchives={() => setShowRemote(true)}
             />
           ))}
           <div className="flex items-center justify-between gap-3 px-3 py-2.5" data-testid="backup-nightly">

@@ -749,6 +749,13 @@ STAGING_NAME_MAX_BYTES = 255
 #: key classification) have to agree on it or the namespace splits.
 KIND_SUBPATHS: dict[str, str] = {KIND_SNAPSHOT: "snapshots", KIND_SESSIONS: "sessions"}
 
+#: The reverse of :data:`KIND_SUBPATHS`, for attributing a recorded key back to
+#: the kind that wrote it. DERIVED rather than written out a second time, so a
+#: kind added to the table above cannot be missing from this one -- a missing
+#: entry would not raise, it would silently leave that kind's archives
+#: uncounted.
+_KIND_BY_SUBPATH: dict[str, str] = {sub: kind for kind, sub in KIND_SUBPATHS.items()}
+
 #: The floor, and not a style choice: at ``keep=0`` the sweep would delete the
 #: archive the run has just uploaded, so a backup would end by destroying itself.
 #: Every configured value is clamped through :func:`_clamp_retention_keep`. The
@@ -6475,6 +6482,57 @@ def retention_unrecorded(account: str) -> dict[str, Any]:
     # Shape-safe per kind for the reason :func:`retention_unclaimed` is: a polled
     # endpoint must read a hand-edited document as nothing measured rather than raise.
     return {str(kind): dict(row) for kind, row in measured.items() if isinstance(row, dict)}
+
+
+def remembered_archives(account: str) -> dict[str, int]:
+    """Per kind, how many uploaded archives this install still holds a record of.
+
+    ``{kind: int}`` for every kind in :data:`KIND_SUBPATHS`, always present: a kind
+    with no record reads 0. That is the one way it differs from
+    :func:`retention_unclaimed` and :func:`retention_unrecorded`, which are stored
+    by a sweep, so an absent kind THERE means "never measured" and a caller must
+    not read it as zero. This one is derived from the state document on every call
+    and has no unmeasured state to distinguish.
+
+    Served BESIDE :func:`last_runs`, and that pairing is the whole point. The
+    ledger holds ONE run per kind, so a second nightly overwrites the first
+    record while both archives stay in the drive -- a surface reading only the run
+    record therefore reports one archive for a prefix holding several, and an
+    operator cannot see that anything is accumulating there. This count says the
+    single run line is not the list.
+
+    A COUNT OF RECORDS, never an inventory, and it misses in BOTH directions.
+    It reads LOW when :data:`MAX_REMEMBERED_UPLOADS` drops the oldest record once
+    the map is full, and when another install wrote to the same drive, since only
+    this install's own pushes are recorded. It reads HIGH after retention: the
+    sweep deletes the object and :func:`_prune_recorded_versions` clears only the
+    ``upload_versions`` entry, so the ``uploads`` key this counts outlives the
+    archive it names -- with ``keep=3`` after ten nightlies this answers 10 while
+    the list the row's own button opens shows 3. Only a listing can say what the
+    drive really holds, and that call is the OPT-IN half of the backup status read
+    for what it costs. The row is therefore worded as a record count and hands the
+    reader to that listing rather than standing in for it.
+
+    Counted from :func:`uploaded_objects`, so it carries this process's
+    unpersisted pushes for the reason that function does: the archive is in the
+    bucket whether or not the state write landed.
+
+    A key is attributed by its FIRST segment, which is the kind's subpath -- the
+    segment, not a string prefix, so one subpath that starts with another's text
+    cannot absorb its keys. A legacy key from before the install-id namespace
+    still carries that segment, so its archive counts for the kind that wrote it
+    rather than being dropped. A key under no known subpath is counted for no
+    kind, because there is no kind to attribute it to.
+
+    Local and free -- no AWS call -- so it rides on the unpolled half of the
+    status read, like :func:`nightly_failures`.
+    """
+    counts = dict.fromkeys(KIND_SUBPATHS, 0)
+    for key in uploaded_objects(account):
+        kind = _KIND_BY_SUBPATH.get(_key_segments(key)[0])
+        if kind is not None:
+            counts[kind] += 1
+    return counts
 
 
 def last_runs(account: str) -> dict[str, Any]:

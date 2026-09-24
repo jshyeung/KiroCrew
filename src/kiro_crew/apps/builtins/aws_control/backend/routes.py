@@ -2345,6 +2345,17 @@ async def _handle_backup_status(request: web.Request) -> web.Response:
         # a read of the same state document this payload already loads, so it rides on
         # the unpolled half rather than waiting for the opt-in remote one.
         "nightlyFailures": await asyncio.to_thread(backup_mod.nightly_failures, account),
+        # Per kind, how many archives this install still holds a record of uploading,
+        # which is a record count and not an inventory in either direction. `runs`
+        # below keeps one record per kind, so a second nightly overwrites the first
+        # while both archives stay in the drive: a row reading only that record states
+        # "last backed up" and nothing else, which on a prefix holding several reads as
+        # a prefix holding one. It can also read HIGH, because retention deletes an
+        # object while its `uploads` key stays. Local and free, like `install` -- a read
+        # of the state document this payload already loads -- so it rides on the
+        # unpolled half rather than the opt-in remote listing, which is the only thing
+        # that can say what the drive really holds. See `backup.remembered_archives`.
+        "rememberedArchives": await asyncio.to_thread(backup_mod.remembered_archives, account),
         "runs": await asyncio.to_thread(backup_mod.last_runs, account),
         "jobs": await asyncio.to_thread(_account_jobs, account),
         # This install's own identity, so every row can be told from every other

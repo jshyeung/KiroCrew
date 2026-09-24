@@ -5077,6 +5077,7 @@
         "backup_kind_sessions": "সেশন আর্কাইভ",
         "backup_last_run": "সর্বশেষ ব্যাকআপ {{when}} · {{size}}",
         "backup_never": "এখনও ব্যাকআপ করা হয়নি",
+        "backup_remembered": "এই ইনস্টলের নথিভুক্ত আর্কাইভ: {{count}} · তালিকা দেখো",
         "backup_sessions_scope": "এই Kiro হোমের অধীনে থাকা প্রতিটি সেশনের CLI রিপ্লে লগ এতে অন্তর্ভুক্ত, শুধু {{productName}}-তে শুরু করা চ্যাট নয়।",
         "backup_run_now": "এখন ব্যাকআপ করুন",
         "backup_running": "ব্যাকআপ হচ্ছে…",

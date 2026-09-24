@@ -1361,6 +1361,25 @@ demonstrated the fault is gone, which is the line `_unattended_sessions_redactio
 already draws. The status read serves the record as `nightlyFailures` so an operator
 can see the count and the day it started; no console renderer ships with it.
 
+The status read also serves `rememberedArchives`, a per-kind count of the `uploads`
+keys this install holds under each kind's subpath. It exists because `runs` keeps ONE
+record per kind: a second nightly overwrites the first while both archives stay in the
+drive, so a surface reading only that record reports one archive for a prefix holding
+several and an operator cannot see anything accumulating there. Like `nightlyFailures`
+it is derived from the state document this payload already loads, so it is local and
+free and rides on the unpolled half rather than the opt-in remote listing.
+
+It is a count of RECORDS, not an inventory, and it misses in both directions. It reads
+low because the record map is bounded by `MAX_REMEMBERED_UPLOADS` and covers only this
+install's own pushes. It reads HIGH because of the pruning asymmetry above: retention
+deletes the object and the prune clears only the `upload_versions` entry, so the
+`uploads` key outlives the archive it names -- the same direction as "a held version
+outlives its `uploads` counterpart", read the other way round. Only a listing can say
+what the drive holds, which is why the console line carrying this count is worded as a
+record count and opens the stored-archive disclosure instead of standing in for it. It
+renders only when the count exceeds what the run line already implies, so a row whose
+two lines would agree shows one.
+
 The clear alone is not enough, because the two writers serialize under the sidecar lock
 but each mutate re-reads fresh state. An unconditional failure write can therefore land
 AFTER a concurrent manual success cleared the count and record a failure against a kind
