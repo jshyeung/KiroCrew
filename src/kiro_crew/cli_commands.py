@@ -50,6 +50,7 @@ from kiro_crew.apps.manager import (
     disable_app,
     enable_app,
     get_app,
+    get_app_manifest,
     install_app,
     list_apps,
     trust_grant_removal_blocked,
@@ -785,10 +786,12 @@ def _handle_workspace(args: argparse.Namespace) -> None:
         print("Usage: kirocrew workspace {list|create|update|delete}")
 
 
-def _run_app_action_through_gateway(action: str, app_name: str) -> bool:
+def _run_app_action_through_gateway(
+    action: str, app_name: str, *, payload: dict[str, object] | None = None
+) -> bool:
     """Return true when a live gateway handled an app lifecycle request."""
     try:
-        result = app_lifecycle_client.toggle_app(app_name, action)
+        result = app_lifecycle_client.toggle_app(app_name, action, payload=payload)
     except app_lifecycle_client.AppGatewayTimeout as exc:
         # The outcome is unknown, not negative: the gateway may still be applying
         # the action, so this is neither a refusal nor an invitation to retry.
@@ -814,6 +817,39 @@ def _print_file_only_app_result(app_name: str, *, enabled: bool) -> None:
         "this takes effect at the next gateway start (on Windows and in sandboxed "
         "shells the CLI always uses this path). If a gateway is running now, apply "
         "it live from the dashboard."
+    )
+
+
+def _app_declares_backend(app_name: str) -> bool:
+    """Whether *app_name*'s manifest declares a backend process.
+
+    Gates the file-only uninstall's warning. A DECLARATION is a positive property
+    of the app, which is why it is read here instead of the recorded pid: an app
+    with no persisted record is exactly the case where nothing may be concluded,
+    so using record-absence to silence the warning would put back the reading
+    this path exists to avoid. An unreadable manifest warns for the same reason —
+    not knowing is not the same as knowing there is nothing to stop.
+    """
+    try:
+        manifest = get_app_manifest(app_name)
+    except Exception:  # noqa: BLE001 - a malformed manifest must not fail an uninstall
+        return True
+    if manifest is None:
+        return True
+    return bool(getattr(getattr(manifest, "backend", None), "entryPoint", ""))
+
+
+def _warn_backend_not_stopped(app_name: str) -> None:
+    """Report that a file-only uninstall could not stop the app's backend."""
+    print(
+        f"⚠️  No running gateway was reached, so {app_name}'s backend was not "
+        "stopped: signalling a process another gateway started is not something "
+        "the CLI can do from out here (on Windows and in sandboxed shells the CLI "
+        "always uses this path, so a gateway may well be running). If one is still "
+        "running it holds its port until the next gateway start, which terminates "
+        "backends left behind by a previous generation. To stop it now, restart the "
+        "gateway, or uninstall from the dashboard instead.",
+        file=sys.stderr,
     )
 
 
@@ -1171,6 +1207,24 @@ def _handle_app(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     elif action == "uninstall":
+        # Ask a running gateway first, exactly as enable and disable do above.
+        # Uninstall has to stop the app's backend, and out here it cannot: the
+        # gateway is a DIFFERENT process and holds the only live handle on that
+        # child. Doing the whole uninstall locally deleted the app's files while
+        # its backend kept running -- holding its port, its app secret and its
+        # proxied routes -- and still printed success. The gateway's own handler
+        # runs the same trust-grant and cron preconditions before anything
+        # destructive, so nothing is skipped by handing the work over.
+        #
+        # The purge flag travels in the body because the handler defaults an
+        # absent one to "preserve data"; without it a delegated `--purge-data`
+        # would quietly keep the data it was told to destroy.
+        if _run_app_action_through_gateway(
+            "uninstall",
+            args.name,
+            payload={"purge_data": bool(getattr(args, "purge_data", False))},
+        ):
+            return
         # Precondition before anything destructive: the same reason the dashboard
         # handler checks here rather than inside uninstall_app. deregister_app()
         # below is irreversible, so a grant that cannot be dropped has to abort
@@ -1189,6 +1243,9 @@ def _handle_app(args: argparse.Namespace) -> None:
         _cleanup_app_crons_from_scheduler(args.name)
         deregister_app(args.name)
         keep_data = not getattr(args, "purge_data", False)
+        # Read BEFORE the uninstall: the declaration lives in the app's manifest,
+        # which goes with the app directory below.
+        declares_backend = _app_declares_backend(args.name)
         result = uninstall_app(args.name, keep_data=keep_data)
         if result.ok:
             # AFTER success, matching this function's trust-grant reasoning: a
@@ -1197,6 +1254,8 @@ def _handle_app(args: argparse.Namespace) -> None:
             cleanup = discard_app_session_pointers(args.name)
             print(f"✅ {result.message}")
             _print_pointer_cleanup(args.name, cleanup)
+            if declares_backend:
+                _warn_backend_not_stopped(args.name)
         else:
             # The pointers outlive the app, so "already gone" is the one failure
             # whose bookkeeping half is still worth doing. It is also the residual's
