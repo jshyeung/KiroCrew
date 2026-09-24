@@ -410,10 +410,17 @@ surface is attached. Telegram implements the hook over its existing
 Approve/Deny/Trust inline keyboard (`TelegramDispatcher.deliver_spawn_approval`):
 the press resolves through the same `on_callback` `a:` path as a tool approval, so
 **Trust** grants parent-session trust via `add_trusted_session` and a later spawn
-from that session is auto-approved by the parent-trusted rung. The seam is
-in-memory only (dies with the process); the hook is registered on Telegram startup
-and unregistered on client shutdown. The per-agent `auto_approve_spawn` rung
-(issue #2381 item 2) is deferred to #4751/#4693 and is NOT added here.
+from that session is auto-approved by the parent-trusted rung. Discord implements it
+too (`DiscordDispatcher.deliver_spawn_approval`), over its existing Approve/Deny
+buttons on the same `on_interaction` `a:` path, with four differences: no Trust rung
+(standing spawn trust is granted from the dashboard), a `unified` dm_scope key is
+unaddressable and falls through, a refused send is reported by an absent message id
+rather than an exception and is read the same way, and the channels governance
+ceiling is consulted before anything is armed because a denied channel drops the
+Approve press that would answer the prompt. The seam is in-memory only (dies with
+the process); each hook is registered on its channel's startup and unregistered on
+client shutdown. The per-agent `auto_approve_spawn` rung (issue #2381 item 2) is
+deferred to #4751/#4693 and is NOT added here.
 
 **Delivery order.** A spawn-approval prompt that reaches `_spawn_with_approval`
 is offered to surfaces in this fixed order, and the search stops at the first one

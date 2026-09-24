@@ -412,6 +412,18 @@ class DiscordApprovalDecider:
         cls._NONCES[key] = nonce
         return nonce
 
+    @classmethod
+    def retire(cls, key: str) -> None:
+        """Drop an armed nonce whose prompt never went out (idempotent).
+
+        ``__call__`` retires the nonce together with the prompt it waited on, but
+        a caller that registers one and then fails to post — a spawn-approval
+        prompt Discord refused, or a destination whose authorization was
+        withdrawn before the send — runs no such wait, so the stale nonce would
+        otherwise outlive the prompt that never existed.
+        """
+        cls._NONCES.pop(key, None)
+
     async def __call__(self, event: Any) -> bool:
         k = self.key(self._session_key, getattr(event, "request_id", ""))
         fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()

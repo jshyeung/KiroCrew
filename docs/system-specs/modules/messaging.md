@@ -394,6 +394,21 @@ order (channel hook → Slack-DM/dashboard fallback → the #8914 fast-fail back
 the operator-log-vs-agent-error security split are documented in
 [`subagent.md`](subagent.md).
 
+**Discord is the second opt-in, and it is not identical.**
+`DiscordDispatcher.deliver_spawn_approval` posts the existing Approve/Deny buttons
+and awaits the press through the same `on_interaction` `a:` path, registered in
+`discord/gateway.py` on startup and unregistered from the client's `on_close` hook.
+Four differences are load-bearing. Discord's ladder has **no Trust rung**, so there
+is no in-channel way to grant standing spawn trust here — the operator grants it
+from the dashboard. A `unified` dm_scope collapses several peers into one session
+key, which names no single conversation, so such a key is unaddressable and falls
+through. This client reports a refused send by **returning no message id** rather
+than by raising, so an absent id is read the same way as an exception: nothing was
+surfaced, fall through. And the channels governance ceiling
+(`channel_inbound_permitted`) is consulted before anything is armed, because the
+press path drops an Approve on a denied channel and a prompt nobody can answer
+would otherwise deny-by-default at its timeout.
+
 ## Layer 2b — `Renderer` + `OutputEvent` (`renderer.py`)
 
 ### `OutputEvent`
