@@ -5088,10 +5088,12 @@ def _crew_thread(log: CrewLog, item: Any) -> "int | None":
     actual bound would take, and it answers a different question (does this seq
     exist) than this one (which dispatch named this item).
 
-    Scanning the whole file is also what correctness wants here: a report that
-    answers a dispatch but resolves no anchor is not written at all, because the
-    spec reads a missing ``thread`` as a report volunteered with no dispatch
-    behind it -- a different fact, in a file nothing rewrites.
+    Reading the whole file is also what correctness wants, though not because a
+    miss refuses the write: :func:`on_crew_report` records an unthreaded report
+    rather than dropping it. What a miss costs is that the entry becomes
+    indistinguishable from one volunteered with no dispatch behind it, which is a
+    claim about where the work came from that nothing later can correct -- so every
+    anchor the file actually holds is worth finding.
 
     An unreadable log answers ``None``, so a report still lands.
     """
