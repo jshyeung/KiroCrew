@@ -1891,11 +1891,26 @@ class TestLocalStreamingSession:
         is the signal that the load is under way, so it must arrive BEFORE ``ready``.
         """
         self._install(monkeypatch, _FakeLocalSession(pending=None, pending_load=True))
+        from kiro_crew.dashboard import stt_stream
+
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             first = await ws.receive_json()
             assert first["type"] == "status"
             assert first["stage"] == stt.STAGE_PREPARING
+            # The deadline belongs to the side that owns the wait, so the frame
+            # states it rather than leaving the client to pick one. A client
+            # number shorter than this abandons a load still running here and
+            # discards audio the next frame would have transcribed.
+            assert (
+                first["prepare_timeout_ms"]
+                == (stt_stream._MAX_MODEL_PREPARE_SECS + stt_stream._LOCAL_FINAL_WIRE_GRACE_SECS)
+                * 1000
+            )
+            # Strictly longer than this server's own ceiling: the timeout must be
+            # reached HERE first, where the reason is known and goes out as a
+            # coded error, instead of at a client that can only guess.
+            assert first["prepare_timeout_ms"] > stt_stream._MAX_MODEL_PREPARE_SECS * 1000
             assert (await ws.receive_json())["type"] == "ready"
             await ws.send_str('{"type":"stop"}')
             await ws.close()
@@ -1982,6 +1997,14 @@ class TestLocalStreamingSession:
         assert counts == sorted(counts) and len(set(counts)) == len(counts), counts
         assert all(frame["stage"] == "downloading" for frame in sent), sent
         assert all(frame["total_bytes"] == model.size_bytes for frame in sent), sent
+        # Every announcing frame carries the deadline, not just the first one: a
+        # client that joins mid-transfer hears one of these as its FIRST word on
+        # the subject, and a frame without the figure leaves it holding a budget
+        # this side never agreed to.
+        expected_ms = (
+            stt_stream._MAX_MODEL_PREPARE_SECS + stt_stream._LOCAL_FINAL_WIRE_GRACE_SECS
+        ) * 1000
+        assert all(frame["prepare_timeout_ms"] == expected_ms for frame in sent), sent
 
     @pytest.mark.asyncio
     async def test_a_failed_progress_send_stops_reporting_not_the_transfer(self, monkeypatch):

@@ -92,6 +92,27 @@ _active_sessions = 0
 # stalling. Generous enough for the largest model on a slow link, since the
 # alternative to waiting is a first run that cannot succeed.
 _MAX_MODEL_PREPARE_SECS = 1800
+
+
+def _prepare_timeout_ms() -> int:
+    """Milliseconds a client should allow for preparation, per THIS server's ceiling.
+
+    Announced on the `status` frames that say preparation is under way, for the
+    same reason `ready` announces `final_timeout_ms`: the deadline belongs to the
+    side that owns the wait. A client picking its own number picks one this side
+    does not honour, and the only interesting case is the number being SHORTER --
+    the client then abandons a load this server is still working on, discarding
+    audio the next frame would have transcribed.
+
+    Deliberately longer than the server's own ceiling by the wire grace, so the
+    timeout is reached HERE first. This side knows why preparation failed and
+    says so in a coded `error`; the client's timer is a backstop for a socket
+    that dies without one, and a backstop that fires first would replace every
+    real diagnosis with a guess about the connection.
+    """
+    return (_MAX_MODEL_PREPARE_SECS + _LOCAL_FINAL_WIRE_GRACE_SECS) * 1000
+
+
 # How often a download in progress republishes its byte count. This is NOT
 # cosmetic: `useMeetingTranscription` arms a 20s stall watchdog on the last frame
 # it received and RECONNECTS when it fires, so a single status frame at the start
@@ -663,6 +684,7 @@ async def _run_local_session(
                 "downloaded_bytes": 0,
                 "total_bytes": 0,
                 "code": "",
+                "prepare_timeout_ms": _prepare_timeout_ms(),
             }
         )
 
@@ -1217,6 +1239,7 @@ async def _relay_download_progress(
                 "downloaded_bytes": _status_int(status.get("downloaded_bytes")),
                 "total_bytes": _status_int(status.get("total_bytes")),
                 "code": stt.CODE_MODEL_MISSING,
+                "prepare_timeout_ms": _prepare_timeout_ms(),
             }
         )
         if not delivered:
