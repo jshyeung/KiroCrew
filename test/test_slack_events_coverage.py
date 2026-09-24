@@ -736,9 +736,7 @@ class TestInitSocketMode:
         # startup path still reads it -- to tell an operator who has not migrated yet.
         orch = _socket_orch()
         orch._cfg.agent.dangerously_skip_permissions = True
-        with _SocketPatches() as sp, patch.object(
-            ev, "standing_grant_declared", return_value=True
-        ):
+        with _SocketPatches() as sp, patch.object(ev, "standing_grant_declared", return_value=True):
             await ev.init_socket_mode(orch, ev.SeenCache())
         sp.setters["set_yolo_mode"].assert_called_once_with(True)
 
