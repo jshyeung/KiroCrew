@@ -14,13 +14,14 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from kiro_crew import sandbox
+from kiro_crew import platform_compat, sandbox
 from kiro_crew.apps.builtins.aws_control.backend import storage
 from kiro_crew.deploy import engine
 from kiro_crew.deploy.engine import AWSError
@@ -537,8 +538,20 @@ class TestObjectIO:
         # process that replaced the file in between would have had its bytes
         # uploaded instead. The descriptor is handed over as the child's stdin,
         # which is what `/dev/stdin` reads.
-        assert argv[argv.index("--body") + 1] == storage._DESCRIPTOR_BODY
-        assert kwargs["stdin_fd"] is not None
+        #
+        # Both arms are asserted rather than one plus a skip. A skip here would
+        # leave the platform that takes the OTHER arm with no statement about what
+        # its upload sends, and that arm is the one whose body is a name.
+        if storage._CAN_PASS_BODY_DESCRIPTOR:
+            assert argv[argv.index("--body") + 1] == storage._DESCRIPTOR_BODY
+            assert kwargs["stdin_fd"] is not None
+        else:
+            # Windows has no `/dev/stdin`, so the CLI opens the name itself and
+            # nothing is handed to its stdin. What keeps that honest is the
+            # caller's held directory handle, plus `_assert_same_file` after the
+            # transfer -- so the name is expected here, and the descriptor is not.
+            assert argv[argv.index("--body") + 1] == str(local)
+            assert kwargs["stdin_fd"] is None
         assert argv[argv.index("--expected-bucket-owner") + 1] == "111122223333"
         assert kwargs["action"] == "s3:PutObject"
 
@@ -1692,3 +1705,208 @@ class TestGetFileVersionPinning:
                         version="-x",
                     )
         assert not isinstance(caught.value, AWSError)
+
+
+class TestTheDescriptorBodySpellingReachesAChild:
+    """``--body /dev/stdin`` is only sound if the CLI CHILD resolves it to our fd.
+
+    Every POSIX upload uses that spelling, so the whole descriptor binding rests
+    on a claim about a child process rather than about this one. The other tests
+    here stub the subprocess chokepoint and therefore assert the argv only -- they
+    cannot see whether a real child reading ``/dev/stdin`` gets the descriptor it
+    inherited. These two spawn one.
+
+    ``cat`` stands in for the AWS CLI deliberately: the claim under test is the
+    platform's, not that tool's, and a test needing real credentials would not run
+    anywhere. The resolution being exercised is the same one.
+    """
+
+    @pytest.mark.skipif(
+        not storage._CAN_PASS_BODY_DESCRIPTOR,
+        reason="the descriptor body spelling is POSIX-only; this platform passes a name",
+    )
+    def test_an_unconfined_child_reads_our_descriptor(self, tmp_path):
+        payload = b"bytes-only-the-inherited-descriptor-can-reach"
+        path = tmp_path / "body.bin"
+        path.write_bytes(payload)
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            done = subprocess.run(
+                ["cat", storage._DESCRIPTOR_BODY],
+                stdin=fd,
+                capture_output=True,
+                timeout=120,
+            )
+        finally:
+            os.close(fd)
+        assert done.returncode == 0, done.stderr[:400]
+        assert done.stdout == payload
+
+    @pytest.mark.skipif(
+        not storage._CAN_PASS_BODY_DESCRIPTOR,
+        reason="the descriptor body spelling is POSIX-only; this platform passes a name",
+    )
+    @pytest.mark.skipif(
+        not sandbox.userns_available(),
+        reason="no namespace sandbox backend here: unshare(CLONE_NEWUSER) is refused",
+    )
+    def test_a_sandbox_confined_child_still_reads_our_descriptor(self, tmp_path):
+        # The sandbox is a user + mount namespace that binds empty directories
+        # over the trees it hides. It does not remount /proc or /dev, which is
+        # what keeps /dev/stdin meaningful inside it -- but that is a statement
+        # about a namespace, and no in-process assertion can observe one. So a
+        # confined child is spawned and asked the same question.
+        payload = b"bytes-that-must-survive-the-namespace"
+        path = tmp_path / "body.bin"
+        path.write_bytes(payload)
+        plain = ["cat", storage._DESCRIPTOR_BODY]
+        # The second value is a CLEANUP PATH (the Linux launcher script or the
+        # Seatbelt profile), not a backend name, and the caller owns deleting it.
+        argv, cleanup = sandbox.wrap_argv(list(plain))
+        # Confinement is evidenced by the argv the wrapper returns, not by that
+        # path: None there means "no cleanup needed", which is a statement about
+        # the backend's temp files rather than about whether one was applied.
+        assert argv != plain, "wrap_argv returned the argv unwrapped"
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            done = subprocess.run(argv, stdin=fd, capture_output=True, timeout=180)
+        finally:
+            os.close(fd)
+            if cleanup:
+                with contextlib.suppress(OSError):
+                    os.unlink(cleanup)
+        assert done.returncode == 0, done.stderr[:400]
+        assert done.stdout == payload
+
+
+class TestTheNameArmRefusesAConcurrentWriter:
+    """The arm that hands the CLI a NAME must also hold the bytes, not just the inode.
+
+    On POSIX the body is a descriptor and nothing resolves a name, so none of this
+    applies there. On Windows there is no ``/dev/stdin``: the child opens the name
+    itself, and a held descriptor fixes only WHICH inode that name reaches. A
+    same-UID process can open the same inode and rewrite it in place, and the
+    post-transfer identity check passes because the inode never changed -- so the
+    object carries bytes nothing checked. On POSIX that writer is removed by the
+    sandbox mask over the staging leaf; Windows has no such mask, so the writer is
+    refused instead, by a guard handle opened without ``FILE_SHARE_WRITE``.
+
+    That refusal is the PLATFORM's, which this host cannot execute. What is pinned
+    here is therefore the request and its lifetime -- the guard is taken on the body,
+    before the transfer, and is still open while the child runs -- plus the share
+    mode it rests on. The enforcement itself is asserted separately, under a
+    Windows guard, so the claim is measured where it is real rather than assumed
+    everywhere.
+    """
+
+    def test_the_windows_arm_takes_a_deny_write_guard_before_the_transfer(self, tmp_path):
+        local = tmp_path / "body.bin"
+        local.write_bytes(b"the-bytes-that-must-not-change")
+        order: list[str] = []
+        real_open = platform_compat.open_file_no_reparse
+
+        def recording_open(path, **kwargs):
+            if kwargs.get("deny_write"):
+                order.append(f"guard:{path}")
+            return real_open(path, **kwargs)
+
+        def recording_checked(*args, **kwargs):
+            order.append("transfer")
+            return "{}"
+
+        with mock.patch.object(storage, "_CAN_PASS_BODY_DESCRIPTOR", False):
+            with mock.patch.object(storage.platform_compat, "open_file_no_reparse", recording_open):
+                with mock.patch.object(storage, "_checked", side_effect=recording_checked):
+                    storage.put_file(
+                        "p",
+                        "us-east-1",
+                        "b",
+                        "drive",
+                        "body.bin",
+                        str(local),
+                        account="111122223333",
+                    )
+
+        assert order == [f"guard:{local}", "transfer"], (
+            "the deny-write guard must be taken on the body BEFORE the child runs; "
+            f"observed order was {order}"
+        )
+
+    def test_the_guard_is_still_open_while_the_child_runs(self, tmp_path):
+        # A guard released before the transfer would satisfy the ordering test above
+        # and protect nothing, so its LIFETIME is the property, not its creation.
+        local = tmp_path / "body.bin"
+        local.write_bytes(b"payload")
+        seen: dict[str, object] = {}
+        real_open = platform_compat.open_file_no_reparse
+
+        def recording_open(path, **kwargs):
+            fd = real_open(path, **kwargs)
+            if kwargs.get("deny_write"):
+                seen["guard_fd"] = fd
+            return fd
+
+        def checked_while_guard_held(*args, **kwargs):
+            guard_fd = seen["guard_fd"]
+            # os.fstat raises EBADF on a closed descriptor, so a successful stat here
+            # is the evidence that the guard outlives the child rather than a claim.
+            seen["alive_during_transfer"] = os.fstat(guard_fd).st_ino
+            return "{}"
+
+        with mock.patch.object(storage, "_CAN_PASS_BODY_DESCRIPTOR", False):
+            with mock.patch.object(storage.platform_compat, "open_file_no_reparse", recording_open):
+                with mock.patch.object(storage, "_checked", side_effect=checked_while_guard_held):
+                    storage.put_file(
+                        "p",
+                        "us-east-1",
+                        "b",
+                        "drive",
+                        "body.bin",
+                        str(local),
+                        account="111122223333",
+                    )
+
+        assert seen["alive_during_transfer"] == local.stat().st_ino
+        # And released afterwards, so the upload does not leak a handle that would
+        # keep refusing writers for the life of the process.
+        with pytest.raises(OSError):
+            os.fstat(seen["guard_fd"])  # type: ignore[arg-type]
+
+    def test_a_guard_landing_on_another_file_is_refused(self, tmp_path):
+        # The guard is opened BY NAME while the checked descriptor is already held,
+        # so it is a second resolution of that string and can land elsewhere. A
+        # guard on the wrong file would protect the wrong bytes silently.
+        local = tmp_path / "body.bin"
+        local.write_bytes(b"payload")
+        decoy = tmp_path / "decoy.bin"
+        decoy.write_bytes(b"other")
+
+        def open_the_decoy(path, **kwargs):
+            if kwargs.get("deny_write"):
+                return os.open(str(decoy), os.O_RDONLY)
+            return platform_compat.open_file_no_reparse(path, **kwargs)
+
+        with mock.patch.object(storage, "_CAN_PASS_BODY_DESCRIPTOR", False):
+            with mock.patch.object(storage.platform_compat, "open_file_no_reparse", open_the_decoy):
+                with mock.patch.object(storage, "_checked", return_value="{}") as checked:
+                    with pytest.raises(AWSError, match="not the file that was checked"):
+                        storage.put_file(
+                            "p",
+                            "us-east-1",
+                            "b",
+                            "drive",
+                            "body.bin",
+                            str(local),
+                            account="111122223333",
+                        )
+        assert not checked.called, "nothing may be transferred once the guard is not the body"
+
+    def test_the_share_mode_the_guard_rests_on_omits_write_sharing(self):
+        # Platform-independent, and the one assertion that would catch the guard
+        # being requested correctly while the constant behind it grants writes
+        # anyway. FILE_SHARE_READ is 0x1 and FILE_SHARE_WRITE is 0x2.
+        assert platform_compat._WIN_FILE_SHARE_READ & 0x2 == 0
+        assert platform_compat._WIN_FILE_SHARE_READ & 0x1 == 0x1
+        # The mode used when deny_write is NOT asked for still shares writes, so the
+        # two are genuinely different requests rather than the same value twice.
+        assert platform_compat._WIN_FILE_SHARE_READ_WRITE & 0x2 == 0x2

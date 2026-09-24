@@ -36,6 +36,7 @@ gate. The functions are sync (subprocess-bound) — call via
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import mimetypes
@@ -45,6 +46,7 @@ import secrets
 import shutil
 import stat
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
@@ -671,7 +673,7 @@ def _assert_uploadable(fd: int) -> os.stat_result:
             "the upload body has more than one name, so it may be a hard link to another "
             "file; refusing rather than uploading bytes that were never staged here"
         )
-    if platform_compat.IS_POSIX and info.st_uid != os.getuid():
+    if not platform_compat.stat_owned_by_current_user(info):
         raise AWSError(
             "the upload body is owned by another user, so this process did not stage it; "
             "refusing rather than uploading a file it does not own"
@@ -759,6 +761,7 @@ def put_file(
     ``mimetypes`` cannot place keeps the S3 default rather than guessing.
     """
     owned_fd = -1
+    guard_fd = -1
     if body_fd is None:
         owned_fd = _verified_body_fd(local_path)
         fd = owned_fd
@@ -791,15 +794,38 @@ def put_file(
             # whole archive.
             os.lseek(fd, 0, os.SEEK_SET)
         else:
-            # Windows. No ``/dev/stdin``, so the CLI is given the name -- and what
-            # makes that sound here is the caller's PINNED directory rather than
-            # anything this function can do: a directory with an open handle can
-            # be neither renamed nor deleted, nor can any directory above it, so
-            # the name cannot be re-pointed at a planted junction between our
-            # checks and the child's open. The identity of the file that name
-            # reaches is re-verified after the call against the descriptor above,
-            # so a substitution that happened anyway is reported rather than
-            # recorded as a successful upload of our bytes.
+            # Windows. No ``/dev/stdin``, so the CLI is given the name -- and a name
+            # is re-resolved at the child's open, so two separate things have to be
+            # held for that to be sound.
+            #
+            # WHICH FILE the name reaches is held by the caller's PINNED directory:
+            # a directory with an open handle can be neither renamed nor deleted,
+            # nor can any directory above it, so the name cannot be re-pointed at a
+            # planted junction between our checks and the child's open.
+            #
+            # WHAT THAT FILE CONTAINS needs a second hold, and the descriptor above
+            # does not provide it. A descriptor fixes an inode; it does not stop a
+            # same-UID process opening the same inode and rewriting the bytes in
+            # place. On POSIX that writer is removed by the sandbox mask over the
+            # staging leaf, and on Windows there is no such mask -- ``staging_root``
+            # there applies ``restrict_dir_to_owner``, which excludes other USERS
+            # and not the same-UID agent process this app's threat model assumes.
+            # So the writer is refused instead: this guard handle drops
+            # ``FILE_SHARE_WRITE``, and for as long as it lives Windows fails any
+            # other process's attempt to open the body for writing. The child's READ
+            # open is still permitted, which is what makes the name usable at all.
+            #
+            # It is a PREVENTION and it has to be, because the alternative measures
+            # after the fact: ``_assert_same_file`` below compares inode identity,
+            # which an in-place rewrite survives, and even a content digest taken
+            # afterwards would only report that the object already in the bucket is
+            # wrong -- off-host, unattended, with no recall.
+            guard_fd = platform_compat.open_file_no_reparse(local_path, deny_write=True)
+            # The guard must hold the file we CHECKED. Opened by name, it is a second
+            # resolution of that string, so its inode is compared against the
+            # descriptor's before it is trusted -- otherwise a substitution that
+            # happened between the two would be met with a guard on the wrong file.
+            _assert_same_open_file(fd, guard_fd)
             body = local_path
             stdin_fd = None
             visible = ()
@@ -833,18 +859,49 @@ def put_file(
             _assert_same_file(fd, local_path)
         return _put_version_id(out)
     finally:
+        # The guard goes first: it is what was refusing other writers, and holding
+        # it a moment longer than the transfer costs nothing while releasing it
+        # early would reopen the window this function exists to close.
+        if guard_fd >= 0:
+            os.close(guard_fd)
         if owned_fd >= 0:
             os.close(owned_fd)
+
+
+def _assert_same_open_file(fd: int, other_fd: int) -> None:
+    """Refuse unless two descriptors hold the same file.
+
+    Used where a second handle on the body is taken BY NAME while the first is
+    already held: the second open is a fresh resolution of that string, so it can
+    land on a different file than the one already checked. Comparing the two
+    descriptors is what makes the second one's protection apply to the first one's
+    bytes. Compared on ``(st_dev, st_ino)`` and nothing else, because that is the
+    whole question here -- the content checks belong to whoever opened ``fd``.
+    """
+    held = os.fstat(fd)
+    guard = os.fstat(other_fd)
+    if (guard.st_dev, guard.st_ino) != (held.st_dev, held.st_ino):
+        raise AWSError(
+            "the upload body was replaced while it was being prepared, so the file that "
+            "would be uploaded is not the file that was checked"
+        )
 
 
 def _assert_same_file(fd: int, local_path: str) -> None:
     """Refuse unless *local_path* still names the file *fd* holds.
 
-    Only the pinned-name arm needs this, and it DETECTS rather than prevents: the
-    bytes are already in the bucket by the time it runs. It is worth having
-    anyway, because the alternative is recording a successful upload of bytes this
-    process never read -- a restore would then hand those bytes back as the
-    owner's own archive, which is the outcome the record exists to make impossible.
+    Only the pinned-name arm needs this, and it is a BACKSTOP rather than the
+    protection: the deny-write guard taken before the transfer is what stops the
+    bytes changing, and this says whether the NAME still reaches the same inode. It
+    cannot do more than report -- the bytes are already in the bucket by the time it
+    runs -- but reporting is worth having, because the alternative is recording a
+    successful upload of bytes this process never read, and a restore would then
+    hand those bytes back as the owner's own archive.
+
+    Inode identity only, deliberately. An in-place content rewrite would pass this
+    check, and that gap is closed by refusing the writer rather than by widening the
+    comparison: a digest taken here would still be a digest taken after the object
+    was sent.
     """
     held = os.fstat(fd)
     try:
@@ -1000,8 +1057,16 @@ _STAGING_READ_CHUNK = 64 * 1024
 _S3_INVALID_RANGE_CODE = "InvalidRange"
 
 
-def _preview_staging_parent() -> Path:
-    """The agent-masked root that preview staging directories are cut under.
+def staging_root() -> Path:
+    """The agent-masked root that every AWS Control staging directory is cut under.
+
+    Shared by the preview staging (:func:`_preview_staging_parent`) and by the
+    backup archive staging, because both need the same property and there should
+    be one place that establishes it: a directory a SIBLING agent cannot reach.
+    The system temp directory is not that place -- it is shared, same-UID
+    writable, and carries no mask -- so an archive staged there can be rewritten
+    in place between being built and being uploaded, and a descriptor pin does not
+    help because pinning fixes which inode a name reaches, not that inode's bytes.
 
     On a sandboxed host the root already exists by the time any agent runs: the
     sandbox materialises it before every namespace spawn
@@ -1035,6 +1100,79 @@ def _preview_staging_parent() -> Path:
     else:
         platform_compat.restrict_dir_to_owner(str(staging))
     return staging
+
+
+def _preview_staging_parent() -> Path:
+    """The root preview staging directories are cut under. See :func:`staging_root`.
+
+    Kept as its own name because the preview path is what the sandbox-mask tests
+    address, and because the two callers are otherwise unrelated -- a change to
+    where previews stage should not silently move where backups stage.
+    """
+    return staging_root()
+
+
+def cut_pinned_staging(prefix: str) -> tuple[str, int]:
+    """Cut a private staging directory under :func:`staging_root` and PIN it.
+
+    Returns ``(path, dir_fd)``. Release both with :func:`drop_pinned_staging`.
+
+    Every upload body this app stages goes through here, because the pin is the
+    whole basis on which :func:`put_file` may hand the AWS CLI a NAME. Where no
+    descriptor can be passed to the child -- Windows has no ``/dev/stdin`` -- the
+    name is all the child gets, and a name is re-resolved at the child's open. A
+    pinned directory cannot be renamed or deleted, and neither can any directory
+    above it, so the path the child walks cannot be re-pointed at a planted
+    junction between our check and its open.
+
+    Two properties, and a caller needs both:
+
+    * the masked root removes the WRITER -- a sibling agent's namespace has an
+      empty directory bound over that leaf, so the body has no name there to
+      rewrite in place, which no pin can prevent. Detection is not an
+      alternative: a rewrite of the held inode is read by every later check as
+      well as by the upload, so the digests and the bytes sent agree with each
+      other and the run records a successful upload of a body it never built;
+    * the pin fixes the PATH -- on POSIX the descriptor is a resolution root for
+      our own opens, and on Windows holding the directory is what blocks the
+      rename.
+
+    ``mkdtemp`` for the unique name and the 0700 mode, then
+    :func:`platform_compat.pin_directory`, which refuses a link or reparse point
+    at the name rather than following it.
+    """
+    tmp = tempfile.mkdtemp(prefix=prefix, dir=str(staging_root()))
+    try:
+        return tmp, platform_compat.pin_directory(tmp)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def drop_pinned_staging(path: str, dir_fd: int) -> None:
+    """Release a :func:`cut_pinned_staging` pin and remove its directory.
+
+    The close comes first: on Windows the pin is exactly what would make the
+    removal fail.
+    """
+    if dir_fd >= 0:
+        os.close(dir_fd)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def pinned_staging(prefix: str) -> Iterator[tuple[Path, int]]:
+    """:func:`cut_pinned_staging` as a scope. Yields ``(path, dir_fd)``.
+
+    The form to reach for in synchronous code. A coroutine that must offload the
+    syscalls onto a worker thread uses the two halves directly instead, since
+    entering a context manager on the event loop would run them there.
+    """
+    tmp, dir_fd = cut_pinned_staging(prefix)
+    try:
+        yield Path(tmp), dir_fd
+    finally:
+        drop_pinned_staging(tmp, dir_fd)
 
 
 def get_object_head_bytes(

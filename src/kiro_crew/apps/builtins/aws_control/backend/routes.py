@@ -69,8 +69,6 @@ import datetime as dt
 import json
 import logging
 import os
-import shutil
-import tempfile
 import time
 import weakref
 from contextlib import asynccontextmanager
@@ -1362,10 +1360,27 @@ async def _handle_drive_upload(request: web.Request) -> web.Response:
     if request.content_length and request.content_length > _MAX_UPLOAD_BYTES:
         return _bad_request("file too large (512 MB cap)", "upload_too_large")
 
-    # NOT a `with TemporaryDirectory()`: its __exit__ runs shutil.rmtree
-    # SYNCHRONOUSLY on the event loop, and deleting a 512 MB spool is exactly
+    # The two halves of the pin rather than the `pinned_staging` scope: a context
+    # manager's __enter__ and __exit__ both run on whatever thread entered it, so
+    # here that is the event loop, and its exit removes a 512 MB spool -- exactly
     # the stall every other touch of this file is offloaded to avoid.
-    tmp = await asyncio.to_thread(tempfile.mkdtemp, prefix="kc-upload-")
+    #
+    # Under the masked staging root rather than the shared system temp root. The
+    # gap this spool lives across is the longest of any upload body here -- a
+    # 512 MB stream plus a wait behind the per-key lock, both minutes -- and the
+    # descriptor `put_file` opens fixes which inode it sends, not that inode's
+    # bytes, so a same-UID rewrite in that window would send bytes no check saw.
+    #
+    # `cut_pinned_staging` is called INSIDE the offloaded callable, not as an
+    # argument to it: an argument is evaluated by this coroutine before the thread
+    # is ever entered, and that function does lstat, mkdir, two resolves, is_dir,
+    # chmod and an open -- metadata syscalls that stall every other task on a slow
+    # or contended data home. Same shape as the `to_thread(open, ...)` below.
+    #
+    # PINNED and not merely relocated, because on a platform with no `/dev/stdin`
+    # `put_file` hands the CLI this spool's NAME and rests on its caller holding
+    # the directory open.
+    tmp, staging_fd = await asyncio.to_thread(storage_mod.cut_pinned_staging, "kc-upload-")
     try:
         spool = Path(tmp) / "upload.bin"
         received = 0
@@ -1424,7 +1439,7 @@ async def _handle_drive_upload(request: web.Request) -> web.Response:
         except AWSError as exc:
             return _aws_failed(exc)
     finally:
-        await asyncio.to_thread(shutil.rmtree, tmp, True)
+        await asyncio.to_thread(storage_mod.drop_pinned_staging, tmp, staging_fd)
     return web.json_response({"uploaded": True, "key": key, "bytes": received})
 
 

@@ -29,7 +29,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-import tempfile
 from pathlib import Path
 from typing import Any, Callable, Collection
 
@@ -348,7 +347,13 @@ def push_artifact(
         "tags": [_clean(t) for t in (artifact.tags or [])],
         "pushedAt": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
     }
-    with tempfile.TemporaryDirectory(prefix="kc-library-") as tmp:
+    # Under the masked staging root, not the shared system temp root. The
+    # credential and exfiltration scan above runs on the in-memory string, so a
+    # same-UID rewrite of the file AFTER that scan and before the upload would
+    # put unscanned bytes in the bucket -- and the descriptor `put_file` holds
+    # fixes which inode it sends, not that inode's contents. The masked leaf
+    # leaves a sibling agent no name to open.
+    with storage.pinned_staging("kc-library-") as (tmp, _staging_fd):
         content_path = Path(tmp) / f"v{artifact.version}{ext}"
         content_path.write_text(content, encoding="utf-8")
         meta_path = Path(tmp) / "meta.json"
