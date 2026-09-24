@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from kiro_crew import platform_compat
-from kiro_crew.atomic_write import refuse_linked_parent
+from kiro_crew.atomic_write import fsync_dir, refuse_linked_parent
 from kiro_crew.config.paths import config_dir, kiro_agents_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.identity_stores import AUTH_SQLITE_DB, AUTH_SQLITE_SIDECAR_SUFFIXES
@@ -2535,6 +2535,102 @@ def _first_linked_component_below(root: str, leaf: str) -> str | None:
     return None
 
 
+def _masked_crew_home_roots() -> list[str]:
+    """Every crew data home the masks cover, de-duplicated, live one first.
+
+    The mask lists are NOT scoped to the live home, and that is the whole reason this
+    helper exists. :func:`_crew_home_entries` expands each hidden leaf across both
+    :data:`_CREW_HOME_PREFIXES`, so ``~/.kiro/crew/.env`` and ``~/.kirocrew/.env`` are
+    both masked whichever one ``config_dir()`` resolves to, and
+    :func:`_relocated_crew_targets` adds the resolved home on top when ``KIROCREW_HOME``
+    moves it out from under ``$HOME``. A check that resolves ``config_dir()`` alone
+    therefore judges one of the homes the launcher masks and none of the others.
+
+    Ordered live-home-first so a refusal names the home the operator is most likely
+    looking at, and de-duplicated so a relocation that happens to coincide with a prefix
+    is visited once.
+
+    Never raises. A home that cannot be resolved contributes nothing and the remaining
+    roots still apply, because every caller here is a read that reports what it finds --
+    a probe that cannot resolve a path must not turn that into a verdict about the host.
+    """
+    roots: list[str] = []
+    try:
+        roots.append(str(config_dir()))
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for the masked-leaf pass", exc_info=True)
+    try:
+        home = Path.home()
+        roots.extend(str(home / Path(prefix)) for prefix in _CREW_HOME_PREFIXES)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("could not resolve $HOME for the masked-leaf pass", exc_info=True)
+    return list(dict.fromkeys(roots))
+
+
+def _refuse_multilinked_credential_leaves() -> None:
+    """Refuse the spawn when a masked CREDENTIAL leaf has a second hard link, in ANY home.
+
+    Owns that refusal for every masked home rather than for the live one, because the masks
+    cover every home (see :func:`_masked_crew_home_roots`) while ``config_dir()`` names one.
+    A ``.env`` under an un-migrated ``~/.kirocrew``, or one sitting in the default home
+    under a ``KIROCREW_HOME`` relocation, holds live channel tokens and is masked; a second
+    hard link on it reaches those bytes through a name no mask covers, which is exactly the
+    condition this refusal exists to stop. Scoping the check to the live home would leave
+    the ordinary layouts this codebase provides for unchecked, so the leaf would be
+    masked-but-unjudged and the spawn would proceed.
+
+    Only the HARD-LINK condition, and only the credential leaves. The symlink and
+    linked-component refusals in :func:`_refuse_aliased_masked_leaves` stay live-home-only
+    deliberately: a host part-way through a migration legitimately points the legacy home
+    AT the live one, and refusing every spawn for that layout would break working hosts
+    while closing nothing -- the two names then share a single inode, which the live home's
+    own pass already judges.
+
+    A leaf that is absent, is a link, or is not a regular file is skipped: only a regular
+    file can carry a second hard link, and ``lstat`` never follows a link, so the symlink
+    case belongs to the pass that has a sentence for it.
+
+    A leaf reached through a linked INTERMEDIATE component is skipped with a warning, not
+    refused. ``lstat`` leaves only the final component un-followed, so for a multi-component
+    leaf (``workspace/md-notebook/pat`` is the one such entry here) a planted link above it
+    makes this read report the link count of a file somewhere else entirely -- refusing on
+    that would fail every spawn over a number belonging to a file outside the data home.
+    The chain case has its own control: :data:`_CREW_ALIAS_CHAIN_DEGRADE_LEAVES` records
+    why those leaves degrade rather than refuse, and :func:`_refuse_aliased_masked_leaves`
+    applies it. Escalating here would invert that decision.
+    """
+    for root in _masked_crew_home_roots():
+        for leaf in sorted(_CREW_HARDLINK_REFUSED_LEAVES):
+            target = os.path.join(root, leaf)
+            try:
+                linked = _first_linked_component_below(root, leaf)
+            except SandboxCeilingUnsealable:
+                # Same policy as the lstat below, and the same reason: a component this
+                # pass cannot classify is left to the live home's own fail-closed pass.
+                continue
+            if linked is not None:
+                logger.warning(  # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- the word "credential" names the leaf CLASS; the arguments are two paths and no file is read.  # noqa: E501  # fmt: skip
+                    "sandbox: not reading the link count of the masked credential leaf %s. "
+                    "It is reached through a component that is a link (%s), so the count "
+                    "would belong to a file outside the data home. Replace the link with a "
+                    "real directory to close the alias.",
+                    target,
+                    linked,
+                )
+                continue
+            try:
+                info = os.lstat(target)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # A path this process cannot classify is judged by the live home's pass,
+                # which has the fail-closed sentence for it. Escalating here would refuse
+                # every spawn for an unreadable path in a home nothing is using.
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                raise SandboxCeilingUnsealable(_masked_leaf_multilink_detail(target, info.st_nlink))
+
+
 def _refuse_aliased_masked_leaves() -> None:
     """Refuse the spawn when a MASKED leaf is reachable under a second name.
 
@@ -2577,6 +2673,11 @@ def _refuse_aliased_masked_leaves() -> None:
     a leaf masked only so an agent cannot WRITE it, the reader re-validates the content and
     a spawn-wide outage is not proportionate. Either way the warning is emitted HERE rather
     than left to :func:`_warn_if_alias_backed`, which never runs over these leaves.
+
+    The credential refusal itself is issued by :func:`_refuse_multilinked_credential_leaves`,
+    called at the end of this pass, because it has to cover EVERY masked home while this
+    loop covers ``config_dir()``. The symlink and linked-component refusals stay scoped to
+    this one home on purpose; that function's docstring gives the reason.
 
     A TOLERATED leaf is VISITED and WARNED, never skipped. Excluding it from the walk is the
     same silence one level along: a symlinked ``.env`` carries live channel tokens and is
@@ -2668,7 +2769,9 @@ def _refuse_aliased_masked_leaves() -> None:
             )
         if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
             if leaf in _CREW_HARDLINK_REFUSED_LEAVES:
-                raise SandboxCeilingUnsealable(_masked_leaf_multilink_detail(target, info.st_nlink))
+                # Refused by _refuse_multilinked_credential_leaves, which owns this
+                # condition across EVERY masked home rather than this loop's single one.
+                continue
             logger.warning(
                 "sandbox: the masked path %s has %d hardlinks. The mask covers this path "
                 "only, so a read or write through another name reaches the same inode. "
@@ -2678,6 +2781,10 @@ def _refuse_aliased_masked_leaves() -> None:
                 target,
                 info.st_nlink,
             )
+    # Every masked home, not just this loop's. The credential leaves are masked under each
+    # crew-home spelling and under a relocated home, so the refusal has to cover the same
+    # set the masks do.
+    _refuse_multilinked_credential_leaves()
 
 
 def _masked_leaf_multilink_detail(target: str, links: int) -> str:
@@ -2725,22 +2832,33 @@ def masked_credential_leaf_aliases() -> list[tuple[str, int]]:
     fault, because doctor must not turn its own probe failure into a verdict about the host.
     An absent leaf has no second name by construction.
 
+    Covers EVERY masked home (:func:`_masked_crew_home_roots`), the same set
+    :func:`_refuse_multilinked_credential_leaves` judges. A probe narrower than the refusal
+    is worse than no probe: it reports a clean host and the next spawn refuses anyway, which
+    is the failure this read exists to prevent.
+
     Returns the leaf path and its link count, so the caller renders the same sentence the
     spawn would refuse with instead of paraphrasing it.
     """
-    try:
-        root = str(config_dir())
-    except Exception:
-        return []
     found: list[tuple[str, int]] = []
-    for leaf in sorted(_CREW_HARDLINK_REFUSED_LEAVES):
-        target = os.path.join(root, leaf)
-        try:
-            info = os.lstat(target)
-        except OSError:
-            continue
-        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
-            found.append((target, info.st_nlink))
+    for root in _masked_crew_home_roots():
+        for leaf in sorted(_CREW_HARDLINK_REFUSED_LEAVES):
+            target = os.path.join(root, leaf)
+            try:
+                if _first_linked_component_below(root, leaf) is not None:
+                    # Reached through a linked component, so the count would belong to a
+                    # file outside the data home. The spawn path skips this case for that
+                    # reason, and a probe that reports what the spawn does NOT refuse on
+                    # would fail doctor's exit code over a foreign path.
+                    continue
+            except SandboxCeilingUnsealable:
+                continue
+            try:
+                info = os.lstat(target)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                found.append((target, info.st_nlink))
     return found
 
 
@@ -3191,6 +3309,11 @@ def _open_dir_anchored(anchor: str, components: tuple[str, ...]) -> int | None:
     return fd
 
 
+#: The published signing key's leaf name under a crew data home. Named once because three
+#: things key off it: the mask list, the legacy temp prefix below, and the staging
+#: reconciliation that compares a staged file's inode against this file's.
+_AUTH_STORE_PUBLISHED_KEY_LEAF: str = "token_signing.key"
+
 #: The name shape a pre-upgrade signing-key publish left in the crew data-home root:
 #: ``token_secret`` staged ``.<leaf>.<pid>.<hex>.tmp`` beside the key and published with
 #: ``os.link``, so a SIGKILL between that link and the cleanup unlink leaves a file holding
@@ -3203,7 +3326,116 @@ def _open_dir_anchored(anchor: str, components: tuple[str, ...]) -> int | None:
 #: component's in-flight temp between its ``mkstemp`` and its rename and fail that write for
 #: no reason -- the same hazard ``_CEILING_TEMP_PREFIX`` is skipped for one directory down.
 #: A name carrying the leaf can only have come from this one publisher.
-_AUTH_STORE_LEGACY_TEMP_PREFIX: str = ".token_signing.key."
+_AUTH_STORE_LEGACY_TEMP_PREFIX: str = f".{_AUTH_STORE_PUBLISHED_KEY_LEAF}."
+
+
+def _reconcile_auth_store_staging_links() -> list[str]:
+    """Drop a staging name that is a SECOND HARD LINK to the published signing key.
+
+    Without this the hard-link refusal is a one-way door on a state the gateway's own
+    publisher creates on purpose. ``token_secret`` publishes the key with ``os.link`` from
+    a staged file and then unlinks the staged name; when the directory ``fsync`` after the
+    link fails it deliberately KEEPS that name, as a recoverable second name to an inode
+    whose only other name might not be durable yet, and a kill between the link and the
+    unlink leaves the same shape. Either way ``token_signing.key`` has two names, the leaf
+    is in :data:`_CREW_HARDLINK_REFUSED_LEAVES`, and every confined spawn then refuses --
+    with no automatic way out, because the operator's only exit is to find and remove the
+    name by hand.
+
+    Reconciling is sound precisely BECAUSE the two names share an inode: the destination
+    already resolves to the fully-written key, so the staged name carries no byte the
+    destination does not. That identity is also the bound. A staged file from a publish
+    still IN FLIGHT points at a different inode -- the key either does not exist yet or
+    still names the previous one -- so a concurrent writer's temp is never touched.
+    Anything that is not a regular file, and anything whose inode differs, is left alone.
+
+    **The key's own directory entry is synced BEFORE the second name is dropped, and a
+    sync the device refuses REFUSES the spawn.** Sharing an inode makes the second name
+    redundant for reading, not for durability: the publisher keeps it exactly when
+    ``fsync_dir`` on the key's parent failed, so at that moment the destination entry may
+    not have reached the device and the staged name is the inode's one other reference. A
+    crash after this function unlinked it, and before that entry commits, would leave the
+    inode with no name at all -- the signing key gone and every dashboard session invalid.
+    Syncing first is what makes dropping it lossless rather than probabilistic. Where a
+    directory sync cannot be EXPRESSED (Windows has no directory descriptor, some network
+    mounts reject it) ``fsync_dir`` returns quietly and the unlink proceeds, so the refusal
+    is reserved for a device that actively refused the write -- a host whose storage is
+    failing, where destroying the key's only durable name is the worse outcome.
+
+    The sync runs only when a matching alias was actually found. A healthy home returns at
+    the link-count test above, so this costs nothing on the ordinary spawn path.
+
+    Runs BEFORE :func:`_refuse_aliased_masked_leaves`, which is the ordering this function
+    exists to establish: cleanup that a refusal gates on must not sit behind it.
+
+    A root, staging directory, or key it cannot open or stat is SKIPPED rather than
+    escalated. Refusing here would fail every spawn for a layout that is merely unusual,
+    and the refusal downstream still judges whatever link count survives.
+    """
+    removed: list[str] = []
+    for root in _masked_crew_home_roots():
+        try:
+            key_info = os.lstat(os.path.join(root, _AUTH_STORE_PUBLISHED_KEY_LEAF))
+        except OSError:
+            # No published key here, so no staged name can be a second link to one.
+            continue
+        if not stat.S_ISREG(key_info.st_mode) or key_info.st_nlink < 2:
+            continue
+        dir_fd = _open_dir_anchored(root, (_AUTH_STORE_STAGING_LEAF,))
+        if dir_fd is None:
+            continue
+        try:
+            aliases: list[str] = []
+            for name in os.listdir(dir_fd):
+                try:
+                    info = os.lstat(name, dir_fd=dir_fd)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                if (info.st_dev, info.st_ino) != (key_info.st_dev, key_info.st_ino):
+                    # A different inode: an in-flight staging write, or an unrelated file.
+                    continue
+                aliases.append(name)
+            if not aliases:
+                continue
+            try:
+                fsync_dir(root)
+            except OSError as exc:
+                raise SandboxCeilingUnsealable(
+                    f"cannot sync {safe_terminal_line(root)} to make the token-signing "
+                    f"key's own directory entry durable: {safe_terminal_line(str(exc))}. "
+                    "The publisher kept a staging link as the key inode's second name "
+                    "because that same sync failed, so dropping it now could leave the key "
+                    "with no name at all after a crash, and keeping it leaves the masked "
+                    "leaf with a link count the spawn path refuses on. Fix the device or "
+                    "filesystem holding the data home, then restart."
+                ) from exc
+            for name in aliases:
+                candidate = os.path.join(root, _AUTH_STORE_STAGING_LEAF, name)
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise SandboxCeilingUnsealable(
+                        f"cannot remove the stale auth-store staging link "
+                        f"{safe_terminal_line(candidate)}: {safe_terminal_line(str(exc))}. It "
+                        "is a second name for the token-signing key, so the masked leaf has "
+                        "a link count the spawn path refuses on, and leaving it would make "
+                        "that refusal permanent. Remove it and restart."
+                    ) from exc
+                logger.info(
+                    "sandbox: removed a stale auth-store staging link at %s. The publish it "
+                    "belonged to had already linked the key into place and that name is now "
+                    "synced, so this name was a redundant second name for the same inode "
+                    "and the masked leaf read as aliased.",
+                    candidate,
+                )
+                removed.append(candidate)
+        finally:
+            os.close(dir_fd)
+    return removed
 
 
 def _sweep_legacy_auth_store_temps() -> list[str]:
@@ -3226,19 +3458,24 @@ def _sweep_legacy_auth_store_temps() -> list[str]:
     skipping removes the deletion hazard entirely, while refusing would fail every spawn on
     a host whose layout is merely unusual. A file that matches and cannot be removed DOES
     refuse the spawn, naming the path -- launching would hand the agent the signing key.
+
+    A match is only removed once it is known not to be the key inode's last name, because
+    the pre-upgrade publisher kept exactly this name when its own directory sync failed:
+
+    * the published key is ABSENT -- REFUSED, and nothing is removed. Whether this name is
+      the inode's only one cannot be told apart from a staged write that never published,
+      so removing it risks destroying a key an operator can still recover by renaming it,
+      while leaving it hands the agent a cleartext key at an unmasked name. Refusing does
+      neither, and the message says which of the two the operator wants.
+    * the published key is present and shares this inode -- ``fsync_dir`` on the root first,
+      refusing where the device refuses it, then remove. Sharing the inode means the key's
+      own entry may not have reached the device yet, so this is the protocol
+      :func:`_reconcile_auth_store_staging_links` uses for the same reason.
+    * the published key is present with a different inode -- removed. It is an older or
+      never-published staged copy, and the live key is reachable by its own name.
     """
     removed: list[str] = []
-    roots: list[str] = []
-    try:
-        roots.append(str(config_dir()))
-    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
-        logger.debug("could not resolve the crew data home for the auth-store sweep", exc_info=True)
-    try:
-        home = Path.home()
-        roots.extend(str(home / Path(prefix)) for prefix in _CREW_HOME_PREFIXES)
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("could not resolve $HOME for the auth-store sweep", exc_info=True)
-    for root in dict.fromkeys(roots):
+    for root in _masked_crew_home_roots():
         dir_fd = _open_dir_anchored(root, ())
         if dir_fd is None:
             continue
@@ -3248,10 +3485,47 @@ def _sweep_legacy_auth_store_temps() -> list[str]:
                     continue
                 candidate = os.path.join(root, name)
                 try:
-                    if not stat.S_ISREG(os.lstat(name, dir_fd=dir_fd).st_mode):
-                        continue
+                    info = os.lstat(name, dir_fd=dir_fd)
                 except OSError:
                     continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                try:
+                    key_info = os.lstat(_AUTH_STORE_PUBLISHED_KEY_LEAF, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    raise SandboxCeilingUnsealable(
+                        f"the legacy auth-store staging temp {candidate} is present while "
+                        f"{os.path.join(root, _AUTH_STORE_PUBLISHED_KEY_LEAF)} is absent, so "
+                        "it may be the only remaining name for the inode holding the "
+                        "token-signing key. Removing it could destroy a key an operator can "
+                        "still recover, and leaving it in place hands the agent a cleartext "
+                        "key at a name no mask covers, so the spawn refuses instead. Rename "
+                        "it onto the signing-key name to keep every current dashboard "
+                        "session, or delete it to mint a fresh key on the next start."
+                    ) from None
+                except OSError:
+                    # The key's own entry cannot be classified, so whether this name is its
+                    # last one is unknown. Skip rather than unlink: the same fail-closed
+                    # choice the descent above makes, and the mask still covers the key.
+                    continue
+                if (info.st_dev, info.st_ino) == (key_info.st_dev, key_info.st_ino):
+                    # This name is the published key's SECOND name, which the pre-upgrade
+                    # publisher kept exactly when its own directory sync failed. So the
+                    # key's own entry may not have reached the device, and this is the
+                    # inode's one other reference: sync first, and refuse where the device
+                    # refuses, on the same protocol the staging reconciler uses.
+                    try:
+                        fsync_dir(root)
+                    except OSError as exc:
+                        raise SandboxCeilingUnsealable(
+                            f"cannot sync {safe_terminal_line(root)} before removing the "
+                            f"legacy auth-store staging temp {safe_terminal_line(candidate)}, "
+                            f"which is a second name for the token-signing key's own inode: "
+                            f"{safe_terminal_line(str(exc))}. Dropping it now could leave the "
+                            "key with no name at all after a crash, and keeping it leaves a "
+                            "cleartext key at a name no mask covers. Fix the device or "
+                            "filesystem holding the data home, then restart."
+                        ) from exc
                 try:
                     os.unlink(name, dir_fd=dir_fd)
                 except FileNotFoundError:
@@ -7279,17 +7553,24 @@ def namespace_argv(
     # creatable from any sandbox simply because the data-home ROOT is writable there and
     # an absent name has no mask. Publishing the stub first makes the mask non-vacuous.
     _materialize_live_target_mask_target()
+    # CLEANUP BEFORE THE REFUSAL, and this order is a contract rather than a preference.
+    # Both sweeps and the reconciliation remove names that are themselves hard links to a
+    # masked credential leaf -- a pre-upgrade orphan is a link to the signing key by
+    # construction, and so is a staging name the publisher kept when its directory sync
+    # failed. The refusal below reads ``st_nlink``, so running it first would refuse on a
+    # link count that the very next statement was about to fix, and refuse again on every
+    # later spawn: the cleanup written for that state would sit permanently behind the gate
+    # it is supposed to open. Neither sweep needs the refusal to have run, because each
+    # descends by pinned descriptor and skips a root it cannot open.
+    _sweep_legacy_md_notebook_temps()
+    _sweep_legacy_auth_store_temps()
+    _reconcile_auth_store_staging_links()
     # LAST of the pre-spawn checks, and last on purpose: every masked leaf's NAME must be
     # the name the mask binds, and the leaves above have already answered for themselves
     # with sentences tailored to what they hold. This pass covers the rest -- the masked
     # leaves nothing materialises, whose alias went unreported entirely -- and creates
     # nothing, so an unused store stays absent.
     _refuse_aliased_masked_leaves()
-    # A pre-upgrade orphan already ON disk is a different problem from an absent mask
-    # target, and this one is not Linux-specific: see the sweep's own docstring for why
-    # the macOS path calls it too.
-    _sweep_legacy_md_notebook_temps()
-    _sweep_legacy_auth_store_temps()
 
     script = _build_launcher_script(
         sandbox_level,
@@ -8182,6 +8463,11 @@ def sandbox_exec_argv(
     # that does not exist yet — but an orphan already on disk needs sweeping here too.
     _sweep_legacy_md_notebook_temps()
     _sweep_legacy_auth_store_temps()
+    # Reconciled here as well, though only the namespace path refuses on a link count. The
+    # stale name is a second name for the signing key either way, and leaving it to
+    # accumulate on a macOS host means the first Linux spawn on a shared data home meets a
+    # backlog of them.
+    _reconcile_auth_store_staging_links()
 
     profile = _build_seatbelt_profile(
         sandbox_level,

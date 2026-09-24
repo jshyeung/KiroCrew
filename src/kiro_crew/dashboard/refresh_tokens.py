@@ -579,12 +579,41 @@ class RefreshStateManager:
                 # file tools as a whole directory, so no name inside it is
                 # reachable either way. Both steps are atomic renames, so the
                 # destination is never partial.
-                staged = auth_store_staging_dir(self._state_path.parent) / (
+                payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+                try:
+                    staging = auth_store_staging_dir(self._state_path.parent)
+                except OSError as exc:
+                    # The staging directory is unusable, so publish through the state
+                    # file's own directory instead of letting this reach the handler
+                    # below. That handler only warns, and the caller reports a
+                    # successful rotation or logout either way, so dropping the write
+                    # here would lose the consumed-JTI or revoked-chain record and the
+                    # next restart would accept the spent token. Persisting keeps the
+                    # security property that matters; what it gives up is the mask over
+                    # the write window, which is a stated residual. mkstemp still picks
+                    # a random name, so there is no name to pre-plant.
+                    logger.warning(  # nosemgrep: python-logger-credential-disclosure -- the rule fires on the "refresh_tokens:" prefix; the arguments are the state-file path and an OSError, never a record value.  # noqa: E501  # fmt: skip
+                        "refresh_tokens: auth-store staging directory unusable for %s "
+                        "(%s); publishing through the state file's own directory so the "
+                        "reuse-detection record is not lost. The write window is not "
+                        "masked from agent namespaces until the staging directory is "
+                        "usable again.",
+                        self._state_path,
+                        exc,
+                    )
+                    atomic_write(
+                        self._state_path,
+                        payload,
+                        restrict_to_owner=True,
+                        restrict_on_error="warn",
+                    )
+                    return
+                staged = staging / (
                     f"{self._state_path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
                 )
                 atomic_write(
                     staged,
-                    json.dumps(data, separators=(",", ":")).encode("utf-8"),
+                    payload,
                     restrict_to_owner=True,
                     restrict_on_error="warn",
                 )

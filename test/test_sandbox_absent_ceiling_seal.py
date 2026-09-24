@@ -68,10 +68,21 @@ def _no_host_ssh_probe(monkeypatch):
 
 @pytest.fixture()
 def crew_home(tmp_path, monkeypatch):
-    """Point ``config_dir()`` — the live data home — at a scratch tree."""
+    """Point ``config_dir()`` — the live data home — at a scratch tree.
+
+    ``Path.home`` is pinned at the same scratch root, and that half is load-bearing rather
+    than tidiness. The masked-leaf passes resolve EVERY crew-home spelling
+    (:func:`sandbox._masked_crew_home_roots`), because the masks cover every spelling and a
+    check scoped to the live home alone would judge one of them. Under a bare
+    ``config_dir()`` patch those passes would read ``$HOME/.kiro/crew`` and
+    ``$HOME/.kirocrew`` on the machine running the suite, so a developer whose real data
+    home happens to hold a hard-linked credential leaf would see refusals from tests that
+    never created one.
+    """
     home = tmp_path / ".kiro" / "crew"
     home.mkdir(parents=True)
     monkeypatch.setattr(sandbox, "config_dir", lambda: home)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     return home
 
 
@@ -671,6 +682,125 @@ class TestAMaskedCredentialLeafRefusesASecondHardLink:
         with pytest.raises(OSError):
             os.link(target, crew_home / "diag-alias")
 
+    def test_a_credential_leaf_in_the_LEGACY_home_spelling_refuses(self, crew_home, tmp_path):
+        """The masks cover both spellings, so a check on the live one alone judges half.
+
+        ``_crew_home_entries`` expands every hidden leaf across both
+        ``_CREW_HOME_PREFIXES``, so ``~/.kirocrew/.env`` is masked and holds live channel
+        tokens whichever spelling ``config_dir()`` resolves to. A second hard link on it
+        reaches those bytes under a name no mask covers.
+        """
+        legacy = tmp_path / ".kirocrew"
+        legacy.mkdir()
+        target = legacy / ".env"
+        target.write_text("SLACK_BOT_TOKEN=x\n", encoding="utf-8")
+        os.link(target, legacy / "env-alias")
+        assert target.stat().st_nlink == 2
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._refuse_aliased_masked_leaves()
+        assert ".env" in str(caught.value)
+        assert "hard links" in str(caught.value)
+
+    def test_a_credential_leaf_left_in_the_DEFAULT_home_by_a_relocation_refuses(
+        self, tmp_path, monkeypatch
+    ):
+        """A relocated ``KIROCREW_HOME`` needs no migration history to reach this.
+
+        ``_relocated_crew_targets`` masks the resolved home ON TOP of the ``$HOME``-relative
+        spellings, so both the relocated home AND the default one are masked at once. A
+        signing key left in the default home is then masked, unread by a live-home-only
+        check, and readable through a second name.
+        """
+        relocated = tmp_path / "srv" / "crew"
+        relocated.mkdir(parents=True)
+        monkeypatch.setattr(sandbox, "config_dir", lambda: relocated)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        default = tmp_path / ".kiro" / "crew"
+        default.mkdir(parents=True)
+        stranded = default / "token_signing.key"
+        stranded.write_bytes(b"k" * 32)
+        os.link(stranded, default / "key-alias")
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._refuse_aliased_masked_leaves()
+        assert "token_signing.key" in str(caught.value)
+
+    def test_an_integrity_leaf_in_a_NON_LIVE_home_still_does_not_refuse(
+        self, crew_home, tmp_path, caplog
+    ):
+        """The widening carries the credential/integrity split with it, not past it.
+
+        Without this the cross-home pass could quietly refuse on every masked leaf in a
+        second home while the live home still warns for the same shape, which is a
+        different rule in each home.
+        """
+        leaf = _HARDLINK_TOLERATED_FILE_LEAVES[0]
+        legacy = tmp_path / ".kirocrew"
+        target = legacy / leaf
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n", encoding="utf-8")
+        os.link(target, legacy / f"alias-{leaf.replace('/', '-')}")
+
+        with caplog.at_level("WARNING"):
+            sandbox._refuse_aliased_masked_leaves()  # does not raise
+
+    def test_a_symlinked_legacy_home_does_not_refuse_the_spawn(self, crew_home, tmp_path):
+        """The layout a part-migrated host actually has must keep starting agents.
+
+        Pointing the legacy home AT the live one is the ordinary migration shape. Both names
+        then reach ONE inode, whose link count the live home's own pass already judges, so
+        refusing here would break a working host to close nothing.
+        """
+        (tmp_path / ".kirocrew").symlink_to(crew_home, target_is_directory=True)
+        target = crew_home / ".env"
+        target.write_text("SLACK_BOT_TOKEN=x\n", encoding="utf-8")
+        assert target.stat().st_nlink == 1
+
+        sandbox._refuse_aliased_masked_leaves()  # does not raise
+
+    def test_the_roots_cover_every_spelling_the_masks_do(self, crew_home, tmp_path):
+        """The refusal's root set and the mask's prefix set must not drift apart."""
+        roots = sandbox._masked_crew_home_roots()
+        for prefix in sandbox._CREW_HOME_PREFIXES:
+            assert str(tmp_path / Path(prefix)) in roots, f"{prefix} is masked but unchecked"
+        assert len(roots) == len(set(roots)), "a root repeated means one leaf is stat-ed twice"
+
+    def test_the_refused_set_matches_an_independently_written_list(self):
+        """Parameterizing from the set under test lets a deletion remove its own case.
+
+        Every other test in this class derives its cases from
+        ``_CREW_HARDLINK_REFUSED_LEAVES``, so dropping a leaf from that set silently drops
+        the test that guarded it and the suite stays green while the protection is gone.
+        This list is written out by hand for exactly that reason: changing the set must also
+        change this literal, which is a decision someone makes rather than a side effect.
+        """
+        from kiro_crew.identity_stores import AUTH_SQLITE_DB, AUTH_SQLITE_SIDECAR_SUFFIXES
+
+        expected = {
+            # signs dashboard access and refresh tokens
+            "token_signing.key",
+            # refresh-token chain state; a read continues a session
+            "refresh_chains.json",
+            # live GitHub PAT
+            "workspace/md-notebook/pat",
+            # named secrets store
+            "ops_mission_control_secrets.json",
+            # channel tokens
+            ".env",
+            # browser session material; a restored copy still carries live cookies
+            "browser-cookies.txt",
+            "playwright-storage-state.json",
+            "playwright-extension-token",
+            # the auth store: the module states the bytes are a live bearer token
+            AUTH_SQLITE_DB,
+            *(f"{AUTH_SQLITE_DB}{suffix}" for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES),
+        }
+        assert set(sandbox._CREW_HARDLINK_REFUSED_LEAVES) == expected, (
+            "the refused set changed; update this literal deliberately, and check the "
+            "leaf's reason block and the security spec with it"
+        )
+
     def test_the_refused_set_names_only_masked_leaves(self):
         """An entry outside ``_CREW_HIDDEN_LEAVES`` would refuse over a path nothing masks.
 
@@ -716,6 +846,214 @@ class TestAMaskedCredentialLeafRefusesASecondHardLink:
 
 
 @_POSIX_ONLY
+class TestTheAuthStoreStagingReconciliation:
+    """A staging name that is a second link to the published key is dropped, not refused.
+
+    Without this the hard-link refusal is a one-way door on a state the gateway's own
+    publisher creates deliberately: `token_secret` KEEPS the staging name when the directory
+    sync after `os.link` fails, as a recoverable second name, and a kill between the link
+    and the cleanup unlink leaves the same shape. The key then has two names, so every
+    confined spawn refuses, and the operator's only exit is to find and remove the file by
+    hand.
+    """
+
+    @pytest.fixture
+    def staged_link(self, crew_home):
+        """The published key plus a staging name that is a second link to it."""
+        key = crew_home / sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF
+        key.write_bytes(b"k" * 32)
+        staging = crew_home / sandbox._AUTH_STORE_STAGING_LEAF
+        staging.mkdir(mode=0o700)
+        stale = staging / ".token_signing.key.4242.deadbeefcafe0123.tmp"
+        os.link(key, stale)
+        assert key.stat().st_nlink == 2
+        return key, stale
+
+    def test_it_removes_the_stale_staging_link(self, staged_link):
+        key, stale = staged_link
+
+        removed = sandbox._reconcile_auth_store_staging_links()
+
+        assert not stale.exists(), "the stale staging link survived"
+        assert str(stale) in removed
+        assert key.read_bytes() == b"k" * 32, "reconciling must not touch the key's bytes"
+        assert key.stat().st_nlink == 1
+
+    def test_the_spawn_path_is_not_deadlocked_by_it(self, staged_link):
+        """The whole point: the refusal must be reachable past this state, not blocked by it.
+
+        Asserted as the two calls in the order the spawn path uses them, because that order
+        IS the fix -- with the refusal first this raises and no later spawn can ever clear
+        it.
+        """
+        sandbox._reconcile_auth_store_staging_links()
+        sandbox._refuse_aliased_masked_leaves()  # does not raise
+
+    def test_it_syncs_the_keys_parent_BEFORE_dropping_the_second_name(
+        self, staged_link, monkeypatch
+    ):
+        """Sharing an inode makes the staged name redundant for READING, not for durability.
+
+        The publisher keeps that name precisely when the sync of the key's own parent
+        failed, so at that moment the key's directory entry may not have reached the device
+        and the staged name is the inode's one other reference. Dropping it first and
+        crashing leaves the inode with no name at all.
+        """
+        key, stale = staged_link
+        seen: list[tuple[str, bool]] = []
+
+        def fake_sync(path, **kwargs):
+            seen.append((str(path), stale.exists()))
+
+        monkeypatch.setattr(sandbox, "fsync_dir", fake_sync)
+
+        sandbox._reconcile_auth_store_staging_links()
+
+        assert seen, "the key's own parent was never synced"
+        synced, stale_still_there = seen[0]
+        assert synced == str(key.parent), f"synced {synced}, not the key's parent"
+        assert stale_still_there, (
+            "the staged link was unlinked BEFORE the sync that makes the key's own name "
+            "durable, so a crash in between would leave the inode with no name"
+        )
+        assert not stale.exists(), "the link survived a successful sync"
+
+    def test_a_device_refused_sync_refuses_the_spawn_and_KEEPS_the_link(
+        self, staged_link, monkeypatch
+    ):
+        """A failing sync means the key's entry is not durable, so its other name stays.
+
+        Refusing is the honest outcome: the spawn cannot proceed while the leaf carries two
+        names, and dropping the second one on a host whose device refuses the write trades
+        a refused spawn for a possibly unrecoverable signing key.
+        """
+        key, stale = staged_link
+
+        def refuse_sync(path, **kwargs):
+            raise OSError(errno.EIO, "device refused the directory write")
+
+        monkeypatch.setattr(sandbox, "fsync_dir", refuse_sync)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._reconcile_auth_store_staging_links()
+
+        assert stale.exists(), "the key's only other name was dropped after a failed sync"
+        assert key.stat().st_nlink == 2
+        assert "durable" in str(caught.value)
+
+    def test_an_unsupported_sync_still_drops_the_link(self, staged_link, monkeypatch):
+        """``fsync_dir`` returns quietly where a directory sync cannot be EXPRESSED.
+
+        Windows has no directory descriptor and some network mounts reject one, so a quiet
+        return must not be read as a refusal -- that would make every such host refuse
+        every spawn.
+        """
+        _key, stale = staged_link
+        monkeypatch.setattr(sandbox, "fsync_dir", lambda path, **kwargs: None)
+
+        removed = sandbox._reconcile_auth_store_staging_links()
+
+        assert not stale.exists()
+        assert str(stale) in removed
+
+    def test_no_sync_when_there_is_no_matching_alias(self, crew_home, monkeypatch):
+        """The cost bound: an ordinary spawn must not pay a directory sync.
+
+        The key here has a second name, so the link-count test passes, but nothing in the
+        staging directory shares its inode -- so there is nothing to drop and nothing to
+        make durable first.
+        """
+        key = crew_home / sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF
+        key.write_bytes(b"k" * 32)
+        os.link(key, crew_home / "alias-outside-staging")
+        staging = crew_home / sandbox._AUTH_STORE_STAGING_LEAF
+        staging.mkdir(mode=0o700)
+        (staging / ".token_signing.key.1.aa.tmp").write_bytes(b"n" * 32)
+        calls: list[str] = []
+        monkeypatch.setattr(sandbox, "fsync_dir", lambda path, **kw: calls.append(str(path)))
+
+        sandbox._reconcile_auth_store_staging_links()
+
+        assert calls == [], f"synced {calls} with no alias to drop"
+
+    def test_a_staged_file_for_an_UNPUBLISHED_key_is_left_alone(self, crew_home):
+        """The bound, and the inode identity is what draws it.
+
+        A publish still in flight has staged its bytes but not linked them into place, so
+        its temp is a DIFFERENT inode. Unlinking that would destroy a concurrent writer's
+        work between its staging write and its link.
+        """
+        key = crew_home / sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF
+        key.write_bytes(b"k" * 32)
+        os.link(key, crew_home / "some-other-alias")
+        staging = crew_home / sandbox._AUTH_STORE_STAGING_LEAF
+        staging.mkdir(mode=0o700)
+        inflight = staging / ".token_signing.key.9999.abcdef0123456789.tmp"
+        inflight.write_bytes(b"n" * 32)
+
+        removed = sandbox._reconcile_auth_store_staging_links()
+
+        assert inflight.exists(), "an in-flight staging write for a different inode was removed"
+        assert removed == []
+
+    def test_a_non_regular_staging_entry_is_left_alone(self, crew_home):
+        key = crew_home / sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF
+        key.write_bytes(b"k" * 32)
+        os.link(key, crew_home / "alias")
+        staging = crew_home / sandbox._AUTH_STORE_STAGING_LEAF
+        staging.mkdir(mode=0o700)
+        subdir = staging / "not-a-file"
+        subdir.mkdir()
+
+        sandbox._reconcile_auth_store_staging_links()
+
+        assert subdir.is_dir(), "a directory inside the staging dir was removed"
+
+    def test_it_is_quiet_when_the_key_has_one_name(self, crew_home):
+        key = crew_home / sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF
+        key.write_bytes(b"k" * 32)
+        staging = crew_home / sandbox._AUTH_STORE_STAGING_LEAF
+        staging.mkdir(mode=0o700)
+
+        assert sandbox._reconcile_auth_store_staging_links() == []
+
+    def test_it_is_quiet_with_no_staging_directory(self, crew_home):
+        (crew_home / sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF).write_bytes(b"k" * 32)
+
+        assert sandbox._reconcile_auth_store_staging_links() == []
+
+    def test_cleanup_runs_before_the_refusal_on_both_launch_paths(self):
+        """The ordering contract, pinned in source rather than left to call-site drift.
+
+        A future edit that moves the refusal above the cleanup restores the deadlock, and
+        nothing else in the suite would notice: every test here calls the two functions
+        directly.
+        """
+        for builder in (
+            sandbox.namespace_argv,
+            sandbox.sandbox_exec_argv,
+        ):
+            body = inspect.getsource(builder)
+            if "_refuse_aliased_masked_leaves()" not in body:
+                # The Seatbelt path does not refuse at all; it only cleans up.
+                assert "_reconcile_auth_store_staging_links()" in body
+                continue
+            cleanup = body.index("_reconcile_auth_store_staging_links()")
+            refusal = body.index("_refuse_aliased_masked_leaves()")
+            assert cleanup < refusal, (
+                f"{builder.__name__} refuses on the link count before the reconciliation "
+                "that clears it, which makes the refusal permanent"
+            )
+
+    def test_the_legacy_prefix_is_derived_from_the_key_leaf(self):
+        """Two spellings of one filename is how a rename half-lands."""
+        assert (
+            sandbox._AUTH_STORE_LEGACY_TEMP_PREFIX == f".{sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF}."
+        )
+        assert sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF in sandbox._CREW_HARDLINK_REFUSED_LEAVES
+
+
+@_POSIX_ONLY
 class TestTheDoctorReadOfMaskedCredentialAliases:
     """The refusal must not be an operator's first notice, so doctor reads it pre-spawn.
 
@@ -737,6 +1075,54 @@ class TestTheDoctorReadOfMaskedCredentialAliases:
         (crew_home / "token_signing.key").write_bytes(b"key")
 
         assert sandbox.masked_credential_leaf_aliases() == []
+
+    def test_it_reports_an_aliased_leaf_in_a_NON_LIVE_masked_home(self, crew_home, tmp_path):
+        """A probe narrower than the refusal is worse than none at all.
+
+        It would report a clean host and the next spawn would refuse anyway, which is the
+        outage this read exists to pre-empt. So the probe walks the same homes the refusal
+        does.
+        """
+        legacy = tmp_path / ".kirocrew"
+        legacy.mkdir()
+        stranded = legacy / "token_signing.key"
+        stranded.write_bytes(b"k" * 32)
+        os.link(stranded, legacy / "alias")
+
+        found = sandbox.masked_credential_leaf_aliases()
+
+        assert (str(stranded), 2) in found
+
+    def test_the_probe_and_the_refusal_read_the_same_homes(self):
+        """Pinned as one source, because two lists that must agree are a list that drifts.
+
+        Judged on the executable body with the docstring dropped: both functions DISCUSS
+        ``config_dir()`` in prose, which is exactly the gap they explain, so scanning raw
+        source would fail on the explanation instead of on the code.
+        """
+        import ast
+
+        def code_only(func) -> str:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+            body = tree.body[0].body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body = body[1:]
+            return "\n".join(ast.unparse(node) for node in body)
+
+        for func in (
+            sandbox.masked_credential_leaf_aliases,
+            sandbox._refuse_multilinked_credential_leaves,
+        ):
+            body = code_only(func)
+            assert "_masked_crew_home_roots()" in body, f"{func.__name__} does not read every home"
+            assert (
+                "config_dir()" not in body
+            ), f"{func.__name__} resolves the live home alone, which is the gap itself"
 
     def test_it_creates_nothing(self, crew_home):
         before = sorted(p.name for p in crew_home.iterdir())
@@ -849,6 +1235,83 @@ class TestTheDoctorReadOfMaskedCredentialAliases:
             source.index("_refuse_aliased_masked_leaves()"),
         ]
         assert order == sorted(order), "the alias pass must run last"
+
+
+@_POSIX_ONLY
+class TestACredentialLeafBehindALinkedComponentIsNotRefused:
+    """A link count read THROUGH a link belongs to a file somewhere else entirely.
+
+    ``lstat`` leaves only the final component un-followed, so for a multi-component
+    credential leaf a link planted above it makes this read report the link count of a file
+    outside the data home. Refusing on that number would fail every spawn over a file the
+    sandbox does not protect, and it would invert the decision
+    ``_CREW_ALIAS_CHAIN_DEGRADE_LEAVES`` records for exactly that chain: degrade, do not
+    refuse. The chain hazard has its own control, and this pass is not it.
+    """
+
+    @staticmethod
+    def _multi_component_leaves() -> list[str]:
+        return sorted(
+            leaf for leaf in sandbox._CREW_HARDLINK_REFUSED_LEAVES if "/" in leaf or os.sep in leaf
+        )
+
+    def test_such_a_leaf_exists_to_test(self):
+        """Guard against a vacuous pass if the refused set ever loses its nested leaf."""
+        assert self._multi_component_leaves(), (
+            "no multi-component leaf in _CREW_HARDLINK_REFUSED_LEAVES, so the cases below "
+            "prove nothing"
+        )
+
+    def _plant(self, crew_home, tmp_path, leaf):
+        """Put an aliased leaf behind a symlinked FIRST component, outside the data home."""
+        victim = tmp_path / "agent-owned"
+        parts = leaf.replace(os.sep, "/").split("/")
+        (victim / "/".join(parts[1:-1])).mkdir(parents=True, exist_ok=True)
+        target = victim / "/".join(parts[1:])
+        target.write_bytes(b"secret")
+        os.link(target, victim / "second-name")
+        assert target.stat().st_nlink == 2
+        planted = crew_home / parts[0]
+        if planted.is_symlink():
+            planted.unlink()
+        elif planted.is_dir():
+            shutil.rmtree(planted)
+        planted.symlink_to(victim, target_is_directory=True)
+        return target
+
+    def test_the_refusal_skips_it(self, crew_home, tmp_path):
+        for leaf in self._multi_component_leaves():
+            self._plant(crew_home, tmp_path, leaf)
+
+        sandbox._refuse_multilinked_credential_leaves()  # does not raise
+
+    def test_the_doctor_read_skips_it_too(self, crew_home, tmp_path):
+        """A probe wider than the refusal fails doctor's exit code over a foreign path."""
+        planted = [
+            self._plant(crew_home, tmp_path, leaf) for leaf in self._multi_component_leaves()
+        ]
+
+        found = sandbox.masked_credential_leaf_aliases()
+
+        assert found == [], f"doctor reported an alias it cannot refuse on: {found}"
+        for target in planted:
+            assert target.stat().st_nlink == 2, "the probe must not change anything"
+
+    def test_a_REAL_chain_with_an_aliased_leaf_still_refuses(self, crew_home):
+        """The skip is about the linked component, not about the nested leaf.
+
+        With every component a real directory, the leaf is inside the data home and its
+        second name is exactly what this refusal exists for.
+        """
+        leaf = self._multi_component_leaves()[0]
+        target = crew_home / leaf
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"secret")
+        os.link(target, crew_home / "alias")
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._refuse_multilinked_credential_leaves()
+        assert leaf.replace("/", os.sep) in str(caught.value)
 
 
 @_POSIX_ONLY
@@ -1610,6 +2073,7 @@ class TestTheAuthStoreStagingLeafIsSpelledOnceInEffect:
         assert sandbox._AUTH_STORE_STAGING_LEAF in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES
 
 
+@_POSIX_ONLY
 class TestTheLegacyAuthStoreTempSweep:
     """Pre-upgrade signing-key temps in the data-home root are removed on spawn.
 
@@ -1618,6 +2082,16 @@ class TestTheLegacyAuthStoreTempSweep:
     ``atomic_write`` stages ``tmp<random>.tmp`` in it for unrelated stores. So the control
     test below -- an unrelated temp SURVIVES -- is what proves this sweep cannot unlink
     another component's in-flight write between its ``mkstemp`` and its rename.
+
+    POSIX-only for a reason that is a property of the code under test, not of the test.
+    The sweep lists and unlinks through a PINNED DIRECTORY DESCRIPTOR -- ``os.listdir(fd)``
+    and ``os.unlink(..., dir_fd=fd)`` from :func:`_open_dir_anchored` -- which is how it
+    refuses to delete through a component swapped under it. Windows offers none of that
+    family, so the descriptor open fails, the sweep skips every root and removes nothing.
+    That is correct rather than broken: its only callers are the Linux namespace launcher
+    and the macOS Seatbelt builder, and Windows has no sandbox launcher to call it. Running
+    these assertions there would measure the absence of a code path instead of its
+    behaviour, and the bound control would pass while discriminating nothing.
     """
 
     @pytest.fixture
@@ -1634,6 +2108,8 @@ class TestTheLegacyAuthStoreTempSweep:
         return home / f"{sandbox._AUTH_STORE_LEGACY_TEMP_PREFIX}4242.deadbeefcafe0123.tmp"
 
     def test_it_removes_a_signing_key_staging_orphan(self, isolated_home):
+        key = isolated_home / sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF
+        key.write_bytes(b"live" * 8)
         orphan = self._orphan(isolated_home)
         orphan.write_bytes(b"k" * 32)
 
@@ -1644,6 +2120,86 @@ class TestTheLegacyAuthStoreTempSweep:
             "readable in every agent namespace"
         )
         assert str(orphan) in removed
+        assert key.exists(), "the live key was removed alongside the orphan"
+
+    def test_an_orphan_is_KEPT_when_the_published_key_is_absent(self, isolated_home):
+        """With no key at its own name, the orphan may be the inode's last name.
+
+        That state is indistinguishable from a staged write that never published, so
+        removing it risks destroying a key an operator can still recover by renaming, while
+        leaving it silently hands the agent a cleartext key at an unmasked name. Refusing
+        does neither.
+        """
+        orphan = self._orphan(isolated_home)
+        orphan.write_bytes(b"k" * 32)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._sweep_legacy_auth_store_temps()
+
+        assert orphan.exists(), (
+            "the sweep removed the orphan while the key's own name was absent; that can "
+            "destroy the only remaining name for the signing key's inode"
+        )
+        assert str(orphan) in str(caught.value)
+        assert sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF in str(caught.value), (
+            "the refusal must name the signing-key path, or the operator cannot tell which "
+            "of the two recoveries the message is offering"
+        )
+
+    def test_an_orphan_sharing_the_keys_inode_is_synced_before_removal(
+        self, isolated_home, monkeypatch
+    ):
+        """A second name for the key inode gets the reconciler's fsync-first protocol.
+
+        The pre-upgrade publisher kept exactly this name when its own directory sync failed,
+        so the key's own entry may not have reached the device and this is the inode's one
+        other reference.
+        """
+        key = isolated_home / sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF
+        key.write_bytes(b"k" * 32)
+        orphan = self._orphan(isolated_home)
+        os.link(key, orphan)
+
+        synced: list[str] = []
+        unlinked: list[str] = []
+        real_unlink = os.unlink
+
+        def _record_sync(path):
+            synced.append(str(path))
+
+        def _record_unlink(name, *args, **kwargs):
+            unlinked.append(str(name))
+            return real_unlink(name, *args, **kwargs)
+
+        monkeypatch.setattr(sandbox, "fsync_dir", _record_sync)
+        monkeypatch.setattr(os, "unlink", _record_unlink)
+
+        sandbox._sweep_legacy_auth_store_temps()
+
+        assert synced, "the key's own parent was never synced before its second name went"
+        assert unlinked, "nothing was unlinked, so the ordering claim is untested"
+        assert key.exists(), "the sweep removed the key's own name"
+
+    def test_a_device_refused_sync_KEEPS_the_keys_second_name(self, isolated_home, monkeypatch):
+        """Where the device refuses the sync, removing the second name can lose the inode."""
+        key = isolated_home / sandbox._AUTH_STORE_PUBLISHED_KEY_LEAF
+        key.write_bytes(b"k" * 32)
+        orphan = self._orphan(isolated_home)
+        os.link(key, orphan)
+
+        def _refusing_sync(_path):
+            raise OSError(errno.EIO, "device refused the directory sync")
+
+        monkeypatch.setattr(sandbox, "fsync_dir", _refusing_sync)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._sweep_legacy_auth_store_temps()
+
+        assert orphan.exists(), (
+            "the second name was dropped even though the key's own entry could not be made "
+            "durable; a crash then leaves the inode with no name at all"
+        )
+        assert "sync" in str(caught.value)
 
     def test_it_leaves_an_unrelated_atomic_write_temp_alone(self, isolated_home):
         # atomic_write's own shape for ANY other store in this shared directory.

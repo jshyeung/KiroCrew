@@ -11,6 +11,7 @@ files that don't yet exist for this surface).
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import json
 import os
 import time
@@ -507,6 +508,45 @@ def test_tr_u_16_persistence_roundtrip(tmp_path: Path):
     mgr2 = RefreshStateManager(state_path=state_file)
     assert mgr2.is_consumed("jti1") is True
     assert mgr2.is_chain_revoked("c2") is True
+
+
+def test_tr_u_16b_unusable_staging_dir_still_persists_the_record(tmp_path: Path, monkeypatch):
+    """A refused staging directory must not turn a revocation into a silent no-op.
+
+    ``mark_consumed`` and ``revoke_chain`` return normally whatever the write did, and the
+    endpoints above them report a successful rotation or logout. So a staging directory the
+    validator refuses must still leave the record on disk: otherwise the next restart loads
+    a store with no consumed JTI and no revoked chain, and accepts the spent token.
+
+    What the fallback gives up is the mask over the write window, not the record.
+    """
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    def _refused(_home):
+        raise OSError(errno.ENOTDIR, "staging directory is not usable")
+
+    monkeypatch.setattr(rt, "auth_store_staging_dir", _refused)
+
+    state_file = tmp_path / "rt.json"
+    mgr = RefreshStateManager(state_path=state_file)
+    mgr.mark_consumed(
+        "spent-jti", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    )
+    mgr.revoke_chain("revoked-chain", time.time() + 86400)
+
+    assert state_file.exists(), (
+        "a refused staging directory dropped the state write entirely, so the rotation "
+        "reported success while the reuse-detection record was lost"
+    )
+    reloaded = RefreshStateManager(state_path=state_file)
+    assert reloaded.is_consumed("spent-jti") is True, (
+        "the consumed JTI did not survive a restart, so the spent refresh token would be "
+        "accepted again"
+    )
+    assert reloaded.is_chain_revoked("revoked-chain") is True, (
+        "the chain revocation did not survive a restart, so a logged-out chain would be "
+        "accepted again"
+    )
 
 
 def test_tr_u_17_persistence_file_mode_0600(tmp_path: Path):
