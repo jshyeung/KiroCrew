@@ -105,7 +105,11 @@ from kiro_crew.env import (
     spec_path_key,
 )
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
-from kiro_crew.mcp_cleanup import prune_dangling_tool_refs, purge_deleted_proxy_from_config
+from kiro_crew.mcp_cleanup import (
+    mcp_entry_is_muted,
+    prune_dangling_tool_refs,
+    purge_deleted_proxy_from_config,
+)
 from kiro_crew.mcp_provenance import (
     DERIVED_KEY,
     command_is_ours,
@@ -5696,13 +5700,17 @@ def rebuild_agent_config(
     # collision sibling remains mounted. Grant revocation is intentionally looser:
     # every disabled source denies auto-approval to its canonical alias family,
     # because ``allowedTools`` bypasses the PreToolUse gate.
+    #
+    # "Disabled" is ``mcp_entry_is_muted``, the launch predicate the gateway
+    # rewriter, the session projections and the dashboard listing share: a
+    # non-boolean ``disabled`` (``"false"``, ``null``) is read FAIL-CLOSED here
+    # too, so a server the listing shows as Disabled is never mounted by this
+    # rebuild -- truthiness would have mounted one muted with ``null`` or ``0``.
     _shared_source_entries = tuple(
         itertools.chain(extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items())
     )
     _disabled_source_names = {
-        srv
-        for srv, srv_spec in _shared_source_entries
-        if isinstance(srv_spec, dict) and srv_spec.get("disabled")
+        srv for srv, srv_spec in _shared_source_entries if mcp_entry_is_muted(srv_spec)
     }
     _disabled_mounted_aliases = {
         mounted
@@ -5713,7 +5721,7 @@ def rebuild_agent_config(
     _disabled_grant_families = {
         mcp_server_alias(srv)
         for srv, srv_spec in _shared_source_entries
-        if isinstance(srv_spec, dict) and srv_spec.get("disabled")
+        if mcp_entry_is_muted(srv_spec)
     }
 
     def _grant_ref_is_in_alias_family(ref: object, base: str) -> bool:
@@ -5778,7 +5786,7 @@ def rebuild_agent_config(
             lst[:] = kept
             return True
 
-        if spec.get("disabled") or alias in _disabled_mounted_aliases:
+        if mcp_entry_is_muted(spec) or alias in _disabled_mounted_aliases:
             for key in ("tools", "allowedTools"):
                 if (
                     _strip_owned_refs(key, strip_per_tool=key == "allowedTools")

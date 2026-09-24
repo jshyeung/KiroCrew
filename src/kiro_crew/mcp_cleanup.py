@@ -74,7 +74,13 @@ def mcp_entry_is_muted(entry: Any) -> bool:
     Not every reader of ``disabled`` belongs here. A roster row or a capability
     listing answers "does the user consider this on", where ordinary truthiness is
     right and a wrong answer costs a chip, not a process. This predicate is for
-    the launch decision.
+    the launch decision -- and for every surface that ANNOUNCES it: the dashboard's
+    server listing (``mcp_discovery.list_servers``, which also feeds the probe
+    fan-out and the sync offer) and the ``GET /api/mcp`` stamping read it too,
+    because a row shown enabled beside a launch gate that refuses it is the same
+    disagreement as above in the other direction. The listing reports a
+    non-boolean as a config error so the operator learns why the row is off; it
+    never reads one as "on".
     """
     if not isinstance(entry, dict):
         return False

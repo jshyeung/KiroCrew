@@ -11,6 +11,7 @@ to auto-sync newly discovered servers into the agent config.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 import logging
@@ -22,7 +23,7 @@ import shutil
 import signal
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sized
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ from kiro_crew.env import (
     spec_path_key,
 )
 from kiro_crew.hooks import safe_read_file
+from kiro_crew.mcp_cleanup import mcp_entry_is_muted
 from kiro_crew.mcp_grant import grant_observed
 from kiro_crew.mcp_provenance import ABSENT, resolve_write
 from kiro_crew.mcp_utils import kiro_entry_client_id, kiro_entry_scopes, mcp_server_alias
@@ -257,6 +259,159 @@ def reset_unresolvable_warnings() -> None:
     automatically inside the probe path.
     """
     _unresolvable_warned.clear()
+
+
+#: How many ``(server, value)`` digests the invalid-``disabled`` ledger retains.
+#: Warn-once for a handful of config errors needs a handful of entries; a config
+#: with more malformed ``disabled`` values than this gets them reported up to the
+#: cap and then one line, in total, for the rest. Small on purpose: the ledger
+#: lives for the process and is fed by ``GET /api/mcp``, so its size is the
+#: memory a malformed shared config can pin through nothing but a page load.
+_DISABLED_FLAG_LEDGER_CAP = 64
+
+#: Hex digits retained of each digest. 64 bits is far past collision range for a
+#: set of at most ``_DISABLED_FLAG_LEDGER_CAP`` entries, and a fixed size whatever
+#: the name and value it stands for.
+_DISABLED_FLAG_DIGEST_HEX = 16
+
+#: Characters of a server name that a WARNING line carries. The line is retained
+#: too: the dashboard log ring keeps the last 1000 FORMATTED lines and streams
+#: each to every log subscriber, with no bound on a line's size -- so the config
+#: text a line quotes is what one page load can pin and push. The value is never
+#: quoted (:func:`_describe_flag`); the name is operator-authored config as well,
+#: so it is cut here. Long enough that any real server name survives whole.
+_LOG_NAME_MAX = 64
+
+#: Fixed-size digests of ``(server, value)`` pairs already reported for a
+#: ``disabled`` that is not a boolean. Digests, not the pairs: the name and the
+#: value are both operator-authored config, so retaining either raw would let one
+#: large value -- or many -- grow the process for its lifetime. Keyed by the value
+#: too, so an entry edited from one wrong value to another is reported again.
+#: :func:`_report_invalid_disabled` prunes every digest absent from the current
+#: config, so a value that is fixed and later broken again is reported again, and
+#: the ledger stays bounded by the config -- and, past that, by the cap.
+_disabled_flag_warned: set[str] = set()
+
+#: Whether the ledger has said, once, that it refused entries past the cap. Reset
+#: by a read in which everything fit, so an overflow that ends and recurs is
+#: announced again -- and a config that stays over the cap is announced once.
+_disabled_flag_overflow_warned = False
+
+
+def _disabled_flag_digest(name: str, value: Any) -> str:
+    """The fixed-size ledger key for one ``(server, value)`` pair."""
+    # surrogatepass: JSON ``\\ud800``-style escapes decode to lone surrogates,
+    # which a strict encode would refuse -- and a key must never raise.
+    material = f"{name}\0{value!r}".encode("utf-8", "surrogatepass")
+    return hashlib.sha256(material).hexdigest()[:_DISABLED_FLAG_DIGEST_HEX]
+
+
+def _log_name(name: str) -> str:
+    """*name* as a WARNING line carries it: whole when it fits, else a prefix.
+
+    The cut says how much is missing, so the operator knows the line is not the
+    whole name, and the suffix is a number -- bounded whatever was cut.
+    """
+    if len(name) <= _LOG_NAME_MAX:
+        return name
+    return f"{name[:_LOG_NAME_MAX]}...(+{len(name) - _LOG_NAME_MAX} chars)"
+
+
+def _describe_flag(value: Any) -> str:
+    """The TYPE and size of a non-boolean ``disabled`` -- ``str(len 5)`` -- never its text.
+
+    A log line is retained (the dashboard ring, every log subscriber's
+    stream), so quoting the value would carry an arbitrary amount of config
+    into both for one bad key. The type names what was written in the shape the
+    operator recognises (``str(len 5)`` is a quoted ``"false"``; ``NoneType`` is
+    ``null``; ``int`` is ``0`` or ``1``), and the row's own copy already points
+    at the file to fix, so nothing the operator needs is lost with the text.
+    """
+    kind = type(value).__name__
+    if isinstance(value, Sized):
+        return f"{kind}(len {len(value)})"
+    return kind
+
+
+def _invalid_disabled_flag(spec: Mapping[str, Any]) -> tuple[bool, Any]:
+    """Whether ``spec["disabled"]`` is present and not a boolean, and the value.
+
+    The one place this module inspects the raw value. Every decision -- list,
+    offer for sync, spawn -- goes through :func:`mcp_entry_is_muted`, the
+    launch predicate shared with the gateway rewriter and the session
+    projections, which is FAIL-CLOSED: absent or a literal ``False`` is
+    enabled, ``True`` and every non-boolean (``"false"``, ``1``, ``"yes"``,
+    ``null``) is disabled. This helper only tells the operator WHY such a row is
+    off: the value's type and size are reported through
+    :func:`_report_invalid_disabled` (never its text -- the line is retained) and
+    the row carries ``disabled_reason = "invalid"``, so the table can say "invalid
+    value in <file>" instead of "disabled in <file>" -- the fix is to repair the
+    value, not to flip a switch. A reader that took the value as "enabled" would
+    launch a server the user tried to silence; one that read it as "disabled"
+    only here and not at the launch gate would list a Disabled row the sessions
+    still start. Neither happens while there is one predicate.
+    """
+    flag = spec.get("disabled")
+    return ("disabled" in spec and not isinstance(flag, bool)), flag
+
+
+def _report_invalid_disabled(found: list[tuple[str, Any, str]]) -> None:
+    """WARNING once per (server, value) for a ``disabled`` that is not a boolean.
+
+    ``"disabled": "false"`` (a string) is not a boolean, so the launch predicate
+    (:func:`mcp_entry_is_muted`) reads it FAIL-CLOSED: the server is listed
+    Disabled, never offered for sync and never spawned, until the value is a
+    real ``true`` or ``false``. The line says so out loud because the operator
+    may have written ``"false"`` and meant "on": a server they believe is on is
+    off until the value is a real boolean, and the row's own copy points at the
+    same file.
+
+    *found* is every such ``(name, value, scope)`` the current config holds, so
+    one call is the whole ledger cycle: prune first (a digest absent from the
+    config is forgotten, so a fixed-then-broken value warns again), then admit
+    new pairs up to ``_DISABLED_FLAG_LEDGER_CAP``. A pair refused by the cap gets
+    no entry anywhere -- there is no second store to reintroduce the growth --
+    and the refusal is counted and said once per overflow episode rather than
+    once per refused pair, which would be the flood the ledger exists to stop.
+
+    The line itself is bounded like the ledger: a log line is retained (the
+    dashboard log ring keeps the last 1000 formatted lines and streams each to
+    every subscriber), so it carries the name cut to ``_LOG_NAME_MAX`` and the
+    value's type and size (:func:`_describe_flag`) -- never the value. The
+    overflow line carries counts only.
+    """
+    global _disabled_flag_overflow_warned
+    by_digest = {
+        _disabled_flag_digest(name, value): (name, value, scope) for name, value, scope in found
+    }
+    _disabled_flag_warned.intersection_update(by_digest)
+    refused = 0
+    for digest, (name, value, scope) in by_digest.items():
+        if digest in _disabled_flag_warned:
+            continue
+        if len(_disabled_flag_warned) >= _DISABLED_FLAG_LEDGER_CAP:
+            refused += 1
+            continue
+        _disabled_flag_warned.add(digest)
+        logger.warning(
+            "MCP server %r: 'disabled' in the %s config is %s, not a boolean; it is read "
+            "as DISABLED -- an invalid value never launches a server. Set it to true or "
+            "false.",
+            _log_name(name),
+            scope,
+            _describe_flag(value),
+        )
+    if not refused:
+        _disabled_flag_overflow_warned = False
+    elif not _disabled_flag_overflow_warned:
+        _disabled_flag_overflow_warned = True
+        logger.warning(
+            "MCP config: %d more server(s) carry a non-boolean 'disabled' beyond the %d "
+            "reported above; they are not listed individually. Fix the reported ones "
+            "and the rest are reported on the next read.",
+            refused,
+            _DISABLED_FLAG_LEDGER_CAP,
+        )
 
 
 # Well-known MCP config locations, tagged by scope.  Scope names match
@@ -676,14 +831,23 @@ class McpServerInfo:
         }
     )
     disabled_tools: list[str] = field(default_factory=list)
-    # True when ANY scope's entry for this server carries ``disabled: true``
-    # (a consent-disabled install/custom add, or a server the user switched off
-    # in the dashboard — ``/api/mcp/toggle`` writes the flag into the Kiro-global
-    # ``mcp.json``). Disabled rows are NEVER probed — probing spawns the server
-    # process, which is what consent gates. The refusal is enforced inside
-    # ``probe_server`` itself, so setting this flag is sufficient no matter which
-    # entry point does the probing.
+    # True when ANY scope's entry for this server is muted by the shared launch
+    # predicate (``mcp_entry_is_muted``): ``disabled: true`` -- a consent-disabled
+    # install/custom add, or a server the user switched off in the dashboard
+    # (``/api/mcp/toggle`` writes the flag into the Kiro-global ``mcp.json``) --
+    # or a ``disabled`` that is not a boolean at all, which is read FAIL-CLOSED.
+    # Disabled rows are NEVER probed — probing spawns the server process, which
+    # is what consent gates. The refusal is enforced inside ``probe_server``
+    # itself, so setting this flag is sufficient no matter which entry point does
+    # the probing.
     disabled: bool = False
+    # ``"invalid"`` when the row is disabled by NOTHING but non-boolean
+    # ``disabled`` values (``"false"``, ``1``, ``null``) -- no source carries a
+    # literal ``true``. The table then says "invalid value in <file>" rather than
+    # "disabled in <file>", because the operator's fix differs: repair the value,
+    # not flip a switch. ``None`` when enabled, or when some source really says
+    # ``true`` (the row is off either way, and the switch is the honest story).
+    disabled_reason: str | None = None
     # THIS source's own ``timeout``/``disabled``, verbatim as the scope spec
     # declares them; an absent key is absent here too. Deliberately separate
     # from ``disabled`` above, which is an aggregate across every scope: a sync
@@ -792,6 +956,8 @@ class McpServerInfo:
             d["disabledTools"] = self.disabled_tools
         if self.disabled:
             d["disabled"] = True
+            if self.disabled_reason:
+                d["disabledReason"] = self.disabled_reason
         return d
 
 
@@ -1287,12 +1453,18 @@ def list_servers() -> list[McpServerInfo]:
     """
     servers: dict[str, McpServerInfo] = {}
     disabled_in_agent: set[str] = set()
+    # Canonical names some source switches off with a LITERAL ``true``. A
+    # disabled row whose name is not here is off only because of non-boolean
+    # values (read fail-closed), and says so (``disabled_reason``, step 3d).
+    boolean_true: set[str] = set()
 
     # 1. From agent config (mcpServers key)
     agent_cfg = _load_agent_config()
     for name, spec in agent_cfg.get("mcpServers", {}).items():
         if isinstance(spec, dict):
-            if spec.get("disabled"):
+            if spec.get("disabled") is True:
+                boolean_true.add(mcp_server_alias(name))
+            if mcp_entry_is_muted(spec):
                 disabled_in_agent.add(name)
             else:
                 # Re-resolve stale managed MCP server paths at runtime
@@ -1305,19 +1477,35 @@ def list_servers() -> list[McpServerInfo]:
     #    any seam provider globals, matching rebuild_agent_config.
     by_source = _load_mcp_json_by_source()
     disabled_tools_claimed: set[str] = set()
+    # Transient: the pairs live only until the reconcile below, which retains
+    # fixed-size digests of them, never the pairs.
+    invalid_disabled_found: list[tuple[str, Any, str]] = []
     for scope in _scope_priority(by_source):
         for name, spec in by_source.get(scope, {}).items():
             if not isinstance(spec, dict):
                 continue
+            # ``disabled`` is a boolean or absent. Anything else (``"false"``,
+            # ``1``, ``"yes"``) is a config error, reported once per value; the
+            # decision below is ``mcp_entry_is_muted(spec)``, the launch
+            # predicate the gateway and the session projections read, which is
+            # FAIL-CLOSED: the entry takes the disabled arms exactly as a literal
+            # ``true`` would, so the row the table shows as Disabled is the
+            # server no session starts. Reading the string as "enabled" here
+            # would have listed -- and spawned -- a server the user tried to
+            # silence.
+            invalid, flag = _invalid_disabled_flag(spec)
+            if invalid:
+                invalid_disabled_found.append((name, flag, scope))
+            disabled = mcp_entry_is_muted(spec)
             # Introduce the server first (if new) so the disabledTools
             # carry below applies to both new and existing entries.  Without
             # this ordering, the highest-priority scope's disabledTools is
             # dropped for new servers because `name in servers` is False
             # before insertion, letting a lower-priority scope's value
             # overwrite the (empty) default on a later iteration.
-            if not spec.get("disabled") and name not in servers and name not in disabled_in_agent:
+            if not disabled and name not in servers and name not in disabled_in_agent:
                 servers[name] = _server_from_spec(name, spec, "mcp.json")
-            elif scope == SCOPE_KIROCREW and spec.get("disabled") and name not in servers:
+            elif scope == SCOPE_KIROCREW and disabled and name not in servers:
                 # Consent-disabled entries (registry installs and custom adds
                 # land with ``disabled: true`` until the user enables them)
                 # live ONLY in the KiroCrew scope. They must still get a row:
@@ -1331,7 +1519,7 @@ def list_servers() -> list[McpServerInfo]:
                 info = _server_from_spec(name, spec, "mcp.json")
                 info.disabled = True
                 servers[name] = info
-            elif spec.get("disabled") and name not in servers and name in disabled_in_agent:
+            elif disabled and name not in servers and name in disabled_in_agent:
                 # Switched off from the dashboard: ``/api/mcp/toggle`` writes
                 # ``disabled: true`` into the scope that holds the server AND
                 # onto the agent entry — the agent-side marker is what stops a
@@ -1344,6 +1532,24 @@ def list_servers() -> list[McpServerInfo]:
                 info = _server_from_spec(name, agent_cfg["mcpServers"][name], "agent")
                 info.disabled = True
                 servers[name] = info
+            elif disabled and name not in servers:
+                # Disabled in a SHARED scope (the Kiro-global ``mcp.json`` the IDE
+                # edits, or a provider global) and held by no other source: the
+                # two arms above cover a Kiro Crew store entry and an agent entry
+                # stamped by the toggle, and nothing else ever introduces this
+                # one. Discovery skips disabled entries and the rebuild never adds
+                # a disabled shared server to the agent config, so without this
+                # arm the server is listed only while a pre-disable agent entry
+                # survives and vanishes on the first sync -- read as data loss,
+                # not as a filter, because the IDE keeps showing the same entry
+                # as a greyed "Disabled" row. The row is marked disabled
+                # and never probed: ``probe_server`` refuses on the flag.
+                # ``disabled`` is the launch predicate's read, so a non-boolean
+                # ``"disabled": "false"`` lands here too, reported above and
+                # told apart on the row by ``disabled_reason`` (step 3d).
+                info = _server_from_spec(name, spec, "mcp.json")
+                info.disabled = True
+                servers[name] = info
 
             # Per-tool disables: first-scope-wins.  Use "disabledTools" in
             # spec (key presence) rather than truthiness so an explicit
@@ -1352,6 +1558,9 @@ def list_servers() -> list[McpServerInfo]:
             if name in servers and "disabledTools" in spec and name not in disabled_tools_claimed:
                 servers[name].disabled_tools = spec.get("disabledTools", [])
                 disabled_tools_claimed.add(name)
+    # One ledger cycle for the invalid-value warnings: prune to the current
+    # config, admit up to the cap, say once when the cap refused the rest.
+    _report_invalid_disabled(invalid_disabled_found)
 
     # 3. Compute per-scope presence.
     #
@@ -1369,9 +1578,7 @@ def list_servers() -> list[McpServerInfo]:
     # scope is read as False by the frontend and DELETED on the next apply.
     global_scopes = [s for s in _scope_priority(by_source) if s != SCOPE_KIROCREW]
     for name, server in servers.items():
-        mc_disabled = (
-            isinstance(kirocrew_own.get(name), dict) and kirocrew_own[name].get("disabled") is True
-        )
+        mc_disabled = mcp_entry_is_muted(kirocrew_own.get(name))
         in_any_source = name in agent_names or any(
             name in by_source.get(scope, {}) for scope in by_source
         )
@@ -1423,14 +1630,28 @@ def list_servers() -> list[McpServerInfo]:
     #     is enough, and no scope can re-enable what another disabled. The flag
     #     now IS the safety property (``probe_server`` refuses on it), which is
     #     why populating it correctly matters more than when each caller filtered
-    #     rows for itself.
+    #     rows for itself. Read with the launch predicate, so a non-boolean value
+    #     on an existing row's shared entry flags the row (fail-closed) exactly
+    #     as the sessions refuse to start it.
     for scope_specs in by_source.values():
         for raw_name, spec in scope_specs.items():
-            if not isinstance(spec, dict) or not spec.get("disabled"):
+            if not isinstance(spec, dict):
+                continue
+            if spec.get("disabled") is True:
+                boolean_true.add(mcp_server_alias(raw_name))
+            if not mcp_entry_is_muted(spec):
                 continue
             row = servers.get(mcp_server_alias(raw_name))
             if row is not None:
                 row.disabled = True
+
+    # 3d. WHY a row is off, for the table. A row that no source switches off with
+    #     a literal ``true`` is off only because of non-boolean values, read
+    #     fail-closed above; it says so, because the operator's fix is to repair
+    #     the value where it sits, not to flip a switch the row does not have.
+    for name, row in servers.items():
+        if row.disabled and name not in boolean_true:
+            row.disabled_reason = "invalid"
 
     # 4. Merge cached probe results
     for s in servers.values():
@@ -2648,16 +2869,31 @@ PROBE_MAX_CONCURRENCY = 5
 async def probe_all() -> list[McpServerInfo]:
     """Discover and probe all configured MCP servers (bounded concurrency).
 
-    Consent-disabled rows are excluded: probing spawns the server process,
-    and a disabled server must never run until the user enables it.
+    Consent-disabled rows are never SPAWNED: probing runs the server process,
+    and a disabled server must not run until the user enables it.
 
-    ``probe_server`` now refuses a disabled server on its own, so this filter
-    is defense-in-depth (the idiom ``sync_to_agent_config`` already uses) plus
-    the thing that shapes the RESULT: disabled rows are left out of the
-    returned list entirely rather than reported with ``status="disabled"``,
-    which is the response shape ``GET /api/mcp/probe`` has always had.
+    They are still RETURNED, as ``status="disabled"`` rows with no handshake
+    behind them. This result replaces the dashboard's server list wholesale
+    (the table, the Connections cards and the in-row sign-in all paint the
+    probe response over ``GET /api/mcp``), so a shape that left disabled rows
+    out made every disabled server vanish on the first probe and reappear on
+    the next page load -- the IDE reads the same config and keeps them as greyed
+    rows. The withheld rows are never handed to ``probe_server`` at
+    all: the no-spawn guarantee here does not rest on that function's own
+    refusal arm, which stays as the last line of defence for every other entry
+    point. This filter is also what keeps ``_prune_unresolvable`` keyed to the
+    servers a probe can actually resolve.
     """
-    servers = [s for s in list_servers() if not s.disabled]
+    rows = list_servers()
+    servers = [s for s in rows if not s.disabled]
+    withheld = [s for s in rows if s.disabled]
+    for s in withheld:
+        # The row shape ``probe_server``'s refusal arm produces: an unprobed
+        # ``disabled`` status, no stale failure text, and ``tools`` left as the
+        # last real probe stored them (still worth showing). Nothing is written
+        # to the probe cache -- no probe ran.
+        s.status = "disabled"
+        s.error = ""
     # Keep the warn-once ledger bounded by the config rather than by config
     # churn: a command edited to a different missing binary must not retain the
     # superseded string. Runs before the early return so emptying the config
@@ -2671,7 +2907,7 @@ async def probe_all() -> list[McpServerInfo]:
     # keep failing in isolation inside `probe_server`.
     _prune_unresolvable({(s.name, s.command) for s in servers if isinstance(s.command, str)})
     if not servers:
-        return []
+        return withheld
     # Per-call semaphore: bounds the fan-out within this discovery pass while
     # binding to the currently-running loop (avoids import-time loop capture).
     sem = asyncio.Semaphore(PROBE_MAX_CONCURRENCY)
@@ -2713,7 +2949,11 @@ async def probe_all() -> list[McpServerInfo]:
             out.append(r)  # type: ignore[arg-type]
     for s in out:
         _note_denied_env(s)
-    return out
+    # Same order as ``list_servers`` reported, so the probe response and
+    # ``GET /api/mcp`` list the same servers in the same sequence.
+    by_name = {s.name: s for s in out}
+    by_name.update((s.name, s) for s in withheld)
+    return [by_name[s.name] for s in rows]
 
 
 def _note_denied_env(server: McpServerInfo) -> None:
@@ -2954,7 +3194,10 @@ def discover_servers_to_sync() -> list[McpServerInfo]:
     for name, spec in mcp_servers.items():
         if not isinstance(spec, dict):
             continue
-        if spec.get("disabled"):
+        # The launch predicate: a muted entry -- ``true`` or a non-boolean, read
+        # fail-closed -- is never offered, because syncing it is how it would
+        # reach the agent config the sessions load.
+        if mcp_entry_is_muted(spec):
             continue
         info = McpServerInfo(
             name=name,
