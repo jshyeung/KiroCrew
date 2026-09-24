@@ -185,7 +185,7 @@ def build_prompt_blocks(
                 if len(raw_bytes) >= SNIFF_BYTES
                 else None
             )
-            if mime not in IMAGE_MEDIA_TYPES.values():
+            if mime is None or mime not in IMAGE_MEDIA_TYPES.values():
                 logger.warning(
                     "acp prompt: %s is not a supported raster by content - "
                     "sending path, not inline",
