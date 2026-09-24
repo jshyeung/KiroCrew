@@ -68,6 +68,7 @@ from kiro_crew.config.sections import (
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.chat_utils import drained_to_thread
 from kiro_crew.dashboard.handlers._shared import (
+    _owner_denial_response,
     _pip_install_channel_available,
     guard_owner_surface_routes,
     owner_surface_guard,
@@ -1859,7 +1860,53 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
 
 
 async def api_sel_events(request: web.Request) -> web.Response:
-    """GET /api/sel/events — recent security events."""
+    """GET /api/sel/events — recent security events, owner only.
+
+    The rows are the security audit trail itself, and they name the resources a
+    decision was about: a file held back by the scanner, a service a grant
+    covered. A dashboard session is not by itself the owner -- the messaging
+    bridges mint a presigned token whose subject is the allowed user's own id --
+    so serving these rows to any authenticated session hands one principal the
+    other's audit trail. The check delegates to
+    :func:`is_owner_dashboard_request` rather than re-deriving the rule, so this
+    surface cannot drift from the secrets vault and the delivery-consent gate.
+
+    The refusal is audited. An ungated read attempt against the security log is
+    itself an event an operator wants to see, and the denial row names the
+    calling app rather than any credential. The write is hopped off the loop
+    unless the singleton is already warm: constructing it reads the HMAC key and
+    scans the log tail, which is the same reason the owner path below evaluates
+    ``_sel()`` inside the executor callable rather than while building it.
+
+    The denial response goes through :func:`_owner_denial_response`, the tail
+    every owner gate shares, because a dashboard session signed before an owner
+    was configured keeps its bootstrap subject and is refused here: that caller
+    IS the owner and needs the ``401 stale_session_reauth`` re-sign-in signal,
+    which only that helper's stale-session check can label. The audit above runs
+    first, so the relabel changes the response and not the recorded decision.
+    """
+    from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+    from kiro_crew.sel import sel_is_warm
+
+    if not is_owner_dashboard_request(request):
+
+        def _write_denial() -> None:
+            _sel().log_api_access(
+                caller=str(request.get("user") or "anonymous"),
+                operation="sel.events.read",
+                outcome="denied",
+                source="dashboard",
+                error="non_owner",
+            )
+
+        try:
+            if sel_is_warm():
+                _write_denial()
+            else:
+                await asyncio.to_thread(_write_denial)
+        except Exception:
+            logger.warning("Failed to log a denied SEL read to SEL", exc_info=True)
+        return _owner_denial_response(request, "dashboard owner required", "owner_required")
 
     try:
         limit = min(int(request.query.get("limit", "100")), 1000)

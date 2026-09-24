@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -48,8 +49,27 @@ class _FakeLoop:
 
 
 def _request(query: dict | None = None) -> MagicMock:
+    """An owner-authenticated fake request.
+
+    ``/api/sel/events`` serves the security audit trail and is owner-gated, so a
+    request that carries no owner identity is refused before the offload this
+    module is about. The identity is shaped the way
+    ``is_owner_dashboard_request`` reads it: a dashboard (empty-``app``) session
+    whose user matches the configured owner.
+    """
     req = MagicMock()
     req.query = query or {}
+    req.app = {"state": SimpleNamespace(owner_id="owner-1")}
+    req.__contains__.side_effect = lambda key: key == "app"
+    req.__getitem__.side_effect = lambda key: "" if key == "app" else None
+    req.get.side_effect = lambda key, default=None: "owner-1" if key == "user" else default
+    return req
+
+
+def _non_owner_request() -> MagicMock:
+    """A dashboard session whose user is NOT the configured owner."""
+    req = _request()
+    req.get.side_effect = lambda key, default=None: "someone-else" if key == "user" else default
     return req
 
 
@@ -107,6 +127,57 @@ class TestSelHandlerOffload:
         assert order == ["submitted", "sel"]
         fake_sel.verify_integrity.assert_called_once_with(detailed=True)
         assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_cold_denial_audit_hops_off_the_loop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The refusal is audited, and a COLD audit must not run on the loop.
+
+        Refusing a non-owner is the one path that writes before it reads, and the
+        first write constructs the singleton -- reading the HMAC key and scanning
+        the log tail. A browser-triggerable route may not do that inline, so a
+        cold write is hopped; a warm one is not, which is the next test.
+        """
+        order: list[str] = []
+        fake_sel = MagicMock()
+        monkeypatch.setattr(core_mod, "_sel", _tracking_sel(fake_sel, order))
+        monkeypatch.setattr(sel_mod, "sel_is_warm", lambda: False)
+
+        async def _fake_to_thread(fn, *args):
+            order.append("to_thread")
+            return fn(*args)
+
+        monkeypatch.setattr(core_mod.asyncio, "to_thread", _fake_to_thread)
+
+        resp = await core_mod.api_sel_events(_non_owner_request())
+
+        assert resp.status == 403
+        assert order == ["to_thread", "sel"]  # hopped BEFORE the singleton is built
+        fake_sel.log_api_access.assert_called_once()
+        fake_sel.recent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_warm_denial_audit_stays_inline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A warm singleton needs no hop, so the refusal does not pay for one."""
+        order: list[str] = []
+        fake_sel = MagicMock()
+        monkeypatch.setattr(core_mod, "_sel", _tracking_sel(fake_sel, order))
+        monkeypatch.setattr(sel_mod, "sel_is_warm", lambda: True)
+
+        async def _unexpected_to_thread(fn, *args):  # pragma: no cover - must not run
+            order.append("to_thread")
+            return fn(*args)
+
+        monkeypatch.setattr(core_mod.asyncio, "to_thread", _unexpected_to_thread)
+
+        resp = await core_mod.api_sel_events(_non_owner_request())
+
+        assert resp.status == 403
+        assert order == ["sel"]
+        fake_sel.log_api_access.assert_called_once()
 
 
 class TestSelConstructionRunsOffTheLoop:
