@@ -21,8 +21,13 @@ from kiro_crew.platform_compat import is_link_or_junction
 _START_EPOCH = time.time()
 
 
-def _build_pending() -> bool:
+def _build_pending() -> bool | None:
     """True when MAIN_REPO's built SPA dist is NEWER than this process's start.
+
+    ``None`` is UNKNOWN, and it is the answer for a checkout this app may only
+    read. The dist inspected here is written by Pull+Build, which never runs
+    against a repository that does not carry the Kiro Crew markers, so ``False``
+    would assert "nothing to apply" about a mechanism that does not apply at all.
 
     The dist inspected is the one Pull+Build actually writes — the MAIN CHECKOUT's
     — not the dist of the installation this backend happens to be running from.
@@ -34,7 +39,8 @@ def _build_pending() -> bool:
     """
     try:
         # Path("") is Path("."), which would stat this process's own tree —
-        # no checkout means nothing can be pending.
+        # no checkout means nothing can be pending. The MUTATING accessor on
+        # purpose: it is what makes a read-only checkout answer unknown below.
         dist = Path(repository._repo()) / "src" / "kiro_crew" / "static" / "dist"
         if not dist.exists():
             return False
@@ -42,6 +48,10 @@ def _build_pending() -> bool:
         # static/dist at website/dist, and the rebuild time we care about is the
         # target's.
         return dist.stat().st_mtime > _START_EPOCH
+    except repository.RepoReadOnly:
+        # Ordered ahead of the base class the three states share, so this one is
+        # not swallowed into the False below.
+        return None
     except (OSError, repository.RepoUnavailable):
         return False
 
@@ -58,7 +68,7 @@ async def _repo_owner_name() -> str | None:
     """Derive owner/repo from the upstream remote URL."""
     remote = await repository._upstream_remote()
     try:
-        repo = repository._repo()
+        repo = repository._repo_read()
     except repository.RepoUnavailable:
         # Best-effort helper: an unresolved checkout is "not derivable", the
         # same answer every other failure below produces. Without the accessor
@@ -295,7 +305,7 @@ async def _pr_status_cached(branch: str, head_oid: str | None = None) -> dict | 
         # before merge); only a divergent head means this verdict is stale.
         pr_head_oid = data.get("_head_oid")
         if not pr_head_oid or not await _head_contained_in_pr(
-            repository._repo(), head_oid, pr_head_oid
+            repository._repo_read(), head_oid, pr_head_oid
         ):
             data = None
     _PR_CACHE[branch] = {"data": data, "ts": time.time(), "cached_head": head_oid}
@@ -421,7 +431,7 @@ async def _html_repo_base() -> str | None:
     remote = await repository._upstream_remote()
     try:
         rc, out, _ = await runtime._run_cmd(
-            ["git", "-C", repository._repo(), "remote", "get-url", remote], timeout=5
+            ["git", "-C", repository._repo_read(), "remote", "get-url", remote], timeout=5
         )
     except repository.RepoUnavailable:
         # Same degrade as a failed get-url: fall through to the cached
@@ -697,10 +707,18 @@ def _serving_install_reason_sync(main_repo: str, managed: "tuple[str, ...]") -> 
 
 async def _serving_install_reason(worktrees: "list[dict]") -> str | None:
     global _SERVING_REASON
+    if repository._read_only_reason() is not None:
+        # The notice's whole premise is that Pull+Build HERE does not change the
+        # code that runs. A checkout this app may only read never runs Pull+Build,
+        # and both remedies the message offers — start the gateway from it, or Make
+        # live onto it — are refused, so it would name actions that cannot be
+        # taken. That is the same dead-end instruction the sync helper below
+        # already declines to print, for the same reason.
+        return None
     managed = tuple(sorted(str(wt["path"]) for wt in worktrees if wt.get("path")))
     # Reached only with a built fleet in hand, so the accessor cannot raise
     # here; it exists to keep the path build off the bare global.
-    repo = repository._repo()
+    repo = repository._repo_read()
     key = (repo, managed)
     if _SERVING_REASON is not None and _SERVING_REASON[0] == key:
         return _SERVING_REASON[1]
@@ -1166,6 +1184,14 @@ async def _build_fleet() -> dict:
         # live": the two invite opposite actions (check the gateway vs. stage a
         # cutover). The badges below stay unset; this one field says why.
         live_state_known = False
+    if repository._read_only_reason():
+        # Make live manages THIS product's own service unit, so it is refused for a
+        # checkout served read-only, and `is_live`/`is_staged` answer unknown there.
+        # Reusing the existing unknown-state field is what makes the refusal visible
+        # today: the page already disables Make live and states the reason on it,
+        # where a `null` badge alone is falsy and would render as "nothing is live" —
+        # a row still offering the button that answers 409.
+        live_state_known = False
     live_path = pointer.live
     staged_path = pointer.staged
     previous_path = Path(pointer.previous) if pointer.previous is not None else None
@@ -1185,6 +1211,10 @@ async def _build_fleet() -> dict:
     legacy_prefixes = tuple(
         f"{r.split('/')[-1].lower()}-wt-" for r in (repository._FALLBACK_REPOS or [])
     )
+    # Resolved once for the whole snapshot rather than per row: it is a property of
+    # the CHECKOUT, not of a worktree, so reading it per row would let two rows
+    # disagree with each other and with the payload's own reason field.
+    read_only = repository._read_only_reason() is not None
     wts = []
     for wt in worktrees:
         path = wt.get("path", "")
@@ -1198,8 +1228,13 @@ async def _build_fleet() -> dict:
         running = False
         port = None
         health = None
-        has_venv = False
-        has_dist = False
+        # None is UNKNOWN, and it is the answer for a checkout this app may only
+        # read: ``.venv`` and ``static/dist`` are what THIS product's provision
+        # chain writes, and provision is refused there — so False would report
+        # "not built" about a build that repository never runs, and a row reading
+        # False is exactly what offers Provision.
+        has_venv: bool | None = None if read_only else False
+        has_dist: bool | None = None if read_only else False
         # Build state is a plain filesystem check (``.venv`` binary present /
         # ``static/dist`` directory present) and is therefore knowable on EVERY
         # platform — report it even where pods cannot run, so the Fleet view
@@ -1208,7 +1243,7 @@ async def _build_fleet() -> dict:
         # surface a human checks, and reporting main as unprovisioned reads as
         # "the cutover failed". The ``not is_main`` restriction belongs to the
         # POD-state check below (pods never run on main), not to these probes.
-        if runtime._POD_IMPORTED:
+        if runtime._POD_IMPORTED and not read_only:
             try:
                 has_venv = await loop.run_in_executor(
                     subprocess_executor(), runtime.prov.has_venv, Path(path)
@@ -1269,8 +1304,19 @@ async def _build_fleet() -> dict:
                 "running": running,
                 "port": port,
                 "health": health,
-                "is_live": live_path is not None and repository._same_path(path, live_path),
-                "is_staged": staged_path is not None and repository._same_path(path, staged_path),
+                # None is UNKNOWN. The live target is THIS product's own gateway
+                # and Make live is refused on a checkout this app may only read,
+                # so neither flag is a question about that repository at all.
+                "is_live": (
+                    None
+                    if read_only
+                    else (live_path is not None and repository._same_path(path, live_path))
+                ),
+                "is_staged": (
+                    None
+                    if read_only
+                    else (staged_path is not None and repository._same_path(path, staged_path))
+                ),
                 "has_venv": has_venv,
                 "has_dist": has_dist,
                 "branch": runtime._redact(g["branch"] or branch or ""),
@@ -1400,8 +1446,15 @@ async def _build_fleet() -> dict:
     return {
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "worktrees": wts,
-        "main_repo": runtime._redact(repository._repo()),
+        "main_repo": runtime._redact(repository._repo_read()),
         "main_repo_inferred": repository.MAIN_REPO_INFERRED,
+        # Non-null when the checkout is served READ-ONLY: it is a git repository
+        # that does not carry the Kiro Crew markers, so its worktrees are listed
+        # and every action that would change it is refused. Carries the prose the
+        # backend composed, like gateway_service_reason and pods_unavailable_reason
+        # below, so the UI can hide the refused controls AND say why instead of
+        # hiding them silently. Null is the ordinary managed checkout.
+        "read_only_reason": runtime._redact(repository._read_only_reason() or "") or None,
         "base_branch": repository.BASE_BRANCH,
         "build_pending": _build_pending(),
         "gateway_service_active": await live._gateway_service_active(),

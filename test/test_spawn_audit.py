@@ -918,10 +918,19 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # composition site.
         "apps/builtins/dev_fleet/sync_runner.py::run_step",
         # Dev Fleet builtin backend: async version routes all git/gh through
-        # _run_cmd which calls sandboxed_spawn_argv (the chokepoint). Only
-        # _resolve_primary_checkout uses subprocess.run directly (one-shot
-        # git rev-parse at startup, no agent input, no sandbox needed).
+        # _run_cmd which calls sandboxed_spawn_argv (the chokepoint). Four
+        # functions use subprocess.run directly, all one-shot `git rev-parse` /
+        # `git config` READS of the operator-configured checkout, taken before
+        # the async path exists (discovery) or on the executor hop beside it. No
+        # agent input: every argv is fixed here -- the only variable is the
+        # checkout path, which only tiers 1-2 supply, and reading config or a
+        # path format executes nothing in the repository. The filter probes are
+        # the guard that decides whether the async path may run at all, so they
+        # cannot route through the chokepoint they gate.
         "apps/builtins/dev_fleet/repository.py::_resolve_primary_checkout",
+        "apps/builtins/dev_fleet/repository.py::_configured_filter_commands",
+        "apps/builtins/dev_fleet/repository.py::_worktree_config_scope_live",
+        "apps/builtins/dev_fleet/repository.py::_worktree_config_scope_is_empty",
         "apps/builtins/dev_fleet/runtime.py::worker",
         # dep_sync stands in for `pip install -e .` on a checkout whose console
         # script is locked, and it spawns the same shapes that step did:
