@@ -1825,3 +1825,103 @@ class TestAnAdvisoryLaneThatPublishedNoVerdictIsNotPassed:
 
         assert script.count('advisory_slot_unpublished "$label"') == 2
         assert script.count(f'$label {_UNPUBLISHED}"') == 2
+
+    def test_the_slot_table_and_the_lane_branch_name_the_same_lanes(self):
+        """Three places name these lanes: the branch condition both readers
+        share, the predicate's case arms, and the jq map binding each slot to
+        its stamp. A lane added to the branch without a row in the other two
+        falls through the predicate's default and is scored as published
+        whatever its slot holds -- the same fail-open shape this fixes. Hold the
+        three lists to each other so that drift cannot land quietly."""
+        script = _evaluate_script()
+        labels = {label for label, _, _ in _ADVISORY_SLOTS}
+        markers = {marker for _, marker, _ in _ADVISORY_SLOTS}
+        stamps = {stamp.removesuffix("-REVIEWED") for _, _, stamp in _ADVISORY_SLOTS}
+
+        branch_labels = set(re.findall(r'\[ "\$label" = "([^"]+)" \]', script))
+        arms = dict(re.findall(r'"([^"]+)"\)\s+want="(<!-- [a-z-]+ -->)"', script))
+        bound = dict(re.findall(r'"(<!-- [a-z-]+ -->)": "([A-Z-]+)"', script))
+
+        assert branch_labels == labels
+        assert set(arms) == labels
+        assert set(bound) == markers
+        assert set(arms.values()) == markers
+        assert set(bound.values()) == stamps
+
+
+class TestAnOverriddenAdvisoryLaneOwesNoStamp:
+    """A repository writer's `/ai-review override` records that a human
+    adjudicated this head, and the lane deliberately does not re-run the model
+    on that path -- its model and post steps are gated on the override being
+    inactive. So no stamp is published and re-running the lane cannot produce
+    one. Holding such a lane at pending would strand the head on the very escape
+    hatch the override exists to be.
+
+    The record is trusted on the lanes' own terms: a bot comment whose body
+    starts with the marker the override workflow writes, naming this lane (or
+    every lane) and this head.
+    """
+
+    OLD = "1111111111222222222233333333334444444444"
+    LABEL, MARKER, STAMP = _ADVISORY_SLOTS[0]
+
+    def _stale_slot(self) -> dict:
+        return _slot_comment(self.MARKER, f"Verdict: PASS\n\n[{self.STAMP}] {self.OLD}\n")
+
+    @staticmethod
+    def _override(target: str, head: str, *, author: str = "github-actions[bot]") -> dict:
+        return {
+            "user": {"login": author},
+            "body": (
+                f"<!-- ai-review-human-override target={target} head={head} "
+                "actor=someone source=4242 -->\nJudgment recorded.\n"
+            ),
+        }
+
+    @pytest.mark.parametrize("target", ["design", "all"])
+    def test_a_record_for_this_lane_and_this_head_exempts_it(
+        self, runner: Runner, target: str
+    ):
+        _write_comments(
+            runner, self._stale_slot(), self._override(target, runner.env["SHA"])
+        )
+
+        proc, outputs = runner.evaluate()
+
+        assert proc.returncode == 0, proc.stderr
+        assert self.LABEL in _bucket(_lane_log(proc), "passed")
+        assert outputs["status_state"] == "success"
+
+    def test_a_record_for_another_head_does_not_exempt_it(self, runner: Runner):
+        _write_comments(runner, self._stale_slot(), self._override("design", self.OLD))
+
+        proc, outputs = runner.evaluate()
+
+        assert proc.returncode == 0, proc.stderr
+        assert f"{self.LABEL} {_UNPUBLISHED}" in _bucket(_lane_log(proc), "pending")
+        assert outputs["status_state"] == "pending"
+
+    def test_a_record_for_another_lane_does_not_exempt_it(self, runner: Runner):
+        _write_comments(
+            runner, self._stale_slot(), self._override("ux", runner.env["SHA"])
+        )
+
+        proc, outputs = runner.evaluate()
+
+        assert proc.returncode == 0, proc.stderr
+        assert f"{self.LABEL} {_UNPUBLISHED}" in _bucket(_lane_log(proc), "pending")
+        assert outputs["status_state"] == "pending"
+
+    def test_a_record_posted_by_anyone_else_grants_nothing(self, runner: Runner):
+        """The marker in a contributor's own comment is text, not authority."""
+        _write_comments(
+            runner,
+            self._stale_slot(),
+            self._override("design", runner.env["SHA"], author="someone"),
+        )
+
+        proc, outputs = runner.evaluate()
+
+        assert proc.returncode == 0, proc.stderr
+        assert f"{self.LABEL} {_UNPUBLISHED}" in _bucket(_lane_log(proc), "pending")
+        assert outputs["status_state"] == "pending"

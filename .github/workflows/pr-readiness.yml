@@ -756,9 +756,17 @@ jobs:
           # Abbreviated stamps count: a stamp names the head with at least 7
           # hex, so freshness is prefix agreement in either direction.
           advisory_slots=""
+          advisory_overrides=""
           if [ "${#workflow_specs[@]}" -gt 0 ]; then
-            advisory_slots="$(gh_retry gh api --method GET --paginate \
-              "repos/$REPO/issues/$PR/comments?per_page=100" \
+            advisory_comments=""
+            advisory_comments="$(gh_retry gh api --method GET --paginate \
+              "repos/$REPO/issues/$PR/comments?per_page=100")" || {
+              rc=$?
+              if [ "$rc" -eq 22 ]; then exit 1; fi
+              transport_failed=true
+              workflow_specs=()
+            }
+            advisory_slots="$(printf '%s' "$advisory_comments" \
               | jq -rs --arg sha "$SHA" '
                   {"<!-- design-review -->": "DESIGN",
                    "<!-- ux-review -->": "UX",
@@ -782,26 +790,50 @@ jobs:
                              then "1" else "0" end) ]
                         | @tsv)
                   | .[]
-                ')" || {
-              rc=$?
-              if [ "$rc" -eq 22 ]; then exit 1; fi
-              transport_failed=true
-              workflow_specs=()
-            }
+                ')"
+            # The other proof a lane can carry. An override records that a
+            # repository WRITER adjudicated this head, and the lane deliberately
+            # does not re-run the model on that path -- its model and post steps
+            # are gated on the override being inactive -- so no stamp exists to
+            # find and re-running the lane cannot produce one. Holding such a
+            # lane at pending would strand the head on the exact escape hatch
+            # the override exists to be, so the record exempts it.
+            #
+            # Trust rules are the lanes' own: a `github-actions[bot]` comment
+            # whose body STARTS with the marker the override workflow writes,
+            # naming this lane (or every lane) and this head. A record posted by
+            # anyone else is a contributor's text and grants nothing.
+            advisory_overrides="$(printf '%s' "$advisory_comments" \
+              | jq -rs --arg sha "$SHA" '
+                  add // []
+                  | .[]
+                  | select((.user.login // "") == "github-actions[bot]")
+                  | ((.body // "")
+                     | capture("^<!-- ai-review-human-override target=(?<t>[a-z-]+) head=(?<h>[0-9a-fA-F]{7,40}) ")) as $m
+                  | select(($sha | startswith($m.h)) or ($m.h | startswith($sha)))
+                  | $m.t
+                ')"
           fi
 
           # 1 when this advisory lane's slot carries its OWN stamp naming a head
           # that is not this one, which is the state a `success` conclusion
           # cannot express. First row wins, matching the upsert's own first-match
-          # slot lookup.
+          # slot lookup. A lane adjudicated by a writer at this head answers 0:
+          # it owes no stamp.
           advisory_slot_unpublished() {
-            local want row own fresh
+            local want token row own fresh
             case "$1" in
-              "Design Review") want="<!-- design-review -->" ;;
-              "UX Review") want="<!-- ux-review -->" ;;
-              "First Principles Review") want="<!-- first-principles-review -->" ;;
+              "Design Review") want="<!-- design-review -->"; token="design" ;;
+              "UX Review") want="<!-- ux-review -->"; token="ux" ;;
+              "First Principles Review")
+                want="<!-- first-principles-review -->"; token="first-principles" ;;
               *) printf '0'; return 0 ;;
             esac
+            if printf '%s\n' "$advisory_overrides" \
+              | grep -Fqx -e "$token" -e "all"; then
+              printf '0'
+              return 0
+            fi
             row="$(printf '%s\n' "$advisory_slots" \
               | awk -F'\t' -v k="$want" '$1 == k { print; exit }')"
             own="$(printf '%s' "$row" | cut -d'	' -f2)"
