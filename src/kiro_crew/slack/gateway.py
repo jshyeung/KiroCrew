@@ -51,6 +51,7 @@ from kiro_crew import (
     name_grant,
     platform_compat,
     shutdown_event,
+    work_root,
 )
 from kiro_crew.acp.client import AcpError, AcpProcessDied
 from kiro_crew.agent_sdk import AgentTurnUsage
@@ -15199,7 +15200,7 @@ async def run_gateway(
 
         _AGENTS_JANITOR_TASK = asyncio.create_task(_run_agents_janitor(), name="agents-dir-janitor")
 
-    # ── Agent scratch sweep (fire-and-forget, boot + hourly) ──
+    # ── Agent scratch + work root sweep (fire-and-forget, hourly) ──
     # Reclaim per-process agent scratch dirs whose owner process is dead
     # (see kiro_crew.agent_scratch). Liveness-keyed, never age-keyed, so a
     # long-lived session's in-flight work is never deleted under it -- and
@@ -15208,7 +15209,9 @@ async def run_gateway(
     # repeats catch processes that die while the gateway stays up (no
     # per-teardown hook: the positive liveness signal covers every death
     # path by construction). Same containment posture as the janitor above:
-    # offloaded, fail-open, skipped in test_mode.
+    # offloaded, fail-open, skipped in test_mode. The same wake also sweeps the
+    # cross-process work root (see kiro_crew.work_root), which is idle-keyed
+    # BECAUSE outliving its creator is that root's contract.
     global _AGENT_SCRATCH_SWEEP_TASK
     if not test_mode:
 
@@ -15223,6 +15226,15 @@ async def run_gateway(
                     await asyncio.to_thread(agent_scratch.sweep_dead_scratch)
                 except Exception:
                     logging.getLogger(__name__).debug("agent-scratch sweep failed", exc_info=True)
+                # The cross-process work root rides the SAME hourly wake rather
+                # than a scheduler of its own: it reclaims on an idle window
+                # with no correctness deadline either, and a second timer would
+                # double the wake cost for nothing. Its own try/except, so one
+                # root's failure never skips the other's sweep.
+                try:
+                    await asyncio.to_thread(work_root.sweep_work_root)
+                except Exception:
+                    logging.getLogger(__name__).debug("work-root sweep failed", exc_info=True)
 
         _AGENT_SCRATCH_SWEEP_TASK = asyncio.create_task(
             _run_agent_scratch_sweep(), name="agent-scratch-sweep"
