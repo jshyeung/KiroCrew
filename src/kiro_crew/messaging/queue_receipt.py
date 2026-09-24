@@ -125,6 +125,20 @@ class QueueReceipt:
     msg_id: Any
     opened_by: str = ""
     lines: list[ReceiptLine] = field(default_factory=list)
+    #: The FINAL record this bubble still owes, set when that edit did not land.
+    #:
+    #: An entry carrying one is TERMINAL: its messages have already left the queue,
+    #: so it is not grown and not flipped again -- the next mid-turn message opens a
+    #: fresh bubble rather than putting answered text back under "Queued". The body
+    #: travels WITH the entry because the record owed is the one that transition
+    #: computed; recomputing it later would write whatever the later transition
+    #: happened to be instead.
+    final_body: str | None = None
+
+    @property
+    def owes_record(self) -> bool:
+        """Whether this entry is terminal, still owing a record it could not write."""
+        return self.final_body is not None
 
     @property
     def texts(self) -> list[str]:
@@ -159,8 +173,20 @@ class ReceiptSurface(Protocol):
     async def send_receipt(self, body: str) -> Any | None:
         """Post a new receipt bubble. Returns an opaque message id, or None."""
 
-    async def edit_receipt(self, msg_id: Any, body: str) -> None:
-        """Rewrite the receipt in place. May raise; the queue logs and continues."""
+    async def edit_receipt(self, msg_id: Any, body: str) -> bool:
+        """Rewrite the receipt in place. Returns whether the edit LANDED.
+
+        A channel client answers a refusal with ``False`` rather than an exception:
+        a rate-limited chat, or a bubble past the per-message edit cap Webex
+        documents, is an ordinary non-2xx answer. Returning it is what lets the
+        registry tell "the bubble now shows this" from "the bubble still shows the
+        old text", which is the difference between a durable record and a bubble
+        stranded reading "⏳ Queued".
+
+        An implementation that cannot tell may return ``None``; that is silence,
+        not a reported failure, and :meth:`ReceiptQueue._edit` treats it as landed.
+        May also raise, which IS a reported failure.
+        """
 
 
 class ReceiptQueue:
@@ -187,8 +213,13 @@ class ReceiptQueue:
         return self._lock
 
     def has_receipt(self, session_key: str) -> bool:
-        """Whether a live receipt exists for this session."""
-        return session_key in self._receipts
+        """Whether a LIVE receipt exists for this session.
+
+        An entry still owing a record is terminal, not live: it cannot be grown, and
+        the next mid-turn message opens a fresh bubble rather than joining it.
+        """
+        receipt = self._receipts.get(session_key)
+        return receipt is not None and not receipt.owes_record
 
     async def create_or_grow_locked(
         self,
@@ -212,6 +243,16 @@ class ReceiptQueue:
         """
         receipt = self._receipts.get(session_key)
         line = ReceiptLine(owner=owner, text=display_text)
+        if receipt is not None and receipt.owes_record:
+            # Terminal: those messages already left the queue. Growing it would put
+            # answered text back under "Queued" beside this new one, so the record it
+            # owes is written first and the key released only once that lands -- this
+            # entry is that bubble's only handle.
+            if await self._write_record(surface, receipt):
+                del self._receipts[session_key]
+                receipt = None
+            else:
+                return
         if receipt is None:
             msg_id = await surface.send_receipt(receipt_text([display_text]))
             if msg_id is not None:
@@ -220,10 +261,11 @@ class ReceiptQueue:
                 )
             return
         receipt.lines.append(line)
-        try:
-            await surface.edit_receipt(receipt.msg_id, receipt_text(receipt.texts))
-        except Exception:
-            logger.debug("%s: queue receipt grow failed", surface.label, exc_info=True)
+        # A refused grow needs no record and no terminal state: this message is still
+        # QUEUED, which is exactly what ``lines`` tracks, so the registry and the queue
+        # still agree and the next message's edit re-renders the whole list. Only a
+        # transition whose messages have already LEFT the queue can strand a bubble.
+        await self._edit(surface, receipt.msg_id, receipt_text(receipt.texts))
 
     async def flip_answering_locked(
         self,
@@ -243,13 +285,22 @@ class ReceiptQueue:
         receipt = self._receipts.pop(session_key, None)
         if receipt is None:
             return
+        if receipt.owes_record:
+            # Already terminal from an earlier refused transition. Retry THAT record --
+            # recomputing it here would write this transition's words over what actually
+            # happened -- and keep the entry until it lands.
+            if not await self._write_record(surface, receipt):
+                self._receipts[session_key] = receipt
+            return
         body = receipt_text(answered, answering=True)
         if deferred:
             body += f" · +{deferred} deferred"
-        try:
-            await surface.edit_receipt(receipt.msg_id, body)
-        except Exception:
-            logger.debug("%s: queue receipt flip failed", surface.label, exc_info=True)
+        if not await self._edit(surface, receipt.msg_id, body):
+            # These messages have LEFT the queue, so nothing else will ever revisit this
+            # bubble: dropped now it reads "⏳ Queued" for good. Kept, it is terminal and
+            # carries the record it owes, which the next transition writes.
+            receipt.final_body = body
+            self._receipts[session_key] = receipt
 
     async def finish_cancelled_locked(
         self, session_key: str, surface: ReceiptSurface, owner: str = ""
@@ -284,20 +335,62 @@ class ReceiptQueue:
         receipt = self._receipts.get(session_key)
         if receipt is None:
             return
+        if receipt.owes_record:
+            # This bubble already owes a record from an earlier transition -- those
+            # messages left the queue THEN, not in this clear. Writing "Cancelled" over
+            # an owed "Now answering" would say the opposite of what happened, and
+            # permanently. Retry what is owed and leave the entry until it lands.
+            if await self._write_record(surface, receipt):
+                self._receipts.pop(session_key, None)
+            return
         if owner:
             withdrawn = receipt.withdraw(owner)
             if not withdrawn:
                 return
             self._receipts.pop(session_key, None)
             if owner == receipt.opened_by:
-                await self._edit(surface, receipt.msg_id, receipt_text(withdrawn, cancelled=True))
+                body = receipt_text(withdrawn, cancelled=True)
+                if not await self._edit(surface, receipt.msg_id, body):
+                    receipt.final_body = body
+                    self._receipts[session_key] = receipt
             return
         self._receipts.pop(session_key, None)
-        await self._edit(surface, receipt.msg_id, receipt_text(receipt.texts, cancelled=True))
+        body = receipt_text(receipt.texts, cancelled=True)
+        if not await self._edit(surface, receipt.msg_id, body):
+            receipt.final_body = body
+            self._receipts[session_key] = receipt
 
-    async def _edit(self, surface: ReceiptSurface, msg_id: Any, body: str) -> None:
-        """Rewrite the bubble to *body*, logging rather than raising on failure."""
+    async def _edit(self, surface: ReceiptSurface, msg_id: Any, body: str) -> bool:
+        """Rewrite the bubble to *body*. Returns whether the write LANDED.
+
+        A raise and a reported ``False`` are the same answer here: the bubble still
+        shows its old text. Only an explicit ``False`` counts as reported failure --
+        a surface that answers ``None`` has not reported one, and reading silence as
+        failure would keep every receipt in the registry for good.
+        """
         try:
-            await surface.edit_receipt(msg_id, body)
+            return await surface.edit_receipt(msg_id, body) is not False
         except Exception:
-            logger.debug("%s: queue receipt cancel-finalize failed", surface.label, exc_info=True)
+            logger.debug("%s: queue receipt edit failed", surface.label, exc_info=True)
+            return False
+
+    async def _write_record(self, surface: ReceiptSurface, receipt: QueueReceipt) -> bool:
+        """Put the record *receipt* owes onto its bubble. Returns whether it landed.
+
+        Editing first is what keeps the record in the bubble the reader is already
+        looking at. When the bubble refuses edits the record is POSTED instead: past
+        Webex's documented per-message edit cap no edit of that id will ever land, so
+        retrying alone would leave the record owed for the life of the process. The
+        stale bubble still reads "⏳ Queued" and the posted record says what happened,
+        which together are true; a silent bubble alone is not.
+        """
+        body = receipt.final_body
+        if body is None:
+            return True
+        if await self._edit(surface, receipt.msg_id, body):
+            return True
+        try:
+            return await surface.send_receipt(body) is not None
+        except Exception:
+            logger.debug("%s: queue receipt record post failed", surface.label, exc_info=True)
+            return False

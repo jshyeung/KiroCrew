@@ -1444,6 +1444,34 @@ Neither dispatcher calls a delete API on it. This is deliberate: the receipt is
 the durable record of what the user asked and how it was routed, so deleting it
 would erase the only evidence that a message was accepted at all.
 
+**A transition is published only once its edit LANDS.** `ReceiptSurface.edit_receipt`
+returns whether the write landed, and each channel wrapper passes its client's own
+answer through, because a refusal is an ordinary non-2xx answer rather than an
+exception: a rate-limited chat, or a bubble past the per-message edit cap Webex
+documents. A surface that cannot tell may return `None`; that is silence, not a
+reported failure, and counts as landed -- reading it as failure would keep every
+receipt in the registry for good.
+
+A refused **grow** needs nothing further: that message is still queued, which is
+exactly what the entry's lines track, so the registry and the queue still agree and
+the next message's edit re-renders the whole list. Only a transition whose messages
+have already LEFT the queue can strand a bubble, and for those the entry is KEPT and
+becomes **terminal**, carrying `final_body` -- the record it owes. A terminal entry is
+not live (`has_receipt` reports it absent) and is never grown, because growing it
+would put already-answered text back under `⏳ Queued` beside the new message; the
+next mid-turn message writes the owed record first and opens a FRESH bubble. The body
+travels with the entry so a retry writes the record that transition computed, and a
+later transition never recomputes it: writing `🛑 Cancelled` over an owed
+`▶️ Now answering` would say the opposite of what happened, permanently.
+
+The key is released only once the record is on the bubble, because that entry is the
+bubble's only handle. Editing is tried first, so the record lands in the bubble the
+reader is already looking at; when the bubble refuses edits the record is POSTED as a
+new message instead, since past a per-message edit cap no edit of that id will ever
+land and retrying alone would owe the record for the life of the process. The stale
+bubble still reading `⏳ Queued` and the posted record are together true; a silent
+bubble alone is not.
+
 The enqueue and the receipt create/grow happen together under
 `ReceiptQueue.lock`, which the end-of-turn drain also takes across its dequeue
 plus flip. The lock is deliberately **caller-held** rather than acquired inside
