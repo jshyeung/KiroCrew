@@ -1062,6 +1062,53 @@ const NC_SHEET_CLEARANCE = 20
 const NC_CLOSE_BACKSTOP_MS = 1000
 
 /**
+ * True when the press landed on `el`'s own classic scrollbar.
+ *
+ * The one thing a material selector cannot express: a scrollbar hit-tests to
+ * the element it scrolls, so a press on the list's 6px thumb has the SAME
+ * target as a press on the empty strip below the last card. Only the pointer
+ * position tells them apart — the client box excludes the bar, so a pointer
+ * outside it (past the right edge, or the left edge under RTL where
+ * `clientLeft` already counts the bar) is on the bar. Overlay scrollbars take
+ * no layout space and cannot be told apart this way, but this dashboard styles
+ * `::-webkit-scrollbar`, which makes every Chromium and WebKit bar a classic
+ * one. Nothing to detect while the content does not overflow — which also
+ * covers a DOM with no layout at all, where every box measures zero.
+ */
+function onOwnScrollbar(el: Element, e: MouseEvent): boolean {
+  const r = el.getBoundingClientRect()
+  const x0 = r.left + el.clientLeft
+  const y0 = r.top + el.clientTop
+  const onVerticalBar = el.scrollHeight > el.clientHeight && (e.clientX < x0 || e.clientX >= x0 + el.clientWidth)
+  const onHorizontalBar = el.scrollWidth > el.clientWidth && (e.clientY < y0 || e.clientY >= y0 + el.clientHeight)
+  return onVerticalBar || onHorizontalBar
+}
+
+/**
+ * A press inside the popover that hit the sheet's own background rather than
+ * something on it.
+ *
+ * The sheet is transparent by design: the panel paints nothing and every
+ * readable element is a floating card, so the popover's box says nothing about
+ * what the user pressed. On a phone that box is the whole viewport under the
+ * top bar, on desktop it is the 400px column — so judging a press by the box
+ * left the strip below the last card inert while the identical-looking strip
+ * left of the column dismissed, and on a phone left nothing but the bell to
+ * dismiss with. A press is judged by what it landed on instead. "On it" means
+ * a card (`notif-material`, the index.css hook every card already carries), a
+ * row, the detail panel (`data-nc-material`) or any control — those keep the
+ * sheet; anything else inside the popover is its background and dismisses
+ * exactly like a press outside would. Labels that float directly on the
+ * background (group headings, the empty inbox) are background too — they are
+ * not cards and hold nothing to press. Judged for the pointerdown and again
+ * for the click that completes it.
+ */
+function isSheetBackgroundPress(target: Element, e: MouseEvent): boolean {
+  if (target.closest('.notif-material, [data-notif-row], [data-nc-material], button, a, input, textarea, select, [role="button"]')) return false
+  return !onOwnScrollbar(target, e)
+}
+
+/**
  * Topbar Notifications bell. The Notifications surface is `hiddenFromNav`, so
  * this is its entry point. Click opens an Activity Feed popover
  * (portaled to <body> to escape the topbar's backdrop-filter containing
@@ -1234,14 +1281,43 @@ function NotificationsBellButton() {
 
   useEffect(() => {
     if (!open) return
+    // Whether the pointer gesture in flight began on the sheet's own
+    // background (inside the popover, on no material — see
+    // isSheetBackgroundPress). Set by every pointerdown, consumed by the click
+    // that completes the same gesture.
+    let pressedBackground = false
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as Node | null
       if (!target) return
       const inButton = containerRef.current?.contains(target) ?? false
       const inPopover = popoverRef.current?.contains(target) ?? false
+      // A pointer never targets a text node, so a node inside the popover is
+      // an Element.
+      pressedBackground = inPopover && isSheetBackgroundPress(target as Element, e)
       if (!inButton && !inPopover) {
         closePanel()
       }
+    }
+    // A press on the sheet's background dismisses too, because on a phone the
+    // popover's box is the whole viewport under the top bar and nothing else
+    // could. It is dismissed at CLICK, not at pointerdown, and only when the
+    // gesture also began there:
+    // - at click the sheet is still hit-testable, so the gesture ends on the
+    //   sheet and never reaches the page under the transparent strip.
+    //   Dismissing at pointerdown made the leaving sheet pointer-transparent
+    //   and the same tap's click landed on whatever sat beneath — a
+    //   suggestion chip, a link;
+    // - a touch drag that starts in the gap between two cards to scroll the
+    //   list produces no click, so scrolling still works;
+    // - a drag that starts on a card (selecting its text) and is released on
+    //   the background clicks their common ancestor, which is background —
+    //   the pairing is what keeps that from dismissing.
+    const onClick = (e: MouseEvent) => {
+      if (!pressedBackground) return
+      pressedBackground = false
+      const target = e.target as Node | null
+      if (!target || !popoverRef.current?.contains(target)) return
+      if (isSheetBackgroundPress(target as Element, e)) closePanel()
     }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -1254,8 +1330,13 @@ function NotificationsBellButton() {
       }
     }
     document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('click', onClick)
     document.addEventListener('keydown', onKey)
-    return () => { document.removeEventListener('pointerdown', onPointerDown); document.removeEventListener('keydown', onKey) }
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('click', onClick)
+      document.removeEventListener('keydown', onKey)
+    }
   }, [open, selectedTs, closePanel])
 
   // Auto-mark-read when opening a notification's detail -- ONCE per
@@ -1315,7 +1396,7 @@ function NotificationsBellButton() {
           <ErrorBoundary
             scope="notifications-bell"
             fallback={
-              <div {...leavingProps} className={`absolute top-0 right-0 ${closing ? 'pointer-events-none' : 'pointer-events-auto'} ${isMobile ? 'w-full' : 'w-[400px]'} glass-surface glass-static rounded-xl shadow-xl flex flex-col items-center justify-center gap-2 p-6 text-center`} style={{ maxHeight: 240 }}>
+              <div {...leavingProps} data-nc-material className={`absolute top-0 right-0 ${closing ? 'pointer-events-none' : 'pointer-events-auto'} ${isMobile ? 'w-full' : 'w-[400px]'} glass-surface glass-static rounded-xl shadow-xl flex flex-col items-center justify-center gap-2 p-6 text-center`} style={{ maxHeight: 240 }}>
                 <AlertTriangle size={20} className="text-warn" />
                 <div className="text-[13px] font-semibold text-text-strong">{i18nT('app.notifications_failed_to_load')}</div>
                 <button className="text-[12px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer" onClick={() => leave(() => { closePanel(); navigate('/notifications') }, '/notifications')}>{i18nT('app.open_the_full_inbox')}</button>
@@ -1376,9 +1457,12 @@ function NotificationsBellButton() {
           </div>
           {/* Detail panel — overlays feed on mobile, sits beside it on desktop.
               Rendered plainly (no AnimatePresence): an exit animation here races
-              the portal teardown when the popover closes and throws removeChild. */}
+              the portal teardown when the popover closes and throws removeChild.
+              Material, not background: it is an opaque card, so a press on it
+              keeps the sheet like a press on a row does. */}
           {selected && (
             <div
+              data-nc-material
               className={`absolute top-0 bottom-0 pointer-events-auto ${isMobile ? 'left-0 right-0' : 'left-0 right-[408px]'} bg-card border border-border rounded-xl shadow-xl overflow-hidden`}
             >
               <NotificationDetailPanel
