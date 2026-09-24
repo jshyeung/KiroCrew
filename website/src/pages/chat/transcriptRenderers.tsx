@@ -48,7 +48,9 @@ import { isSubagentCompletionMessage, type ParsedSubagentCompletion } from './su
 import { REASONING_ROLES, hasReasoningContent } from './groupDisplayItems'
 import { FileCard } from '../../components/FileCard'
 import UserMessage from './UserMessage'
-import { formatTs, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
+import CrewmateMessage, { type CrewmateIdentity } from './CrewmateMessage'
+import { crewmateBubbleClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
+import { formatTs, renderAssistantBubble, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
 import { renderUserContent } from './ChatPageMessageContent'
 import { fmtMessageTimeFull } from './messageTime'
 import type { ChatMessage } from '../../types'
@@ -148,6 +150,19 @@ export interface TranscriptRendererOptions {
    *  still files the request. A usage limit in any other slot has no form to
    *  offer and keeps today's row, Continue included. */
   featureRequestFormUrl?: string
+  /** Draw the assistant rows as a CREWMATE speaking: avatar + name + time on
+   *  the first message of a run, one bordered bubble per message, grouped
+   *  corners (components/chat/crewmateBubbles). Set by the Members page for a
+   *  member-mode slot; absent everywhere else, so an ordinary chat keeps the
+   *  SDK's assistant row byte-for-byte. The host also filters the transcript
+   *  with `filterCrewmateChat` — this option only changes how what remains is
+   *  drawn. */
+  crewmate?: CrewmateIdentity
+  /** The UNFILTERED transcript behind a crewmate's chat. The rows the pane
+   *  draws are `ctx.messages`; the rows the pane dropped (the `inject` row a
+   *  policy block writes among them) are only here. Read for the steer-chip
+   *  decision, never for layout. Meaningless without `crewmate`. */
+  crewmateTranscript?: ChatMessage[]
 }
 
 /** Index of the last `error` row, so only that one offers Continue. Derived
@@ -179,6 +194,10 @@ export function createTranscriptRenderers(
       true,
     )
   }
+  // Narrowed once here so the crewmate entry below can close over a definite
+  // identity instead of re-asserting `o.crewmate` inside its render.
+  const crewmate = o.crewmate
+  const crewmateTranscript = o.crewmateTranscript
 
   return [
     // ── Shape-matched rows, ahead of anything keyed only by role ──
@@ -352,6 +371,40 @@ export function createTranscriptRenderers(
         true,
       ),
     },
+    // Replaces the SDK's `assistant` entry (same id) ONLY for a crewmate's
+    // chat: the same AssistantMessage (markdown, option chips, hover actions),
+    // placed as a bubble in a run under the crewmate's avatar and name. The
+    // run position is derived from the list the pane already filtered, so the
+    // neighbours it reads are the rows drawn next to it. The two assistant-role
+    // refinements above (system notice, workflow completion) still precede it;
+    // the pane's filter has already dropped both for a crewmate anyway.
+    ...(crewmate
+      ? [{
+          id: 'assistant',
+          roles: ['assistant', 'streaming'],
+          render: (m: ChatMessage, ctx: MessageRenderContext) => {
+            // Run position reads turn boundaries off the UNFILTERED transcript
+            // (a patrol wake between two replies is filtered from `ctx.messages`).
+            const pos = crewmateRunPosition(ctx.messages, ctx.index, crewmateTranscript)
+            // The run ends here (single / end): the row after it is a boundary
+            // the user sees or the turn ended, so this bubble is the one that
+            // carries the hover actions. The policy-block read goes to
+            // the unfiltered transcript — see `crewmateTranscript`; the row is
+            // located by identity, since the filter keeps the same objects.
+            const full = crewmateTranscript
+            const fullIndex = full ? full.indexOf(m) : -1
+            const bubble = renderAssistantBubble(m, ctx, crewmateBubbleClass(pos), {
+              forceFooter: pos === 'single' || pos === 'end',
+              policyBlockTranscript: full && fullIndex >= 0 ? { messages: full, index: fullIndex } : undefined,
+            })
+            if (bubble === null) return null
+            return ctx.row(
+              <CrewmateMessage crewmate={crewmate} pos={pos} ts={m.ts}>{bubble}</CrewmateMessage>,
+              true,
+            )
+          },
+        } satisfies MessageRenderer]
+      : []),
     {
       // Replaces the default's bare div: same text, plus the Continue
       // affordance on the LAST error when a turn was interrupted.

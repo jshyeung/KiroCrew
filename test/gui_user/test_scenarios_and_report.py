@@ -57,6 +57,7 @@ SHIPPED_SMOKE = {
     "taskrunner-projects-page-compose",
 }
 SHIPPED = SHIPPED_SMOKE | {
+    "crewmate-chat-clean",
     "crewmate-panel-tabs",
     "knowledge-add-folder-source-and-scan",
     "meet-crewmates-flow",
@@ -185,6 +186,7 @@ class TestShippedScenarios:
             ],
             "search": ["search-everywhere-jump-to-setting"],
             "members": [
+                "crewmate-chat-clean",
                 "crewmate-panel-tabs",
                 "meet-crewmates-flow",
                 "members-dm-hello",

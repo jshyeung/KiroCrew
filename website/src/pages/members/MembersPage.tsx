@@ -107,6 +107,7 @@ import { activityDayLabel, floorCountText, groupActivityDays, projectLabel } fro
 import { safeGetItem, safeSetItem } from '../../utils/safeStorage'
 import { useMemberProjection, useMemberRosterViews } from '../../state/useMemberProjection'
 import type { RosterView, ActivityView, WakeView } from '../../state/memberProjectionTypes'
+import type { CrewmateIdentity } from '../chat/CrewmateMessage'
 
 /** The crew manager surface — the ONLY write path for member configuration.
  *  The explicit tab wins over CapabilitiesPage's remembered last tab. */
@@ -835,6 +836,14 @@ export default function MembersPage() {
       last_message: active.last_message || activeRoster.last_message,
     }
   }, [active, activeRoster])
+  // The identity the DM pane draws the crewmate's messages under. Memoised on
+  // the two fields so the pane's renderer memo does not rebuild per render.
+  const crewmateName = activeView?.name
+  const crewmateAvatar = activeView?.avatar
+  const crewmateIdentity = useMemo<CrewmateIdentity | undefined>(
+    () => (crewmateName ? { name: crewmateName, avatar: crewmateAvatar } : undefined),
+    [crewmateName, crewmateAvatar],
+  )
   // Most-recently-active first (like any IM member list); never-talked
   // members fall to the bottom alphabetically. Sorted from the cached roster,
   // which changes only when the cache does — a return to the page, a focus
@@ -1217,6 +1226,13 @@ export default function MembersPage() {
     if (!beside) setOverlayOpen(true)
     return true
   }, [confirmedSlot, tabsCtl, beside])
+  // The quiet crewmate chat's "where the work went" line focuses the Work log
+  // tab — the same select the strip's own chip performs — and, in overlay
+  // mode, reveals the panel, for the same reason as the Side Chat above.
+  const openCrewWorkLog = useCallback(() => {
+    tabsCtl.setActive(CREW_WORK_LOG_TAB_ID)
+    if (!beside) setOverlayOpen(true)
+  }, [tabsCtl, beside])
   // Whether each leading tab's body is on screen — the gate for its data reads.
   // Read from what the panel SHOWS (`onActiveTabChange`), not from the stored
   // focus: a stored focus on a withheld view falls back to the first leading tab
@@ -2321,6 +2337,8 @@ export default function MembersPage() {
                     // ready" would contradict it one line down.
                     hideEmptyHint={activeThreadFailed}
                     openSideChat={openMemberSideChat}
+                    crewmate={crewmateIdentity}
+                    onOpenCrewWorkLog={openCrewWorkLog}
                   />
                 </ErrorBoundary>
               </div>
@@ -2687,7 +2705,13 @@ export default function MembersPage() {
                               its oldest returned entry, so older events may be
                               missing — the count is "at least N", shown as N+.
                               The footer under the list says so in words. */}
-                          {day.chats > 0 && countPhrase('pages.membersPage.activity_chat_count', day.chats, day.isFloor)}
+                          {/* The unit's definition rides on the count the reader
+                              actually hovers, not only on each entry's timestamp. */}
+                          {day.chats > 0 && (
+                            <span title={t('pages.membersPage.activity_chat')}>
+                              {countPhrase('pages.membersPage.activity_chat_count', day.chats, day.isFloor)}
+                            </span>
+                          )}
                           {day.chats > 0 && day.routed > 0 && PROJECT_SEPARATOR}
                           {day.routed > 0 && (
                             <>

@@ -6858,12 +6858,20 @@ class DashboardState:
                     _ev_ts = float(_raw_ts)
                 except (TypeError, ValueError):
                     _ev_ts = time.time()
-                # Same redaction chain the members roster uses, run before the
-                # length cap so a credential split by truncation cannot leak.
-                _prev = content if isinstance(content, str) else str(content or "")
-                _prev, _ = redact_exfiltration_urls(_prev)
-                _prev, _ = redact_credentials(_prev)
-                _prev = _prev[:140]
+
+                # Same redaction chain the members roster read uses, run
+                # before the length cap so a credential split by truncation
+                # cannot leak. The payload is built by the one shared spelling
+                # (`member_message_payload` -> `speech_preview`) so the folded
+                # preview equals what `GET /api/members` reads back.
+                def _sanitize_preview(text: str) -> str:
+                    text, _ = redact_exfiltration_urls(text)
+                    text, _ = redact_credentials(text)
+                    return text
+
+                _payload = eventlog_hooks.member_message_payload(
+                    role, content, msg.get("meta"), _ev_ts, sanitize=_sanitize_preview
+                )
 
                 # Off the event loop: emit opens the member log and does a
                 # synchronous os.fsync append. This callback runs loop-side, so
@@ -6875,7 +6883,7 @@ class DashboardState:
                         _mslug,
                         None,
                         MEMBER_MESSAGE,
-                        {"ts": _ev_ts, "preview": _prev},
+                        _payload,
                     )
 
                 # Queued on the ordered executor either way -- see the slot

@@ -1208,7 +1208,7 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
       // Today's row: the two entries collapse into counts by how the member was
       // reached, and the project rides along as its last path segment.
       const todayRow = screen.getAllByTestId('member-activity-day')[0]
-      expect(todayRow).toHaveTextContent('1 chat')
+      expect(todayRow).toHaveTextContent('1 run')
       expect(todayRow).toHaveTextContent('1 auto-picked')
       expect(todayRow).toHaveTextContent('kirocrew')
       expect(todayRow).not.toHaveTextContent('/srv/')
