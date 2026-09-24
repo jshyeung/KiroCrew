@@ -587,3 +587,90 @@ def test_the_scheme_actually_participates_in_the_key(monkeypatch):
     monkeypatch.setattr(td, "FINGERPRINT_SCHEME", 1)
     under_old_scheme = td.revision_fingerprint(spec())
     assert current != under_old_scheme
+
+
+# --- the stop timeout is the platform half of the supervisor's drain contract ------
+
+#: The image's own drain constants, read as DATA. Importing that tree from here would
+#: mirror the import the spawn audit forbids in gateway code, and the tree assumes an
+#: installed layout where ``kiro_crew`` is absent, so it may not be importable at all.
+_CONTAINER_CONFIG = (
+    pathlib.Path(td.__file__).parents[2]
+    / "apps"
+    / "builtins"
+    / "aws_control"
+    / "crew"
+    / "runtime"
+    / "container"
+    / "common"
+    / "config.py"
+)
+
+
+def _container_constants() -> dict[str, float]:
+    """Every module-level numeric constant in the image's config, by name."""
+    tree = ast.parse(_CONTAINER_CONFIG.read_text(encoding="utf-8"))
+    found: dict[str, float] = {}
+    for node in tree.body:
+        target = None
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target = node.target.id
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            if isinstance(node.targets[0], ast.Name):
+                target = node.targets[0].id
+        if target is None or node.value is None:
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except ValueError:
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            found[target] = value
+    return found
+
+
+def test_the_crew_container_declares_a_stop_timeout_covering_the_whole_drain():
+    """Fargate's 30s default cuts the backup writer's final cycle before it starts.
+
+    The supervisor drains front, backend, then the writer, in that order. The writer's
+    cycle carries the only copy of the turns the backend flushed on the way out, so a
+    stop timeout shorter than the three windows together kills it, kills the supervisor
+    with it, and the non-zero exit meant to report the loss is never delivered.
+    """
+    c = _container_constants()
+    drain_sum = c["FRONT_DRAIN_SECS"] + c["BACKEND_DRAIN_SECS"] + c["SIDECAR_DRAIN_SECS"]
+
+    assert container(td.task_definition_document(spec()))["stopTimeout"] >= drain_sum
+
+
+def test_the_stop_timeout_matches_the_sum_the_image_declares():
+    """Two copies of one contract, pinned equal by reading the image tree as data.
+
+    The gateway cannot import that tree, so the copies are deliberate and this is what
+    stops them drifting: change a drain window without changing this and the pin reds.
+    The sum is recomputed here rather than read by name, because the image derives its
+    own total from the same three windows and a derived name is not a literal.
+    """
+    c = _container_constants()
+    drain_sum = c["FRONT_DRAIN_SECS"] + c["BACKEND_DRAIN_SECS"] + c["SIDECAR_DRAIN_SECS"]
+
+    assert td.CREW_STOP_TIMEOUT_SECS == int(drain_sum)
+
+
+def test_the_stop_timeout_stays_inside_the_limit_fargate_accepts():
+    """A value above the cap is rejected at registration, so the drains have a ceiling."""
+    c = _container_constants()
+
+    assert 0 < td.CREW_STOP_TIMEOUT_SECS <= c["MAX_TASK_STOP_TIMEOUT_SECS"]
+
+
+def test_the_constants_the_pin_reads_are_actually_there():
+    """A typo in a name would make every pin above vacuous rather than red."""
+    missing = {
+        "FRONT_DRAIN_SECS",
+        "BACKEND_DRAIN_SECS",
+        "SIDECAR_DRAIN_SECS",
+        "MAX_TASK_STOP_TIMEOUT_SECS",
+    } - set(_container_constants())
+
+    assert not missing, f"the image's config no longer declares: {sorted(missing)}"
