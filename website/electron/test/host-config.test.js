@@ -5,6 +5,7 @@ const {
   migrateRemoteHostConfig,
   remoteHostPort,
   getRemoteHostConfig,
+  selectLaunchPort,
   setRemoteHostConfig,
 } = require("../host-config");
 
@@ -27,6 +28,30 @@ describe("migrateRemoteHostConfig", () => {
     assert.deepEqual(store._data.remoteHosts, { 7778: { host: "myhost.corp.example.com", binPath: "~/.local/bin/kirocrew" } });
     assert.equal(store._data.remoteHost, undefined);
     assert.equal(store._data.kirocrewBinPath, undefined);
+  });
+
+  it("derives a selectable key rather than trusting the configured port", () => {
+    // A legacy entry names a host and no port, so this key is what makes the crew
+    // visible to selection at all. Port 80 is one selection refuses, so keying the
+    // entry there would record a crew on a port no launch can target.
+    const store = mockStore({ remoteHost: "legacy.example.com", remoteHosts: {} });
+    assert.equal(migrateRemoteHostConfig(store, 80), true);
+    assert.deepEqual(Object.keys(store._data.remoteHosts), ["5476"]);
+  });
+
+  it("lands the legacy entry on the port selection would have chosen", () => {
+    // The migration runs before selection, so the two must agree: with no crew in
+    // the store, selection answers the configured port when it is selectable.
+    for (const configured of [7778, 5476, 9999]) {
+      const store = mockStore({ remoteHost: "legacy.example.com", remoteHosts: {} });
+      migrateRemoteHostConfig(store, configured);
+      const selected = selectLaunchPort({
+        store: mockStore({ remoteHosts: {} }),
+        configuredPort: configured,
+        localGatewayEnabled: true,
+      });
+      assert.deepEqual(Object.keys(store._data.remoteHosts), [String(selected)]);
+    }
   });
 
   it("uses DEFAULT_REMOTE_BIN when kirocrewBinPath is empty", () => {
@@ -224,5 +249,146 @@ describe("isSelectablePort", () => {
     for (const value of [1, 443, 5476, 7778, 65535]) {
       assert.equal(isSelectablePort(value), true, String(value));
     }
+  });
+});
+
+describe("selectLaunchPort", () => {
+  function select(store, { configuredPort = null, localGatewayEnabled = true } = {}) {
+    const logged = [];
+    const port = selectLaunchPort({
+      store,
+      configuredPort,
+      localGatewayEnabled,
+      log: (message) => logged.push(message),
+    });
+    return { port, logged: logged.join("\n") };
+  }
+
+  describe("with the local gateway off", () => {
+    it("honours a dashboard record that names a configured crew", () => {
+      const store = mockStore({ remoteHosts: { "7778": { host: "a.example.com" } } });
+      assert.equal(select(store, { configuredPort: 7778, localGatewayEnabled: false }).port, 7778);
+    });
+
+    it("ignores a dashboard record no host can serve and takes the crew", () => {
+      const store = mockStore({ remoteHosts: { "7778": { host: "a.example.com" } } });
+      assert.equal(select(store, { configuredPort: 5476, localGatewayEnabled: false }).port, 7778);
+    });
+
+    it("takes the configured crew when there is no dashboard record", () => {
+      const store = mockStore({ remoteHosts: { "7778": { host: "a.example.com" } } });
+      assert.equal(select(store, { configuredPort: null, localGatewayEnabled: false }).port, 7778);
+    });
+
+    it("keeps the dashboard record when no crew is configured at all", () => {
+      const store = mockStore({ remoteHosts: {} });
+      assert.equal(select(store, { configuredPort: 9999, localGatewayEnabled: false }).port, 9999);
+    });
+
+    it("refuses a record on port 80 whose only crew sits there too", () => {
+      // The crew scan skips 80, so no remote target is found and the record
+      // reaches the shared exit. Honouring it would hand the launch the one port
+      // whose URL drops it, which is what makes a remote link read as local.
+      const store = mockStore({ remoteHosts: { "80": { host: "a.example.com" } } });
+      assert.equal(
+        select(store, { configuredPort: 80, localGatewayEnabled: false }).port,
+        5476,
+      );
+    });
+
+    it("falls back to the default with neither a record nor a crew", () => {
+      const store = mockStore({ remoteHosts: {} });
+      assert.equal(select(store, { configuredPort: null, localGatewayEnabled: false }).port, 5476);
+    });
+  });
+
+  describe("with the local gateway on", () => {
+    it("declines a dashboard record whose port has a configured crew", () => {
+      // This launch stands a gateway up on the port it picks. Binding a crew's
+      // port shadows that crew, and the supervisor's conflict resolver reads the
+      // same entry, so it calls the gateway this app started foreign.
+      const store = mockStore({ remoteHosts: { "7778": { host: "a.example.com" } } });
+      const { port, logged } = select(store, { configuredPort: 7778 });
+      assert.equal(port, 5476);
+      assert.match(logged, /7778/);
+      assert.match(logged, /remote crew is configured there/);
+    });
+
+    it("declines it on a port it would not select either", () => {
+      const store = mockStore({ remoteHosts: { "80": { host: "a.example.com" } } });
+      assert.equal(select(store, { configuredPort: 80 }).port, 5476);
+    });
+
+    it("keeps a dashboard record whose own port has no crew", () => {
+      // A crew configured somewhere else is not a reason to move a local launch.
+      const store = mockStore({ remoteHosts: { "9999": { host: "a.example.com" } } });
+      assert.equal(select(store, { configuredPort: 7778 }).port, 7778);
+    });
+
+    it("keeps a record whose entry is only a window-title setting", () => {
+      const store = mockStore({ remoteHosts: { "7778": { defaultName: "Staging" } } });
+      assert.equal(select(store, { configuredPort: 7778 }).port, 7778);
+    });
+
+    it("falls back to the default when a crew is configured and no record exists", () => {
+      const store = mockStore({ remoteHosts: { "7778": { host: "a.example.com" } } });
+      assert.equal(select(store, { configuredPort: null }).port, 5476);
+    });
+
+    it("keeps a record whose entry carries an empty or non-string host", () => {
+      // Neither shape names a machine to reach, so neither is a crew to shadow.
+      for (const entry of [{ host: "" }, { host: 5 }, {}]) {
+        const store = mockStore({ remoteHosts: { "7778": entry } });
+        assert.equal(select(store, { configuredPort: 7778 }).port, 7778);
+      }
+    });
+
+    // The product default is also the likeliest local end of a tunnel, so
+    // declining a crew-named record and then handing back 5476 would return a
+    // crew's port for the very reason the record was refused.
+    it("declines a crew-named record without falling back onto another crew", () => {
+      const store = mockStore({
+        remoteHosts: {
+          "7778": { host: "a.example.com" },
+          "5476": { host: "b.example.com" },
+        },
+      });
+      const { port, logged } = select(store, { configuredPort: 7778 });
+      assert.notEqual(port, 7778);
+      assert.notEqual(port, 5476);
+      assert.equal(port, 5477);
+      assert.match(logged, /remote crew is configured on 5476/);
+    });
+
+    it("skips a run of crew-claimed ports to reach a free one", () => {
+      const remoteHosts = {};
+      for (let p = 5476; p <= 5479; p += 1) remoteHosts[String(p)] = { host: "c.example.com" };
+      const store = mockStore({ remoteHosts });
+      assert.equal(select(store, { configuredPort: null }).port, 5480);
+    });
+
+    it("keeps the default and leaves the collision visible when the window is full", () => {
+      // Sixty-four consecutive crews is a configuration to report, not one to
+      // out-guess: a defined answer beats one that depends on the search width.
+      const remoteHosts = {};
+      for (let p = 5476; p < 5476 + 64; p += 1) remoteHosts[String(p)] = { host: "d.example.com" };
+      const store = mockStore({ remoteHosts });
+      const { port, logged } = select(store, { configuredPort: null });
+      assert.equal(port, 5476);
+      assert.match(logged, /names a configured crew/);
+    });
+
+    // A dashboard record on a scheme's default port is refused whether or not a
+    // crew is configured there. Every per-port lookup keyed off the window URL
+    // reads "" for 80, so a launch that lands there cannot be told apart from a
+    // link to a remote crew, and the heartbeat sends the internal secret on that
+    // answer. Which port is selected is the part this module controls.
+    it("refuses a crew-free dashboard record on port 80", () => {
+      const store = mockStore({ remoteHosts: {} });
+      const { port, logged } = select(store, { configuredPort: 80 });
+      assert.equal(port, 5476);
+      assert.match(logged, /No usable dashboard\.url port/);
+      assert.match(logged, /falling back to 5476/);
+    });
   });
 });
