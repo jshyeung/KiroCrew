@@ -371,6 +371,36 @@ def _without_sync_status(properties):
     return {k: v for k, v in properties.items() if k != "sync_status"}
 
 
+def _bundle_item_group(value: object) -> list[str]:
+    """A state row's ``item_ids`` as it arrives in a bundle, parsed to a list of ids.
+
+    A bundle is untrusted input, so anything that is not a JSON array of non-empty
+    strings reads as no group at all, which drops the row rather than committing
+    ownership that cannot be checked. Duplicates collapse and order is kept: the
+    column stores the set of items one document owns, and a repeated id would make
+    the group's size disagree with the items behind it.
+
+    Both shapes are accepted because the column is TEXT holding JSON: an export
+    ships the raw column, and a hand-assembled bundle may carry a real array.
+    """
+    if isinstance(value, str) and value.strip():
+        try:
+            raw: object = json.loads(value)
+        except (ValueError, RecursionError):
+            return []
+    elif isinstance(value, list):
+        raw = value
+    else:
+        return []
+    if not isinstance(raw, list):
+        return []
+    group: list[str] = []
+    for entry in raw:
+        if isinstance(entry, str) and entry and entry not in group:
+            group.append(entry)
+    return group
+
+
 class _NodeView:
     """Minimal node-attribute view supporting get, subscript, iteration, and len."""
 
@@ -510,6 +540,44 @@ _DOC_STATE_KEY_COL: dict[str, str] = {
     "artifact_item_state": "slug",
     "agent_item_state": "slug",
 }
+
+#: Public view of the per-document state tables a ``.knowledge`` bundle carries,
+#: mapped to the column that identifies one document inside each. Derived from the
+#: definition above so the dashboard's bundle validator and :meth:`import_bundle`
+#: read one list. A bundle that moves items WITHOUT these rows moves content the
+#: receiving store can never manage: nothing claims the items for de-duplication,
+#: the Sources UI has no per-document group label for them, and a later ingest of
+#: the same document adds a second copy instead of replacing the first.
+BUNDLE_STATE_KEY_COL: dict[str, str] = dict(_DOC_STATE_KEY_COL)
+
+#: Columns each state table carries through a bundle, beyond its source, its key
+#: and its item group. Everything else is either derived on import -- the live
+#: status, which the surviving group defines -- or local bookkeeping that does not
+#: travel: retry counters, error text, and the dedup winner a losing row points at
+#: all describe the EXPORTING store's own progress.
+_BUNDLE_STATE_CARRIED_COLS: dict[str, tuple[str, ...]] = {
+    "folder_file_state": ("content_hash", "text_hash", "last_seen"),
+    "artifact_item_state": ("content_hash", "updated_at", "name", "kind"),
+    "agent_item_state": ("content_hash", "updated_at", "name", "source_uri"),
+}
+
+#: Columns written to a fixed value instead of being carried.
+#:
+#: ``mtime`` is a statement about a file on the EXPORTING host, and the folder scan
+#: skips hashing a live row whose recorded mtime is at or above the file's. A carried
+#: mtime ahead of the local file's would therefore stop that file ever being hashed
+#: again, silently, leaving the imported text indexed in place of the local content
+#: with no path that corrects it. Zero is below any timestamp a watched file carries,
+#: so the first local scan always hashes; the content hash, which DOES travel, is
+#: then what decides whether anything is re-extracted.
+_BUNDLE_STATE_FIXED_COLS: dict[str, tuple[tuple[str, Any], ...]] = {
+    "folder_file_state": (("mtime", 0.0),),
+}
+
+#: Carried columns that are NOT NULL in the schema. A bundle omitting one gets the
+#: import's own clock, so a row that otherwise qualifies is not refused over a
+#: missing timestamp.
+_BUNDLE_STATE_REQUIRED_COLS = frozenset({"last_seen", "updated_at"})
 
 # Which column on each state table holds a hash in the SAME DOMAIN as
 # ``items.content_hash``, for lookups that have to relate a state row to items.
@@ -2601,15 +2669,63 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             "sources": [dict(r) for r in self.db.execute("SELECT * FROM sources")],
             "source_locations": source_locations,
             "mentions": mentions,
+            # Ownership travels with the content. These rows are what make an
+            # imported item manageable at all, and they are exported unfiltered
+            # like ``sources`` and ``entities``: a namespace-scoped export ships
+            # only some items, and :meth:`import_bundle` is where a row whose
+            # group did not fully arrive is dropped, so the membership rule lives
+            # in one place rather than being half-applied on each side.
+            **{table: [dict(r) for r in self.db.execute(
+                f"SELECT * FROM {table}")]  # noqa: S608 -- table from a module constant
+               for table in BUNDLE_STATE_KEY_COL},
         }
 
     def import_bundle(self, bundle: dict) -> dict:
         items_imported = 0
         entities_created = 0
         relations_rebuilt = 0
+        state_rows_imported = 0
         now = datetime.now().isoformat()
+        # A bundle names its sources by the ids the EXPORTING store minted, and
+        # ``sources.uri`` carries the UNIQUE constraint, so the same logical source
+        # -- the artifact aggregate at ``artifact://``, a folder watched on two
+        # machines -- holds a different id on either side. Every row that points at
+        # a source is rewritten through this map, which makes the rule one sentence:
+        # a bundle source's uri always ends up present in this store, and everything
+        # that pointed at that source points at whichever local row owns that uri.
+        #
+        # Without it a bundle whose uri is already here inserts no source row (the
+        # unique index refuses it) and then every item in the bundle references a
+        # source id this store does not have, so the foreign key refuses the write
+        # and the entire import rolls back.
+        source_id_map: dict[str, str] = {}
+
+        def _mapped_source(raw: object) -> str | None:
+            """The local source id a bundle's source id resolves to, or ``None``.
+
+            ``None`` means the bundle names a source it does not itself carry and
+            this store does not hold. Callers writing a foreign key pass the raw
+            value through in that case: an unresolvable pointer is a malformed
+            bundle, and the constraint refusing it is what the import endpoint
+            turns into its typed malformed-bundle answer.
+            """
+            if not isinstance(raw, str) or not raw:
+                return None
+            mapped = source_id_map.get(raw)
+            if mapped is not None:
+                return mapped
+            row = self.db.execute(
+                "SELECT id FROM sources WHERE id = ?", (raw,)).fetchone()
+            return row["id"] if row else None
+
+        def _source_fk(raw: object) -> object:
+            """*raw* rewritten to its local source id, or left exactly as it came."""
+            mapped = _mapped_source(raw)
+            return mapped if mapped is not None else raw
+
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            claimed_uris: dict[str, str] = {}
             for src in bundle.get("sources", []):
                 # Restore the status from the COLUMN, which ``export_all`` ships
                 # (it serializes SELECT * FROM sources). Reading the blob copy
@@ -2629,6 +2745,26 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                 # such a key on the next open without ever promoting it, so this
                 # is the boundary holding, not a second line of defence.
                 props_text = _validated_properties(src.get("properties"))
+                # Both identity columns become DICTIONARY KEYS while the bundle's
+                # source ids are rewritten, so a list or dict here raises an
+                # unhashable-type TypeError rather than the typed rejection the
+                # import endpoint turns into a 400. They are also the only handles a
+                # source row has, so an empty one names nothing. Enforced at the
+                # writer, like the properties and aliases columns, so a caller that
+                # is not the dashboard endpoint is safe by construction.
+                claimed_id = src.get("id")
+                claimed_uri = src.get("uri")
+                for label, value in (("id", claimed_id), ("uri", claimed_uri)):
+                    if not isinstance(value, str) or not value:
+                        raise KnowledgeBundleError(
+                            f"'sources.{label}' must be a non-empty string")
+                # One id may name only one uri. ``sources.id`` is a PRIMARY KEY, so no
+                # export produces two entries sharing one; accepting them would let the
+                # later entry overwrite the earlier one's place in the map and file the
+                # bundle's items under a source that was never named for them.
+                if claimed_uris.setdefault(claimed_id, claimed_uri) != claimed_uri:
+                    raise KnowledgeBundleError(
+                        "'sources' repeats an id under two different uris")
                 restored = src.get("sync_status")
                 if not isinstance(restored, str) or not restored:
                     restored = json.loads(props_text or "{}").get("sync_status")
@@ -2646,14 +2782,37 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                 if (src.get("source_type") in _WALKING_SOURCE_TYPES
                         and restored != "paused"):
                     restored = "pending_confirmation"
-                self.db.execute(
-                    "INSERT OR IGNORE INTO sources (id, name, source_type, uri, properties, "
-                    "sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (src["id"], src["name"], src["source_type"], src["uri"],
-                     _without_sync_status(props_text),
-                     self._initial_status_or_default(restored),
-                     src.get("created_at", now), now))
+                # Resolve by uri first, because the uri is the source's identity
+                # across stores while the id is local to whichever store minted it.
+                local = self.db.execute(
+                    "SELECT id FROM sources WHERE uri = ?", (src["uri"],)).fetchone()
+                if local is None:
+                    target_id = src["id"]
+                    if self.db.execute("SELECT 1 FROM sources WHERE id = ?",
+                                       (target_id,)).fetchone():
+                        # The uri is absent but its id is already taken by a source
+                        # holding a DIFFERENT uri. Reusing that id would file this
+                        # bundle's documents under an unrelated source and skipping
+                        # would drop them, so the uri arrives under an id of its own.
+                        target_id = str(uuid4())
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO sources (id, name, source_type, uri, properties, "
+                        "sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (target_id, src["name"], src["source_type"], src["uri"],
+                         _without_sync_status(props_text),
+                         self._initial_status_or_default(restored),
+                         src.get("created_at", now), now))
+                    local = self.db.execute(
+                        "SELECT id FROM sources WHERE uri = ?", (src["uri"],)).fetchone()
+                if local is not None:
+                    source_id_map[claimed_id] = local["id"]
+            # Decided BEFORE the items go in, because an item that arrives and then
+            # finds no row to own it is the very defect this ownership round-trip
+            # exists to remove.
+            blocked_items = self._bundle_blocked_items(bundle, source_id_map)
             for item in bundle.get("items", []):
+                if item.get("id") in blocked_items:
+                    continue
                 raw_emb = item.get("embedding")
                 if isinstance(raw_emb, str) and raw_emb:
                     try:
@@ -2673,7 +2832,11 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                     "INSERT OR IGNORE INTO items (id, title, content, item_type, source_id, chunk_index, namespace, summary, tags, embedding, embedding_sig, status, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (item["id"], item["title"], item["content"], item["item_type"],
-                     item.get("source_id"), item.get("chunk_index", 0), item.get("namespace", "default"), item.get("summary"),
+                     # Through the map: the exporting store's source id is not this
+                     # store's, and an item left pointing at the bundle's id is
+                     # refused by the foreign key, which loses the whole import.
+                     _source_fk(item.get("source_id")),
+                     item.get("chunk_index", 0), item.get("namespace", "default"), item.get("summary"),
                      item.get("tags", "[]"), raw_emb, _validated_embedding_sig(item.get("embedding_sig")),
                      item.get("status", "active"),
                      item.get("created_at", now), now))
@@ -2705,19 +2868,214 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                 self.db.execute(
                     "INSERT OR IGNORE INTO source_locations (id, item_id, source_id, chunk_range, section_title, anchor, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (loc["id"], loc["item_id"], loc["source_id"], loc.get("chunk_range"),
+                    (loc["id"], loc["item_id"], _source_fk(loc["source_id"]),
+                     loc.get("chunk_range"),
                      loc.get("section_title"), loc.get("anchor"), loc.get("created_at", now)))
             for m in bundle.get("mentions", []):
                 self.db.execute(
                     "INSERT OR IGNORE INTO mentions (item_id, entity_id, context, created_at) "
                     "VALUES (?, ?, ?, ?)",
                     (m["item_id"], m["entity_id"], m.get("context"), m.get("created_at", now)))
+            state_rows_imported = self._import_bundle_state(bundle, source_id_map, now)
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
         self._load_graph()
-        return {"items_imported": items_imported, "entities_created": entities_created, "relations_rebuilt": relations_rebuilt}
+        return {"items_imported": items_imported, "entities_created": entities_created,
+                "relations_rebuilt": relations_rebuilt,
+                "ownership_rows_imported": state_rows_imported}
+
+    def _bundle_blocked_items(
+        self, bundle: dict, source_id_map: dict[str, str]
+    ) -> set[str]:
+        """Item ids a bundle may not bring in, because this store already holds the
+        document that would own them.
+
+        Two documents cannot share one ``(source, key)``: that pair IS a document's
+        identity within a source. When a live local row already holds the pair -- the
+        same folder watched on two machines, the same artifact slug on both -- the
+        bundle's copy is not a document here, and importing its items anyway would
+        leave them permanently unowned: nothing claims them for de-duplication, the
+        Sources UI shows no group for them, and the text answers searches alongside
+        the local copy after every later edit of it.
+
+        Only that reason blocks an item, because only that reason says the content
+        does not belong here. Every other refusal in :meth:`_import_bundle_state`
+        rejects a ROW as an untrustworthy statement about items that are themselves
+        legitimate -- an over-claiming group, an unparsable one, one whose ids
+        another row already owns -- and those items arrive unowned exactly as they do
+        from a bundle with no state tables at all.
+
+        A row whose group overlaps a blocked group is refused in turn, by the
+        landed-group check: its document arrives without ownership rather than with
+        ownership of a partial group.
+        """
+        blocked: set[str] = set()
+        for table in _DOC_STATE_KEY_COL:
+            key_col = _DOC_STATE_KEY_COL[table]
+            for row in bundle.get(table, []):
+                if not isinstance(row, dict):
+                    continue
+                raw_source = row.get("source_id")
+                if not isinstance(raw_source, str):
+                    continue
+                target_source = source_id_map.get(raw_source)
+                key = row.get(key_col)
+                if target_source is None or not isinstance(key, str) or not key:
+                    continue
+                held = self.db.execute(
+                    f"SELECT item_ids FROM {table} "  # noqa: S608
+                    f"WHERE source_id = ? AND {key_col} = ?",
+                    (target_source, key)).fetchone()
+                if held is not None and self._state_row_owns_items(held["item_ids"]):
+                    blocked.update(_bundle_item_group(row.get("item_ids")))
+        return blocked
+
+    def _import_bundle_state(
+        self, bundle: dict, source_id_map: dict[str, str], now: str
+    ) -> int:
+        """Restore per-document ownership rows for the items this bundle brought.
+
+        Runs INSIDE :meth:`import_bundle`'s transaction and AFTER the item loop,
+        because the test a row has to pass is whether the group it names actually
+        arrived.
+
+        A row is restored only when its WHOLE group did. Ownership means "these
+        items, all of them": a half-present group would let a later ingest replace
+        the named part and leave the rest behind as duplicates, which is the very
+        outcome ownership exists to prevent. A group is also required to be a subset
+        of the bundle's OWN items, so a bundle cannot name item ids it did not ship
+        and take ownership of content that was already here.
+
+        A row that does not qualify is dropped rather than repaired, and its items
+        arrive unowned: an empty group is a de-duplication claim or a scan marker,
+        both of which describe the exporting store's progress and are re-derived
+        here by the next ingest of that document.
+
+        The status written is the table's own live value rather than the bundle's:
+        the surviving group is what makes a row live, and the vocabularies differ
+        per table (see :data:`_DOC_STATE_TABLES`).
+
+        A local row for the same document wins only while it OWNS live items. One
+        with an empty or stale group is holding a marker, not ownership, so the
+        imported row takes its place and its claim on another source's items is
+        released with it.
+
+        Returns the number of rows restored.
+        """
+        bundle_item_ids = {
+            item["id"] for item in bundle.get("items", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        # Ids already spoken for, so no item ends up in two groups. One item in two
+        # groups is content-destroying rather than untidy: the next document-level
+        # delete hands ``delete_items_batch`` an item whose only other holder is a
+        # state row it does not consult, finds nothing else holding it, and removes
+        # it -- leaving the second row naming deleted content. The module already
+        # refuses this shape elsewhere, in ``_adopt_reassigned_item`` and
+        # ``detach_source_location_by_hash``, rather than putting one item in two
+        # groups. Seeded from the local rows of the sources this bundle touches, then
+        # grown as rows are accepted, so overlap WITHIN one bundle is caught too.
+        claimed_ids = self._claimed_item_ids(set(source_id_map.values()))
+        restored = 0
+        for table, live_status in _DOC_STATE_TABLES:
+            key_col = _DOC_STATE_KEY_COL[table]
+            carried = _BUNDLE_STATE_CARRIED_COLS[table]
+            for row in bundle.get(table, []):
+                if not isinstance(row, dict):
+                    continue
+                raw_source = row.get("source_id")
+                # A non-string source id would be an unhashable dictionary key.
+                target_source = (source_id_map.get(raw_source)
+                                 if isinstance(raw_source, str) else None)
+                key = row.get(key_col)
+                if target_source is None or not isinstance(key, str) or not key:
+                    continue
+                group = _bundle_item_group(row.get("item_ids"))
+                if not group or not set(group) <= bundle_item_ids:
+                    continue
+                if set(group) & claimed_ids:
+                    continue
+                placeholders = ", ".join("?" * len(group))
+                held = {
+                    r["id"] for r in self.db.execute(
+                        "SELECT id FROM items WHERE source_id = ? "  # noqa: S608
+                        f"AND id IN ({placeholders})",
+                        (target_source, *group)).fetchall()
+                }
+                if held != set(group):
+                    continue
+                existing = self.db.execute(
+                    f"SELECT {_OWNERSHIP_HASH_COL[table]} AS owned_hash, item_ids "  # noqa: S608
+                    f"FROM {table} WHERE source_id = ? AND {key_col} = ?",
+                    (target_source, key)).fetchone()
+                if existing is not None:
+                    if self._state_row_owns_items(existing["item_ids"]):
+                        # A row holding live items wins: repointing it at the bundle's
+                        # group would leave the items it owns with nothing naming them.
+                        continue
+                    # An empty or stale group is not ownership. It is a de-duplication
+                    # marker or a scan marker, and nothing else will ever name the items
+                    # this bundle brought, so the imported row takes the key. The
+                    # marker's claim on another source's items goes with it: leaving the
+                    # claim behind under a hash no row names any more means a later
+                    # deletion of the holder reassigns an item here and finds nothing to
+                    # adopt it into.
+                    self.detach_source_location_by_hash(
+                        target_source, existing["owned_hash"] or "")
+                fixed = _BUNDLE_STATE_FIXED_COLS.get(table, ())
+                columns = ("source_id", key_col, "item_ids", "status", *carried,
+                           *(col for col, _ in fixed))
+                values: list[Any] = [
+                    target_source, key, json.dumps(group), live_status]
+                for col in carried:
+                    value = row.get(col)
+                    if col in _BUNDLE_STATE_REQUIRED_COLS and not isinstance(value, str):
+                        value = now
+                    values.append(value)
+                values.extend(value for _, value in fixed)
+                self.db.execute(
+                    f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "  # noqa: S608
+                    f"VALUES ({', '.join('?' * len(columns))})",
+                    values)
+                claimed_ids.update(group)
+                restored += 1
+        return restored
+
+    def _claimed_item_ids(self, source_ids: set[str]) -> set[str]:
+        """Every item id an existing state row of *source_ids* already owns.
+
+        Scoped to the sources a bundle resolves to, because ownership is per-source
+        and that keeps the read bounded on a large library.
+        """
+        claimed: set[str] = set()
+        if not source_ids:
+            return claimed
+        placeholders = ", ".join("?" * len(source_ids))
+        params = tuple(source_ids)
+        for table in _DOC_STATE_KEY_COL:
+            for row in self.db.execute(
+                    f"SELECT item_ids FROM {table} "  # noqa: S608
+                    f"WHERE source_id IN ({placeholders})", params):
+                claimed.update(_bundle_item_group(row["item_ids"]))
+        return claimed
+
+    def _state_row_owns_items(self, raw: object) -> bool:
+        """Whether a state row's ``item_ids`` still names an item this store holds.
+
+        An empty group is not ownership: a document that lost a de-duplication keeps a
+        marker row with no group, and every pending or failed scan row carries one too.
+        A group naming only items that have since been deleted is the same thing with
+        more history behind it.
+        """
+        group = _bundle_item_group(raw)
+        if not group:
+            return False
+        placeholders = ", ".join("?" * len(group))
+        return self.db.execute(
+            f"SELECT 1 FROM items WHERE id IN ({placeholders}) LIMIT 1",  # noqa: S608
+            group).fetchone() is not None
 
     def close(self):
         """Close the calling thread's connection (other threads' connections
