@@ -1108,6 +1108,34 @@ def computer_use_state_path() -> Path:
     return config_dir() / "computer_use.json"
 
 
+def standing_approval_path() -> Path:
+    """Return path to standing_approval.json -- the STANDING auto-approve grant.
+
+    Same KEYSTONE reasoning as :func:`computer_use_state_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason, with a sharper consequence:
+    this document is what makes a skip-every-approval grant survive a restart, so an
+    agent that could write it would not merely enable a feature for itself, it would
+    remove the approval step that would have caught everything it did next.
+
+    Deliberately NOT a key in ``config.json``. That document is off the read+write
+    floor on purpose, because reading config in-sandbox is routine, which leaves it
+    only the OS sandbox's read-only seal -- and a seal covers a PATH while the inode
+    behind it stays reachable under a second name in a writable root. This leaf is
+    bind-MASKED in ``sandbox._CREW_HIDDEN_LEAVES`` instead, so the name cannot be
+    opened at all from a sandbox, and masking is available here for a reason that does
+    not hold for ``config.json``: nothing in-sandbox reads this document, while the
+    config document is resolved per call by the subagent cap, the quarantine threshold
+    and the browser and monitoring paths.
+
+    Holds ``{"enabled": bool}``; every read fails soft to NO GRANT (see
+    ``safety_override.standing_grant_declared``) -- absent, unreadable, malformed and
+    ``false`` all answer the same way. There is no dashboard writer: the operator
+    hand-edits the file out-of-band, the same arrangement as
+    :func:`oauth_endpoints_path`. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "standing_approval.json"
+
+
 def oauth_endpoints_path() -> Path:
     """Return path to oauth_endpoints.json — the operator OAuth-endpoint extension.
 

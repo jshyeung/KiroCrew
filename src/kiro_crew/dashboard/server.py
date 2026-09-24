@@ -191,7 +191,9 @@ from kiro_crew.safety_override import (
     describe_dropped_grant,
     grant_declared_yolo,
     safety_override,
+    standing_grant_declared,
     take_dropped_grant,
+    warn_if_config_declares_standing_grant,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel, sel_is_warm, warm_sel_singleton
@@ -2604,7 +2606,12 @@ def _apply_startup_yolo(state: DashboardState, cfg: Any) -> None:
     except Exception:
         logger.warning("Could not apply the configured YOLO duration", exc_info=True)
 
-    if not cfg.agent.dangerously_skip_permissions:
+    # The keystone is the authority, not the config key: ``config.json`` is
+    # agent-readable in-sandbox, so the only protection it can carry is a read-only
+    # seal, and a seal covers a path while the inode stays reachable under a second
+    # name. An operator still carrying the old key is told where to write instead.
+    warn_if_config_declares_standing_grant(cfg.agent.dangerously_skip_permissions)
+    if not standing_grant_declared():
         return
     try:
         result = grant_declared_yolo()

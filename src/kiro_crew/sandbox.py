@@ -244,6 +244,31 @@ _LIVE_TARGET_LEAF: str = "live_target.json"
 #: reason as ``_MD_NOTEBOOK_STAGING_LEAF`` / ``aws-control-staging``.
 _LIVE_TARGET_STAGING_LEAF: str = "live-target-staging"
 
+#: The STANDING auto-approve grant's own leaf. ``safety_override`` reads it at every
+#: startup and, when it says enabled, installs a grant with no expiry -- so this one
+#: document decides whether one session's elevation is the host's default.
+#:
+#: Not a key in ``config.json``. That document is off the read+write floor on purpose,
+#: because reading config in-sandbox is routine, so the only protection available to it
+#: is a read-only seal -- and a seal covers a PATH, not the inode behind it, while the
+#: data-home root stays writable. A second name to that inode therefore remains a way to
+#: write the posture. This leaf is MASKED instead, which is the placement that answers
+#: both halves: an agent cannot open it, so it can neither read the grant nor obtain a
+#: ``link(2)`` source for it, and :func:`_refuse_aliased_masked_leaves` refuses a symlink
+#: rather than sealing a referent. Masking is available here and not for ``config.json``
+#: for one measurable reason: this leaf has no in-sandbox reader at all, while the config
+#: document is resolved per call by the subagent cap, the quarantine threshold and the
+#: browser and monitoring paths.
+#:
+#: Same class of control as ``browser-mode-enabled``, and the same treatment.
+_STANDING_APPROVAL_LEAF: str = "standing_approval.json"
+
+#: Where that grant's absent-equivalent document is staged before it is linked into place.
+#: A whole-directory mask, for the reason :data:`_LIVE_TARGET_STAGING_LEAF` states: a temp
+#: beside the target would be a visible name whose inode BECOMES the keystone, so an agent
+#: that linked the temp would hold a writable second path to the document that grants.
+_STANDING_APPROVAL_STAGING_LEAF: str = "standing-approval-staging"
+
 #: The md-notebook builtin's name, and its own state files under the crew data home.
 #: Named so the mask, the backend carve-out that lifts it, and the materialiser that
 #: gives it a mount target cannot drift apart on a literal.
@@ -430,6 +455,17 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # Where that pointer's absent-equivalent stub is staged before being linked in; a
     # whole-directory mask so the in-flight temp is never a visible, linkable name.
     _LIVE_TARGET_STAGING_LEAF,
+    # The standing auto-approve grant, masked for the reason its own entry states: the
+    # value decides whether one session's elevation becomes the host default, and unlike
+    # the config document it has no in-sandbox reader, so hiding it costs nothing. Given a
+    # mount target before every spawn by
+    # :func:`_materialize_standing_approval_mask_target`, because an ABSENT file cannot be
+    # masked and the data-home root is writable in-sandbox -- and an absent grant name is
+    # the default state on every host, which is what makes that materialiser load-bearing
+    # here rather than a refinement.
+    _STANDING_APPROVAL_LEAF,
+    # Its staging directory, whole-directory masked for the same reason as the pointer's.
+    _STANDING_APPROVAL_STAGING_LEAF,
     "backup",
     "mcp-apps",
     # Published crew webview records. Same model as the entries above, and named
@@ -487,6 +523,38 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     "admission_policy.json",
     "profiles",
     "app_admission.json",
+    # The runtime config documents. They carry the standing approval posture
+    # (``agent.dangerously_skip_permissions``, which ``safety_override`` reads as a
+    # grant with no expiry that every startup re-establishes), so a process able to
+    # write one turns a session-scoped elevation into the default for every later
+    # session. ``is_sensitive_write_path`` refuses the agent's file-edit tool here,
+    # and that gate is the only one it reaches: the read+write floor deliberately
+    # excludes these leaves because reading config is routine and intended, and the
+    # bash gate matches no paths at all, so a sandboxed shell's ``open(..., "w")``
+    # arrives unrefused and only a kernel write denial holds there. Same
+    # both-layers treatment ``cloud.json`` takes below, for the reason its entry
+    # gives.
+    #
+    # READ-ONLY rather than masked, because in-sandbox readers depend on the
+    # content: an MCP server resolves the subagent cap, the quarantine threshold
+    # and the browser preference from it per call. A bind pins the inode while
+    # every writer publishes through ``atomic_write``, so those reads answer with
+    # the document as it stood when the sandbox was built, until the next spawn
+    # builds a new one. ``config.live`` hot-apply therefore does not reach an
+    # existing sandbox's readers, and that cuts both ways rather than one: a
+    # mid-session LOOSENING is not picked up, which is the safe direction, but
+    # neither is a mid-session TIGHTENING, which is not. What bounds the exposure is
+    # that the values held this way are the ones the loader clamps at load time, and
+    # that the posture this seal exists for reads as its default refusal when the
+    # document is empty or stale.
+    #
+    # Listed for pre-creation below, because an ABSENT document is the DEFAULT on an
+    # install that has never saved settings and ``mount(2)`` skips an absent path:
+    # without that entry the seal is skipped exactly where the overlay is still
+    # creatable from inside the sandbox. See that list for the two criteria a
+    # pre-created ``{}`` has to meet.
+    "config.json",
+    "config.local.json",
     # Opt-out and consent ceilings the config loader reads in-sandbox. A writable
     # ``denied_commands.json`` lets an auto-approved agent set ``disable_all`` and
     # defeat the deny gate after a restart; a writable ``computer_use.json`` lets it
@@ -781,6 +849,27 @@ _CREW_CHILD_WITHHELD_LEAVES: tuple[str, ...] = (
     # reader had it before this change either: the app backend that consults it is not
     # an enforced-harness child. Withholding it costs nothing that worked.
     "aws_service_consent.json",
+    # The runtime config documents, sealed read-only above. They sit here rather than
+    # beside ``cloud.json`` in the child-readable set they otherwise resemble --
+    # write-protected, off the read-gate floor -- because both halves of that set's
+    # entry criteria fail for them. They CARRY CREDENTIALS: each channel's bot token
+    # and the decision provider's API key are ``sensitive=True`` fields of this
+    # document, and ``config.sections`` names storing one here a supported choice
+    # beside the credential store. And they are an INPUT TO AN AUTHORIZATION DECISION
+    # an in-sandbox process makes: ``agent.dangerously_skip_permissions`` is the
+    # standing approval posture ``safety_override`` reads at every startup.
+    #
+    # The classification costs nothing today and is written for the day it does. The
+    # mask projects the READ-GATE floor, and these leaves are write-protected only,
+    # so no projection names them for any backend -- ``test_acp_tool_gate`` asserts
+    # exactly that for a write-only leaf, and keeps it out of the child-readable set
+    # rather than reclassifying it. Were the floor to gain them, this side is the one
+    # that fails safe: an empty bind reads as no standing grant and no token, so a
+    # session refuses rather than proceeding elevated. The readable side would instead
+    # hand a self-approving third-party binary both the tokens and the posture, which
+    # is the case this pair exists to prevent.
+    "config.json",
+    "config.local.json",
     # The ONE entry here that holds no secret. It carries the launcher and sealed
     # extension of a single harness's tool gate, and only that harness's child has to
     # execute them, so the grant is made per backend in
@@ -1418,6 +1507,30 @@ assert set(_DELEGATED_OVERLAP_LEAF_REASONS) == set(_CREW_NOFOLLOW_READONLY_FILE_
 )
 
 _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
+    # The runtime config documents, and the pair where an ABSENT file is the DEFAULT
+    # rather than an edge case: nothing writes either one at startup, so an install
+    # that has never saved settings has no name for the seal to bind. ``mount(2)``
+    # skips an absent path, so without this entry the read-only seal above is skipped
+    # exactly there, and a sandboxed shell can CREATE ``config.local.json`` -- the
+    # overlay that wins the deep merge -- carrying the standing approval posture that
+    # every later startup re-establishes.
+    #
+    # Criterion 1 (an EMPTY document means what an ABSENT one means): a pre-created
+    # ``{}`` resolves ``agent.dangerously_skip_permissions`` to ``False``, the same
+    # value an absent pair resolves to, and an empty overlay overrides nothing.
+    # ``KiroCrewConfig.load()`` tolerates finding both documents present, empty and
+    # read-only: its defaults-save is best-effort, so the load returns rather than
+    # raising when the seal refuses that write.
+    #
+    # Criterion 2 (a stale sealed read fails toward refusal): a sandboxed reader
+    # pinned at ``{}`` sees no standing grant, so the posture reads as its default
+    # refusal rather than as an elevation. The residual this criterion does not cover
+    # is the operator's FIRST save: a mid-session tightening published after the
+    # sandbox was built does not reach it either, the same shape ``cloud.json``
+    # records. The loader's load-time clamp bounds every resource ceiling in the
+    # document independently of what a sandbox read returns.
+    "config.json",
+    "config.local.json",
     # The launch record. Criterion 1 (an EMPTY document means what an ABSENT one means) is
     # met by ``LaunchState.load`` treating a document carrying none of its three keys as no
     # record at all and consulting the legacy fields, which is exactly what it does for an
@@ -1516,6 +1629,11 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     # agent reads it and drives the loopback /approve to self-grant. Precreated
     # (empty, 0o700) before every spawn so the mask always has a name to bind over.
     "file-delivery-consent-pending",
+    # The standing-approval grant's staging directory, by the same rule: a direct child of
+    # the data home, absent on a host that has never recorded a grant, and the temp staged
+    # inside it becomes the keystone's inode -- so the mask must hold before the first
+    # publish rather than after it.
+    "standing-approval-staging",
     "appearance-library",
     "quarantined-clones",
     # md-notebook's write-staging directory, for the same reason and by the same rule: a
@@ -1604,6 +1722,25 @@ assert set(_MD_NOTEBOOK_PRECREATE_CONTENT) == set(_MD_NOTEBOOK_STATE_LEAVES)
 #: the reason the leaf name is (this module does not import the config-loader chain);
 #: ``test_sandbox_dev_fleet_live_target.py`` pins the two equal.
 _LIVE_TARGET_PRECREATE_CONTENT: bytes = b'{\n  "checkout": null\n}\n'
+
+#: The standing auto-approve grant's absent-equivalent document, and the argument the
+#: pre-create list asks each masked file leaf to supply for itself.
+#:
+#: It is absent-equivalent by the grant's own rule rather than by coincidence: the reader
+#: (``safety_override.standing_grant_declared``) answers NO GRANT for an absent file, for
+#: an unreadable one, and for a document whose ``enabled`` is anything but ``true``. So a
+#: sandbox pinned at this stub reads exactly what it would read with no file at all -- no
+#: startup warning, nothing withheld that was granted, and no way for the stub itself to
+#: become an authorization.
+#:
+#: The direction matters, and it is the safe one. A stale or empty read here can only ever
+#: subtract a grant, never add one, which is why publishing a stub is sound while
+#: publishing one for a DENY list would not be.
+#:
+#: Spelled as a literal for the reason the leaf name is: this module does not import the
+#: config-loader chain. ``test_config_standing_trust_surface.py`` pins the stub and the
+#: reader's answer together, so the two cannot drift.
+_STANDING_APPROVAL_PRECREATE_CONTENT: bytes = b'{\n  "enabled": false\n}\n'
 
 #: What a materialised ceiling holds — the empty JSON object every reader above
 #: already treats as its absent default. NOT a zero-byte file, which is not valid
@@ -2675,6 +2812,89 @@ def _materialize_live_target_mask_target() -> str | None:
         f"cannot give the live-target pointer's mask a mount target at {target}. "
         "Launching anyway would leave the pointer maskless in every agent namespace, "
         "where writing it selects the code the gateway starts next."
+    )
+
+
+def _materialize_standing_approval_mask_target() -> str | None:
+    """Publish the standing auto-approve grant's absent-equivalent document so its mask mounts.
+
+    The same function as :func:`_materialize_live_target_mask_target`, for a leaf in the
+    same position: a DIRECT child of the data home, so there is no agent-writable
+    intermediate component for a planted link to redirect and no per-component descent is
+    needed.
+
+    Why it is load-bearing rather than a refinement: the launcher's ``SENSITIVE_FILES``
+    loop guards on ``isfile``, so an absent grant is an UNMASKED grant, and absent is the
+    DEFAULT state -- a host that has never recorded one has no such file at all. The
+    data-home root is writable in every sandbox, so without this an agent simply creates
+    the document and the next startup reads its own grant back as the operator's standing
+    instruction. That is the same defect a read-only seal has against an absent path, and
+    it is closed the same way: publish first, so every namespace binds over the name from
+    the outset. :data:`_STANDING_APPROVAL_PRECREATE_CONTENT` carries the
+    absent-equivalence argument.
+
+    Linux spawn path only and at the same site as the other materialisers, for the reason
+    they state: a Seatbelt deny is a path rule that already holds for a name which does
+    not exist yet. The LIVE data home only, and an absent data home is left absent.
+
+    **Fail-closed.** Launching with this leaf maskless is the exposure it exists to
+    prevent. Never truncates and never removes: an existing regular file is left
+    byte-for-byte alone, whether it holds a real grant or this stub. Returns the path if it
+    published one.
+    """
+    try:
+        root = str(config_dir())
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for standing-approval masking")
+        return None
+    if not os.path.isdir(root):
+        return None
+    target = os.path.join(root, _STANDING_APPROVAL_LEAF)
+    # Both link shapes refuse, and before the exists check, exactly as the pointer's own
+    # materialiser refuses before its. A RESOLVING link is the entry that matters here: a
+    # mount follows its target, so the mask would bind the referent while the lexical name
+    # stayed an agent-replaceable link in a writable directory -- which is precisely the
+    # gap that makes a read-only seal insufficient for the config document.
+    _refuse_if_dangling_symlink(target)
+    _refuse_if_symlink_leaf(target)
+    if os.path.exists(target):
+        _refuse_unless_sole_regular_link(target)
+        return None
+    # Staged in a MASKED directory, never beside the target: the temp's inode BECOMES the
+    # grant document, so a visible temp name is a writable second path to it. The staging
+    # leaf is precreated (``_CREW_PRECREATE_HIDDEN_DIR_LEAVES``) and is a direct child of
+    # the data home, so its own chain has no agent-writable component.
+    staging = os.path.join(root, _STANDING_APPROVAL_STAGING_LEAF)
+    try:
+        os.makedirs(staging, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise SandboxCeilingUnsealable(
+            f"cannot create {staging} to stage the standing-approval grant's mask: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(os.lstat(staging).st_mode):
+        raise SandboxCeilingUnsealable(
+            f"{staging} is not a directory; refusing to stage the standing-approval "
+            "grant's mask target through it"
+        )
+    if _publish_empty_ceiling(target, staging, content=_STANDING_APPROVAL_PRECREATE_CONTENT):
+        # The publish is ``os.link``, so the temp's inode gains a second name and the temp
+        # is unlinked right after. A link count above one here means another party linked
+        # that inode inside the window, and a mask over THIS name would not cover their
+        # path to the document that grants.
+        _refuse_unless_sole_regular_link(target)
+        return target
+    # A lost publish race is benign only if the winner cleared the same bar. ``os.link``
+    # fails EEXIST rather than clobbering, so the ordinary loser finds a regular, singly
+    # linked file here; anything else means the name is not maskable.
+    try:
+        _refuse_unless_sole_regular_link(target)
+        return None
+    except FileNotFoundError:
+        pass
+    raise SandboxCeilingUnsealable(
+        f"cannot give the standing auto-approve grant's mask a mount target at {target}. "
+        "Launching anyway would leave the grant maskless in every agent namespace, where "
+        "writing it makes one session's elevation the default for every later session."
     )
 
 
@@ -7042,6 +7262,11 @@ def namespace_argv(
     # creatable from any sandbox simply because the data-home ROOT is writable there and
     # an absent name has no mask. Publishing the stub first makes the mask non-vacuous.
     _materialize_live_target_mask_target()
+    # The standing auto-approve grant needs one for the same reason and a narrower one: it
+    # is absent on every host that has never recorded a grant, the data-home root is
+    # writable in-sandbox, and writing that document makes one session's elevation the
+    # default for every later session.
+    _materialize_standing_approval_mask_target()
     # LAST of the pre-spawn checks, and last on purpose: every masked leaf's NAME must be
     # the name the mask binds, and the leaves above have already answered for themselves
     # with sentences tailored to what they hold. This pass covers the rest -- the masked

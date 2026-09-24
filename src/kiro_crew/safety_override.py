@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Optional
 
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import config_dir
+from kiro_crew.config.loader import config_dir, standing_approval_path
 from kiro_crew.platform.context import (
     current_context,
     register_ceiling_install_hook,
@@ -2204,6 +2204,78 @@ def apply_config_duration() -> int:
     so.adhoc_until_shutdown = until_shutdown
     so.adhoc_ttl = ttl
     return 0 if until_shutdown else ttl
+
+
+def standing_grant_declared() -> bool:
+    """True when the operator has recorded a STANDING, never-expiring auto-approve grant.
+
+    The single declaration of that question, so the dashboard and the headless
+    ``--slack-only`` startup cannot come to answer it differently. The authority is the
+    keystone ``standing_approval.json`` (see
+    ``config.loader.standing_approval_path``), never ``config.json``.
+
+    Why the keystone and not the config key: ``config.json`` is agent-READABLE
+    in-sandbox by design, so the only protection it can carry is the OS sandbox's
+    read-only seal, and a seal covers a PATH while the inode behind it stays reachable
+    under a second name in a writable root. A grant that survives a restart cannot rest
+    on that. The keystone is bind-MASKED instead, so a sandboxed process cannot open it
+    -- it can neither read the grant nor obtain a ``link(2)`` source for it -- and the
+    mask's own pass refuses a symlinked leaf rather than sealing its referent.
+
+    **Fails soft to NO GRANT**, in every direction: absent file, unreadable file,
+    malformed JSON, a document that is not an object, and an ``enabled`` that is
+    anything other than the boolean ``true``. That is the only safe direction here,
+    because the failure mode being avoided is granting authority nobody asked for.
+    ``true`` is required exactly, so a truthy string or a non-empty list does not become
+    a grant by accident.
+
+    An operator who still has ``agent.dangerously_skip_permissions`` set in
+    ``config.json`` gets a WARNING naming the file to write, and no grant. The session's
+    own ad-hoc auto-approve toggle is untouched: it is a live operator action with a
+    duration, not a document, so it never routed through here.
+    """
+    path = standing_approval_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.warning("Standing auto-approve grant not read at %s; treating it as no grant", path)
+        return False
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        logger.warning(
+            "Standing auto-approve grant at %s is not valid JSON; treating it as no grant",
+            path,
+        )
+        return False
+    if not isinstance(doc, dict):
+        logger.warning(
+            "Standing auto-approve grant at %s is not an object; treating it as no grant",
+            path,
+        )
+        return False
+    return doc.get("enabled") is True
+
+
+def warn_if_config_declares_standing_grant(declared_in_config: bool) -> None:
+    """Tell an operator whose standing grant is written in ``config.json``.
+
+    Called once per startup by each gate that reads the keystone. Says the three things
+    such an operator needs: the key does not grant, which file to write, and what they
+    have until they write it.
+    """
+    if not declared_in_config or standing_grant_declared():
+        return
+    logger.warning(
+        "agent.dangerously_skip_permissions is set in config.json, which no longer "
+        "installs a standing grant: that document is agent-readable in-sandbox and its "
+        'seal covers a path, not the inode. Write {"enabled": true} to %s to keep it. '
+        "Until then approvals are requested normally, and the dashboard's timed "
+        "auto-approve toggle still works.",
+        standing_approval_path(),
+    )
 
 
 def grant_declared_yolo() -> ActivationResult:
