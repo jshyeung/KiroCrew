@@ -4514,7 +4514,7 @@ async def _acquire_backend(
         for _sk in _secret_keys:
             spawn_env.pop(_sk, None)
         backend.control_plane = control_plane
-        backend.control_plane_denial = "" if control_plane else (denial[0] if denial else "")
+        backend.control_plane_denial = denial[0] if not control_plane and denial else ""
         # Start the stdout pump immediately so replies to the first
         # forwarded message can route back. The task is owned by the
         # Backend and cancelled at shutdown().
