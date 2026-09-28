@@ -338,3 +338,105 @@ class TestTheManagerSideOfThePulse:
         assert len(mgr._completion_waiters) == subagent_mod._MAX_COMPLETION_WAITERS
         mgr.signal_completion("one-too-many")
         assert overflow.is_set() is False
+
+
+class TestGoAfterAWaitExhaustionHalt:
+    """What the halt notice promises Go does, pinned against the real stage loop."""
+
+    @pytest.mark.asyncio
+    async def test_go_after_exhaustion_advances_to_the_next_stage(self, monkeypatch):
+        """Exhaustion cancels the stage's children; Go then runs the NEXT stage.
+
+        The halt notice tells the user "Send Go to continue to the next stage with
+        this stage's partial results". If Go instead re-ran the halted stage, or
+        waited on the cancelled children again, that notice would be a lie.
+        """
+        from kiro_crew.dashboard import chat_orchestrator
+        from kiro_crew.dashboard.chat import _stage_loop
+
+        monkeypatch.setattr(chat_orchestrator, "_SA_FALLBACK_SECS", 0.02)
+
+        subagents = _Subagents(pending=[{"id": "a1"}])  # never finishes on its own
+        cancelled: list[tuple[str, str, bool]] = []
+
+        async def _cancel_for_boundary(parent_key, owner, *, retain_scope=True):
+            cancelled.append((parent_key, owner, retain_scope))
+            subagents.pending = []  # the cancel is what empties the wave
+            return (1, 0)
+
+        subagents.cancel_for_boundary = _cancel_for_boundary
+        stage_turns: list[str] = []
+
+        async def _mock_run_chat(state, slot, message, **kwargs):
+            stage_turns.append(message)
+            callback = kwargs.get("_on_consumed")
+            if callable(callback):
+                callback(True)
+            slot.append("assistant", "stage output", "msg msg-a")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _mock_run_chat)
+        slot = _make_slot(stage_timeout=2, titles=("Collect", "Verify"))
+        state = _make_state(subagents)
+
+        await asyncio.wait_for(_stage_loop(state, slot, auto_run=True), 20)
+
+        text = _assistant_text(slot)
+        assert "subagent wait exhausted" in text
+        assert "Stopped 1 unfinished subagent run(s)" in text
+        assert "Send Go to continue to the next stage" in text
+        assert slot._auto_run is False
+        assert len(cancelled) == 1 and cancelled[0][2] is True
+        assert len(stage_turns) == 1 and "Execute Stage 1 of 2 now" in stage_turns[0]
+
+        # Go: the same controller entry the plan-action handler starts.
+        await asyncio.wait_for(_stage_loop(state, slot, auto_run=False), 20)
+
+        assert len(stage_turns) == 2, stage_turns
+        assert "Execute Stage 2 of 2 now" in stage_turns[1], (
+            "Go re-ran the halted stage instead of advancing"
+        )
+
+    @pytest.mark.parametrize(
+        ("raised", "notice"),
+        [
+            (TimeoutError("stage ceiling"), "timed out after"),
+            (RuntimeError("provider blew up"), "failed due to an internal error"),
+        ],
+        ids=["stage-turn-timeout", "stage-turn-error"],
+    )
+    @pytest.mark.asyncio
+    async def test_turn_timeout_and_error_halts_cancel_the_stage_children(
+        self, monkeypatch, raised, notice
+    ):
+        """The other two halts that used to leave children running now cancel them.
+
+        The cancel runs BEFORE the notice is written and before the boundary is
+        preserved, so it reads the still-armed scope and the notice reports the
+        real outcome.
+        """
+        from kiro_crew.dashboard.chat import _stage_loop
+
+        subagents = _Subagents(pending=[{"id": "a1"}])
+        cancelled: list[tuple[str, str, bool]] = []
+
+        async def _cancel_for_boundary(parent_key, owner, *, retain_scope=True):
+            assert owner, "cancel ran after the boundary lost its owner"
+            cancelled.append((parent_key, owner, retain_scope))
+            return (1, 0)
+
+        subagents.cancel_for_boundary = _cancel_for_boundary
+
+        async def _mock_run_chat(state, slot, message, **kwargs):
+            raise raised
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _mock_run_chat)
+        slot = _make_slot(titles=("Collect", "Verify"))
+
+        await asyncio.wait_for(_stage_loop(_make_state(subagents), slot, auto_run=True), 20)
+
+        text = _assistant_text(slot)
+        assert notice in text
+        assert "Stopped 1 unfinished subagent run(s) from this stage." in text
+        assert slot._auto_run is False
+        assert [c[0] for c in cancelled] == ["dashboard:wave-wait-slot"]
+        assert cancelled[0][2] is True

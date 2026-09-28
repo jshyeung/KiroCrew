@@ -2380,14 +2380,16 @@ async def test_settlement_wait_exhaustion_cancels_the_stage_children(tmp_path):
         [(f"dashboard:{slot.key}", owner), ("subagent:parent-2", owner)]
     )
     for call in manager.cancel_for_boundary.await_args_list:
-        assert call.kwargs == {"retain_scope": False}
+        assert call.kwargs == {"retain_scope": True}
+    manager.reserve_boundary_cancellation_scopes.assert_called_once()
     halts = [
         message["content"]
         for message in slot.messages
         if "subagent wait exhausted" in message.get("content", "")
     ]
     assert len(halts) == 1
-    assert "cancelled" in halts[0]
+    assert "Stopped 2 unfinished subagent run(s)" in halts[0]
+    assert "Send Go to continue to the next stage" in halts[0]
     assert slot._auto_run is False
 
 
