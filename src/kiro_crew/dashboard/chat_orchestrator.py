@@ -858,6 +858,44 @@ async def _queued_stage_work_pending(manager: object, slot: "_ChatSlot") -> bool
     return False
 
 
+async def _cancel_exhausted_stage_subagents(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+) -> int:
+    """Cancel the stage's still-running children once its wait budget is spent.
+
+    Without this, a halted stage leaves its children running until their own
+    ``subagent_timeout_secs`` deadline (up to an hour by default): the plan says
+    it stopped while the slot still carries live work whose completions land in
+    a plan that is no longer running. The scope is the one explicit Cancel uses,
+    but ``retain_scope=False`` so no cancellation hold outlives the halt: the
+    user can still send Go to resume. Best-effort per parent -- a failure is
+    logged and never masks the halt itself. Returns the number of runs stopped.
+    """
+    manager = state.subagents
+    scope = _capture_stage_cancellation_scope(slot)
+    cancel = getattr(manager, "cancel_for_boundary", None)
+    if scope is None or not callable(cancel):
+        return 0
+    owner, parent_keys, _stage_num = scope
+    stopped = 0
+    for parent_key in parent_keys:
+        try:
+            result = cancel(parent_key, owner, retain_scope=False)
+            if asyncio.iscoroutine(result):
+                result = await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Stage wait exhaustion: cancelling children of %s failed", parent_key
+            )
+            continue
+        if isinstance(result, tuple):
+            stopped += sum(n for n in result if isinstance(n, int))
+    return stopped
+
+
 async def _settle_stage_delivery(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -948,12 +986,14 @@ async def _settle_stage_delivery(
                     state,
                     slot,
                     f"⚠️ Stage {stage_num}: subagent wait exhausted after "
-                    f"{int(elapsed) // 60} minutes. Auto-run stopped — some "
+                    f"{int(elapsed) // 60} minutes. Auto-run stopped and the "
+                    "stage's unfinished subagents were cancelled — some "
                     "results may be incomplete.",
                     event_type="auto_run_subagent_timeout",
                     operation="subagent_wait_exhausted",
                     stage_num=stage_num,
                 )
+                await _cancel_exhausted_stage_subagents(state, slot)
                 return False
             if last_status_at is None or now - last_status_at >= _SA_STATUS_EVERY_SECS:
                 last_status_at = now

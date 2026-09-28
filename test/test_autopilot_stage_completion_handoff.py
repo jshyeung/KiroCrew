@@ -2342,3 +2342,78 @@ async def test_settlement_wait_exhaustion_halts_the_plan(tmp_path):
     assert len(halts) == 1
     assert "Auto-run stopped" in halts[0]
     assert slot._auto_run is False
+
+
+@pytest.mark.asyncio
+async def test_settlement_wait_exhaustion_cancels_the_stage_children(tmp_path):
+    """A halted stage must not leave its children running to their own deadline.
+
+    Before the fix the halt only flipped ``_auto_run`` and returned: the children
+    kept running for up to ``subagent_timeout_secs`` while the plan claimed it
+    had stopped. The halt now cancels exactly the boundary's scope -- every
+    captured parent key, under the boundary's owner token -- and does so without
+    retaining a cancellation hold, so a later Go can still resume the plan.
+    """
+    from kiro_crew.context_management import OrchestrationTracker
+    from kiro_crew.dashboard.chat_orchestrator import _settle_stage_delivery
+
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("settle-wait-cancels", mode="orchestrator")
+    slot._in_stage_execution = True
+    slot._auto_run = True
+    slot.stage_boundary.arm(1, consumed=False)
+    slot.stage_boundary.parent_session_keys.add("subagent:parent-2")
+    owner = slot.stage_boundary.owner
+    assert owner
+    manager = MagicMock()
+    manager.running_agents_for.return_value = [{"id": "sa-1", "status": "running"}]
+    manager.has_pending_work_for_async = AsyncMock(return_value=False)
+    manager.wait_for_parent_reports = AsyncMock(return_value=False)
+    manager.cancel_for_boundary = AsyncMock(return_value=(1, 0))
+    state.subagents = manager
+
+    tracker = OrchestrationTracker(stage_timeout_seconds=2)
+    assert await _settle_stage_delivery(state, slot, tracker, 1) is False
+
+    calls = sorted(c.args for c in manager.cancel_for_boundary.await_args_list)
+    assert calls == sorted(
+        [(f"dashboard:{slot.key}", owner), ("subagent:parent-2", owner)]
+    )
+    for call in manager.cancel_for_boundary.await_args_list:
+        assert call.kwargs == {"retain_scope": False}
+    halts = [
+        message["content"]
+        for message in slot.messages
+        if "subagent wait exhausted" in message.get("content", "")
+    ]
+    assert len(halts) == 1
+    assert "cancelled" in halts[0]
+    assert slot._auto_run is False
+
+
+@pytest.mark.asyncio
+async def test_settlement_wait_exhaustion_cancel_failure_still_halts(tmp_path):
+    """A failing cancel is logged, never raised: the halt itself must still land."""
+    from kiro_crew.context_management import OrchestrationTracker
+    from kiro_crew.dashboard.chat_orchestrator import _settle_stage_delivery
+
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("settle-wait-cancel-fails", mode="orchestrator")
+    slot._in_stage_execution = True
+    slot._auto_run = True
+    slot.stage_boundary.arm(1, consumed=False)
+    manager = MagicMock()
+    manager.running_agents_for.return_value = [{"id": "sa-1", "status": "running"}]
+    manager.has_pending_work_for_async = AsyncMock(return_value=False)
+    manager.wait_for_parent_reports = AsyncMock(return_value=False)
+    manager.cancel_for_boundary = AsyncMock(side_effect=RuntimeError("store down"))
+    state.subagents = manager
+
+    tracker = OrchestrationTracker(stage_timeout_seconds=2)
+    assert await _settle_stage_delivery(state, slot, tracker, 1) is False
+    assert manager.cancel_for_boundary.await_count == 1
+    assert slot._auto_run is False
+    assert any(
+        "subagent wait exhausted" in message.get("content", "")
+        for message in slot.messages
+    )
