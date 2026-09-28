@@ -937,18 +937,6 @@ class OrphanStallMonitor(ManagerComponent):
                 compact_cost_log()  # periodic FIFO trim (also bounds a long-running gateway)
             except Exception:
                 logger.debug("Reaper: cost-log compaction failed", exc_info=True)
-            # Collect every over-deadline agent during the scan, then reap
-            # them CONCURRENTLY below. Reaping inline here serialized the
-            # sweep on each ``_force_reap`` — whose ``reset()`` awaits
-            # ``provider.shutdown()`` while holding the session-manager global
-            # lock (``session_lifecycle`` ``reset``), the same lock every
-            # turn-start (``get_or_create``) contends. Back-to-back inline
-            # reaps therefore starved turn-start on ALL sessions for up to
-            # ``_RESET_TIMEOUT`` per stuck child, which surfaced as a
-            # multi-minute UI "hang" during an autopilot fan-out. Gathering
-            # the reaps lets those lock-holding teardowns overlap instead of
-            # stacking, so one slow teardown no longer blocks the others.
-            due_reaps: list[tuple[str, SubagentInfo, float, str | None]] = []
             for agent_id, info in list(self._manager._agents.items()):
                 if info.done:
                     continue
@@ -972,14 +960,15 @@ class OrphanStallMonitor(ManagerComponent):
                         self._manager._startup_population(exclude=info),
                         info._startup_cotenant_frames,
                     )
-                    due_reaps.append(
-                        (
+                    try:
+                        await self._manager._force_reap(
                             agent_id,
                             info,
                             now - (info._exec_started or now),
-                            "startup_timeout",
+                            reason="startup_timeout",
                         )
-                    )
+                    except Exception:
+                        logger.exception("Reaper: failed to reap %s", agent_id)
                     continue
                 # Idle-stall detection (see _maybe_flag_stall). The main-agent
                 # watchdog stack does not govern subagents; this is their
@@ -996,19 +985,10 @@ class OrphanStallMonitor(ManagerComponent):
                     self._manager._default_timeout,
                     elapsed,
                 )
-                due_reaps.append((agent_id, info, elapsed, None))
-
-            # Dispatch the collected reaps concurrently. Each is wrapped in a
-            # per-agent guard so one failure neither cancels its siblings nor
-            # escalates out of ``gather`` — identical isolation to the inline
-            # ``try/except`` this replaced.
-            if due_reaps:
-                await asyncio.gather(
-                    *(
-                        self._reap_guarded(agent_id, info, elapsed, reason)
-                        for agent_id, info, elapsed, reason in due_reaps
-                    )
-                )
+                try:
+                    await self._manager._force_reap(agent_id, info, elapsed)
+                except Exception:
+                    logger.exception("Reaper: failed to reap %s", agent_id)
 
             # Prune stale tombstoned folders (>7 days old)
             try:
@@ -1022,30 +1002,6 @@ class OrphanStallMonitor(ManagerComponent):
                     logger.info("Reaper: pruned %d stale tombstone(s)", pruned)
             except Exception:
                 logger.debug("Reaper: tombstone pruning failed", exc_info=True)
-
-    async def _reap_guarded(
-        self,
-        agent_id: str,
-        info: SubagentInfo,
-        elapsed: float,
-        reason: str | None,
-    ) -> None:
-        """Force-reap one agent, swallowing (and logging) any failure.
-
-        Used to dispatch the sweep's due reaps concurrently via
-        ``asyncio.gather`` without letting one failure cancel its siblings —
-        the same log-and-continue isolation the inline ``try/except`` gave
-        each reap before they were parallelized.
-        """
-        try:
-            if reason is None:
-                await self._manager._force_reap(agent_id, info, elapsed)
-            else:
-                await self._manager._force_reap(
-                    agent_id, info, elapsed, reason=reason
-                )
-        except Exception:
-            logger.exception("Reaper: failed to reap %s", agent_id)
 
     def _is_startup_stalled_impl(self, info: SubagentInfo, now: float) -> bool:
         """True if a subagent is wedged in startup and should be reaped early.
